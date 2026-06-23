@@ -19,7 +19,7 @@
 //     --device 0        visible GPU via ZE_AFFINITY_MASK (default env)
 //     --seed 42 --md
 //
-// Per run it reports prefill throughput, effective output throughput, canvas
+// Per run it reports prefill throughput, actual output throughput, canvas
 // positions/s, and the diffusion metrics (forward passes/s, tokens/forward,
 // denoising passes).
 #include <cstdio>
@@ -121,43 +121,16 @@ Stat aggregate(const std::vector<double>& v) {
 
 struct Row {
     std::string kernel; int n_prompt, n_gen, ds, runs;
-    Stat prefill, decode, canvas, fwd; // throughputs (effective t/s, canvas positions/s, passes/s)
+    Stat prefill, decode, canvas, fwd; // throughputs (output t/s, canvas positions/s, passes/s)
     double tok_per_fwd, passes;        // diffusion metrics (means)
 };
 
-enum class EffectiveTokenMode { Actual, Canvas, Requested };
-
-EffectiveTokenMode effective_token_mode() {
-    static EffectiveTokenMode mode = [] {
-        const char* env = std::getenv("DIFF_BENCH_EFFECTIVE_TOKENS");
-        if (!env || !std::strcmp(env, "actual") || !std::strcmp(env, "output"))
-            return EffectiveTokenMode::Actual;
-        if (!std::strcmp(env, "canvas") || !std::strcmp(env, "block"))
-            return EffectiveTokenMode::Canvas;
-        if (!std::strcmp(env, "requested") || !std::strcmp(env, "n"))
-            return EffectiveTokenMode::Requested;
-        return EffectiveTokenMode::Actual;
-    }();
-    return mode;
+double output_tps_for(const DiffPerfStats& s) {
+    return s.decode_s > 0 ? s.output_tokens / s.decode_s : 0.0;
 }
 
-int effective_token_count(const DiffPerfStats& s, int requested_tokens, int canvas_len) {
-    switch (effective_token_mode()) {
-        case EffectiveTokenMode::Canvas:
-            return ((requested_tokens + canvas_len - 1) / canvas_len) * canvas_len;
-        case EffectiveTokenMode::Requested:
-            return requested_tokens;
-        default:
-            return s.output_tokens;
-    }
-}
-
-double effective_tps_for(const DiffPerfStats& s, int effective_tokens) {
-    return s.decode_s > 0 ? effective_tokens / s.decode_s : 0.0;
-}
-
-double tokens_per_forward_for(const DiffPerfStats& s, int effective_tokens) {
-    return s.decode_passes > 0 ? (double)effective_tokens / s.decode_passes : 0.0;
+double tokens_per_forward_for(const DiffPerfStats& s) {
+    return s.decode_passes > 0 ? (double)s.output_tokens / s.decode_passes : 0.0;
 }
 
 std::string escaped_result(const std::string& s) {
@@ -289,14 +262,6 @@ int main(int argc, char** argv) {
                          scratch_env_on(std::getenv("DISABLE_SCRATCH"));
         std::printf("[bench] activation arena: %s\n",
                     arena_off ? "DISABLED (fresh alloc per op)" : "enabled (planner-sized)");
-        const char* eff_mode = "actual output";
-        if (effective_token_mode() == EffectiveTokenMode::Canvas) eff_mode = "canvas blocks";
-        else if (effective_token_mode() == EffectiveTokenMode::Requested) eff_mode = "requested -n";
-        std::printf("[bench] effective-token accounting: %s%s\n", eff_mode,
-                    effective_token_mode() == EffectiveTokenMode::Actual
-                        ? " (DIFF_BENCH_EFFECTIVE_TOKENS=canvas for content-independent block throughput)"
-                        : "");
-
         std::vector<Row> rows;
         for (auto& kname : kernel_list) {
             set_nvfp4_kernel(parse_kernel(kname));
@@ -313,23 +278,22 @@ int main(int argc, char** argv) {
                     for (int r = 0; r < runs; ++r) {
                         std::vector<int> out = model.generate(prompt, n, ds, seed, false);
                         const DiffPerfStats& s = model.stats();
-                        int eff_tokens = effective_token_count(s, n, model.config().canvas_length);
-                        double eff_tps = effective_tps_for(s, eff_tokens);
-                        double tok_per_fwd = tokens_per_forward_for(s, eff_tokens);
+                        double output_tps = output_tps_for(s);
+                        double tok_per_fwd = tokens_per_forward_for(s);
                         if (result_tokenizer)
                             print_bench_result(*result_tokenizer, out, kname, p, n, r + 1, runs);
                         pre.push_back(s.prefill_tps());
-                        dec.push_back(eff_tps);
+                        dec.push_back(output_tps);
                         fwd.push_back(s.decode_passes_ps());
                         canvas.push_back(s.decode_passes_ps() * model.config().canvas_length);
                         tpf += tok_per_fwd;
                         pass += s.decode_passes;
                         double arena_gb = model.scratch_bytes() / (1024.0 * 1024.0 * 1024.0);
                         std::printf("[bench] %-8s p%-5d n%-5d run %d/%d: "
-                                    "prefill %.0f t/s | effective %.1f t/s | canvas %.0f pos/s | %.2f fwd/s | %d passes "
+                                    "prefill %.0f t/s | output %.1f t/s | canvas %.0f pos/s | %.2f fwd/s | %d passes "
                                     "| kv %.3f MB/token | arena %.2f GB\n",
                                     kname.c_str(), p, n, r + 1, runs,
-                                    s.prefill_tps(), eff_tps,
+                                    s.prefill_tps(), output_tps,
                                     s.decode_passes_ps() * model.config().canvas_length,
                                     s.decode_passes_ps(), s.decode_passes, kv_mb_per_t, arena_gb);
                     }
@@ -342,7 +306,7 @@ int main(int argc, char** argv) {
         // ---- report ----
         std::printf("\n");
         if (md) {
-            std::printf("| kernel | n_prompt | n_gen | ds | prefill t/s | effective t/s | canvas pos/s | fwd/s | tok/fwd | passes |\n");
+            std::printf("| kernel | n_prompt | n_gen | ds | prefill t/s | output t/s | canvas pos/s | fwd/s | tok/fwd | passes |\n");
             std::printf("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
             for (auto& r : rows)
                 std::printf("| %s | %d | %d | %d | %.0f ± %.0f | %.1f ± %.1f | %.0f ± %.0f | %.2f ± %.2f | %.1f | %.0f |\n",
@@ -353,7 +317,7 @@ int main(int argc, char** argv) {
         } else {
             std::printf("%-8s %8s %6s %4s  %14s  %15s  %15s  %13s  %7s %7s\n",
                         "kernel", "n_prompt", "n_gen", "ds", "prefill t/s",
-                        "effective t/s", "canvas pos/s", "fwd/s", "tok/fwd", "passes");
+                        "output t/s", "canvas pos/s", "fwd/s", "tok/fwd", "passes");
             std::printf("%s\n", std::string(120, '-').c_str());
             for (auto& r : rows)
                 std::printf("%-8s %8d %6d %4d  %7.0f ±%-5.0f  %8.1f ±%-5.1f  %8.0f ±%-5.0f  %6.2f ±%-5.2f  %7.1f %7.0f\n",
