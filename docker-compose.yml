@@ -1,0 +1,40 @@
+# docker-compose.yml -- interactive GPU development environment.
+#
+# Usage:
+#   docker compose build
+#   docker compose run --rm dev          # drops you into a shell in /workspace
+# then inside the container, see README.md for the cmake build commands.
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: .devops/Dockerfile
+      args:
+        ONEAPI_VERSION: 2025.3.3-0-devel-ubuntu24.04
+        ONEDNN_VERSION: v3.12
+        INSTALL_RUST: "1"
+    image: myproject-dev:latest
+
+    # --- Intel GPU passthrough --------------------------------------------
+    # Exposes the host's render/card device nodes to the container so SYCL can
+    # target the GPU. Requires the host to have the Intel GPU kernel driver
+    # (i915 or xe) loaded and /dev/dri present.
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      # Only needed when running as a NON-root user inside the container.
+      # The 'render' group on the HOST owns /dev/dri/renderD*. Find its GID:
+      #   getent group render | cut -d: -f3
+      # then export it before `docker compose ...`, e.g. RENDER_GID=110.
+      - "${RENDER_GID:-render}"
+
+    # --- Source + build artifacts -----------------------------------------
+    volumes:
+      - .:/workspace:cached          # edit on host, build in container
+    working_dir: /workspace
+
+    # Keep an interactive shell available.
+    stdin_open: true
+    tty: true
+    command: bash
