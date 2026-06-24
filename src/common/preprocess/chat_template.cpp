@@ -71,6 +71,7 @@ std::string repeat_token(const std::string& token, int count) {
 PromptBuildResult render_chat_prompt(
     const std::string& model_dir,
     json messages,
+    json tools,
     const std::vector<int>& image_token_counts,
     const std::vector<int>& audio_token_counts,
     bool add_generation_prompt,
@@ -82,7 +83,7 @@ PromptBuildResult render_chat_prompt(
     minja::chat_template tmpl(source, meta.bos_token, meta.eos_token);
     minja::chat_template_inputs inputs;
     inputs.messages = std::move(messages);
-    inputs.tools = json::array();
+    inputs.tools = std::move(tools);
     inputs.add_generation_prompt = add_generation_prompt;
     inputs.extra_context = {{"enable_thinking", enable_thinking}};
 
@@ -141,7 +142,7 @@ PromptBuildResult build_chat_prompt(
     content.push_back({{"type", "text"}, {"text", user_prompt}});
 
     json messages = json::array({{{"role", "user"}, {"content", content}}});
-    return render_chat_prompt(model_dir, std::move(messages),
+    return render_chat_prompt(model_dir, std::move(messages), json::array(),
                               image_token_counts, audio_token_counts,
                               add_generation_prompt, enable_thinking);
 }
@@ -164,7 +165,22 @@ PromptBuildResult build_chat_prompt(
         rendered_messages.push_back({{"role", message.role}, {"content", content}});
     }
 
-    return render_chat_prompt(model_dir, std::move(rendered_messages),
+    return render_chat_prompt(model_dir, std::move(rendered_messages), json::array(),
+                              {}, {}, add_generation_prompt, enable_thinking);
+}
+
+PromptBuildResult build_chat_prompt_json(
+    const std::string& model_dir,
+    json messages,
+    json tools,
+    bool add_generation_prompt,
+    bool enable_thinking
+) {
+    if (!messages.is_array() || messages.empty())
+        throw std::runtime_error("chat prompt needs at least one message");
+    if (!tools.is_array())
+        throw std::runtime_error("chat prompt tools must be an array");
+    return render_chat_prompt(model_dir, std::move(messages), std::move(tools),
                               {}, {}, add_generation_prompt, enable_thinking);
 }
 

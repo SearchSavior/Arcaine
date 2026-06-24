@@ -16,8 +16,20 @@ std::vector<int> TokenizerBridge::build_prompt(const std::vector<ChatTemplateMes
     return std::move(built.tokens);
 }
 
+std::vector<int> TokenizerBridge::build_prompt_json(const nlohmann::ordered_json& messages,
+                                                    const nlohmann::ordered_json& tools) {
+    auto built = build_chat_prompt_json(model_dir_, messages, tools,
+        /*add_generation_prompt=*/true, /*enable_thinking=*/false);
+    return std::move(built.tokens);
+}
+
 std::string TokenizerBridge::decode(const std::vector<int>& token_ids) {
     return tokenizer_.decode(token_ids, /*skip_special=*/true);
+}
+
+std::string TokenizerBridge::decode_raw(const std::vector<int>& token_ids) {
+    return tokenizer_.decode(token_ids, /*skip_special=*/false,
+                             /*strip_leading_space=*/false);
 }
 
 std::vector<std::string> TokenizerBridge::pieces(const std::vector<int>& token_ids) {

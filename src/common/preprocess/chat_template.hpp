@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 // Architecture-independent chat templating. Minja renders the model's
 // chat_template.jinja and the native tokenizer.json loader maps text to ids,
@@ -29,6 +30,14 @@ PromptBuildResult build_chat_prompt(
 PromptBuildResult build_chat_prompt(
     const std::string& model_dir,
     const std::vector<ChatTemplateMessage>& messages,
+    bool add_generation_prompt = true,
+    bool enable_thinking = false
+);
+
+PromptBuildResult build_chat_prompt_json(
+    const std::string& model_dir,
+    nlohmann::ordered_json messages,
+    nlohmann::ordered_json tools = nlohmann::ordered_json::array(),
     bool add_generation_prompt = true,
     bool enable_thinking = false
 );

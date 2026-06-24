@@ -1,6 +1,7 @@
 #pragma once
 #include "../common/preprocess/tokenizer.hpp"
 #include "../common/preprocess/chat_template.hpp"
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -15,7 +16,10 @@ public:
 
     std::vector<int> build_prompt(const std::string& user_prompt);
     std::vector<int> build_prompt(const std::vector<ChatTemplateMessage>& messages);
+    std::vector<int> build_prompt_json(const nlohmann::ordered_json& messages,
+                                       const nlohmann::ordered_json& tools);
     std::string decode(const std::vector<int>& token_ids);
+    std::string decode_raw(const std::vector<int>& token_ids);
     std::vector<std::string> pieces(const std::vector<int>& token_ids);
 
 private:

@@ -17,7 +17,6 @@ endif()
 # which is on CMAKE_PREFIX_PATH (set via ENV in the Dockerfile), so this
 # find_package picks up its DNNLConfig.cmake automatically.
 find_package(dnnl CONFIG REQUIRED)
-
 include_directories(third_party third_party/minja/include)
 
 # The dev image also ships older oneDNN builds through oneAPI/OpenVINO. Keep the
@@ -125,6 +124,12 @@ target_compile_options(diffusion_gemma PRIVATE -fsycl -fno-sycl-id-queries-fit-i
 target_link_options(diffusion_gemma   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
+# OpenAI-compatible HTTP API server for DiffusionGemma.
+add_executable(diffusion_server src/diffusion_server.cpp src/utils/tool_call_parser.cpp ${DIFFUSION_SRCS})
+target_compile_options(diffusion_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(diffusion_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(diffusion_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+
 # llama-bench style throughput benchmark (loads once, sweeps expert kernels).
 add_executable(diffusion_bench src/diffusion_bench.cpp ${DIFFUSION_SRCS})
 target_compile_options(diffusion_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
@@ -132,3 +137,4 @@ target_link_options(diffusion_bench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG}
 target_link_options(diffusion_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
+target_link_libraries(diffusion_server PRIVATE DNNL::dnnl)

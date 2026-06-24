@@ -2,7 +2,8 @@
 #
 # Usage:
 #   docker compose build
-#   docker compose run --rm dev          # drops you into a shell in /workspace
+#   docker compose run --rm --service-ports dev
+#                                        # drops you into a shell with ports published
 # then inside the container, see README.md for the cmake build commands.
 
 services:
@@ -33,6 +34,8 @@ services:
     volumes:
       - .:/workspace:cached          # edit on host, build in container
     working_dir: /workspace
+    ports:
+      - "7461:7461"
 
     # Keep an interactive shell available.
     stdin_open: true

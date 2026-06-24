@@ -27,14 +27,12 @@ Arcaine currently implements DiffusionGemma
 - Gemma4-12B [BF16](https://huggingface.co/google/gemma-4-12B-it)
 
 
-
-
 ## Container setup
 
 ```bash
 export RENDER_GID=$(getent group render | cut -d: -f3)
 docker compose build
-docker compose run --rm \
+docker compose run --rm --service-ports \
   -v /mnt/Ironwolf-4TB/Projects/arcana/models:/workspace/models \
   dev   # interactive shell in /workspace
 ```
@@ -65,6 +63,45 @@ Doing the build makes a few binaries which all accept `--help`.
 
 Host requirements: Linux, Intel GPU, `i915`/`xe` driver, `/dev/dri` present,
 user in `render` group.
+
+## OpenAI-compatible API server
+
+`diffusion_server` loads one DiffusionGemma model and serves `GET /v1/models`
+and `POST /v1/chat/completions`. Authentication is disabled by default; set
+`ARCAINE_API_KEY` to require `Authorization: Bearer <key>`.
+
+```bash
+ARCAINE_API_KEY=local ./build/diffusion_server \
+  --model models/diffusiongemma-26B-A4B-it-NVFP4 \
+  --served-model-name diffusiongemma-26B-A4B-it-NVFP4 \
+  --host 0.0.0.0 \
+  --port 7461
+```
+
+```bash
+curl http://127.0.0.1:7461/v1/models \
+  -H "Authorization: Bearer local"
+```
+
+```bash
+curl http://127.0.0.1:7461/v1/chat/completions \
+  -H "Authorization: Bearer local" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"diffusiongemma-26B-A4B-it-NVFP4","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":64}'
+```
+
+Streaming uses OpenAI-style append-only content deltas. Add
+`"arcaine_stream_drafts":true` to receive custom `arcaine.diffusion_step` SSE
+events with the mutable denoising canvas text.
+
+The OpenAI-client integration tests are opt-in and expect a running server:
+
+```bash
+ARCAINE_TEST_OPENAI_BASE_URL=http://127.0.0.1:7461/v1 \
+ARCAINE_TEST_MODEL=diffusiongemma-26B-A4B-it-NVFP4 \
+ARCAINE_TEST_API_KEY=local \
+pytest tests/test_openai_tool_calling.py
+```
 
 
 ## Notes
