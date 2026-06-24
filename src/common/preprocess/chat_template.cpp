@@ -75,7 +75,8 @@ PromptBuildResult render_chat_prompt(
     const std::vector<int>& image_token_counts,
     const std::vector<int>& audio_token_counts,
     bool add_generation_prompt,
-    bool enable_thinking
+    bool enable_thinking,
+    json chat_template_kwargs = json::object()
 ) {
     const TokenizerMetadata meta = load_tokenizer_metadata(model_dir);
     const std::string source = read_file(model_dir + "/chat_template.jinja");
@@ -85,7 +86,13 @@ PromptBuildResult render_chat_prompt(
     inputs.messages = std::move(messages);
     inputs.tools = std::move(tools);
     inputs.add_generation_prompt = add_generation_prompt;
-    inputs.extra_context = {{"enable_thinking", enable_thinking}};
+    // Start from the dedicated enable_thinking flag, then let explicit
+    // --chat-template-kwargs override it (and add any other template vars).
+    json extra_context = {{"enable_thinking", enable_thinking}};
+    if (chat_template_kwargs.is_object())
+        for (auto& [key, value] : chat_template_kwargs.items())
+            extra_context[key] = value;
+    inputs.extra_context = std::move(extra_context);
 
     std::string rendered = tmpl.apply(inputs);
 
@@ -174,14 +181,16 @@ PromptBuildResult build_chat_prompt_json(
     json messages,
     json tools,
     bool add_generation_prompt,
-    bool enable_thinking
+    bool enable_thinking,
+    json chat_template_kwargs
 ) {
     if (!messages.is_array() || messages.empty())
         throw std::runtime_error("chat prompt needs at least one message");
     if (!tools.is_array())
         throw std::runtime_error("chat prompt tools must be an array");
     return render_chat_prompt(model_dir, std::move(messages), std::move(tools),
-                              {}, {}, add_generation_prompt, enable_thinking);
+                              {}, {}, add_generation_prompt, enable_thinking,
+                              std::move(chat_template_kwargs));
 }
 
 std::string decode_tokens(

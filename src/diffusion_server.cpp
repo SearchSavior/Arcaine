@@ -22,6 +22,7 @@
 #include "common/gpu/placement.hpp"
 #include "diffusion_gemma/model.hpp"
 #include "utils/chat.hpp"
+#include "utils/chat_template_kwargs.hpp"
 #include "utils/tool_call_parser.hpp"
 
 using json = nlohmann::ordered_json;
@@ -39,6 +40,7 @@ struct ServerOptions {
     unsigned seed = 42;
     bool print_placement = true;
     DiffPlacementOptions placement;
+    json chat_template_kwargs = json::object();
 };
 
 struct ChatRequest {
@@ -523,6 +525,8 @@ json chat_response(const std::string& id, const ChatRequest& chat,
             ? json(nullptr)
             : json(parsed.content)},
     };
+    if (!parsed.reasoning_content.empty())
+        message["reasoning_content"] = parsed.reasoning_content;
     if (!parsed.tool_calls.empty())
         message["tool_calls"] = tool_calls_json(parsed.tool_calls);
 
@@ -596,7 +600,24 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                 id, created, chat.model, {{"role", "assistant"}}));
 
             std::vector<int> emitted_ids;
-            std::string emitted_text;
+            std::string emitted_reasoning;
+            std::string emitted_content;
+
+            // Prefix-diff a freshly parsed channel against what we already
+            // streamed; on a non-prefix change re-emit the whole string,
+            // matching the prior single-channel content behavior.
+            auto channel_delta = [](const std::string& full, std::string& emitted) -> std::string {
+                std::string delta;
+                if (full.size() >= emitted.size() &&
+                    full.compare(0, emitted.size(), emitted) == 0) {
+                    delta = full.substr(emitted.size());
+                } else {
+                    delta = full;
+                }
+                emitted = full;
+                return delta;
+            };
+
             DiffStreamCallback on_step = [&](const DiffStepEvent& ev) {
                 if (!ok || !ev.canvas) return;
                 if (ev.committed && !saw_first_commit) {
@@ -624,18 +645,20 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                                    ev.canvas->begin() +
                                        static_cast<std::vector<int>::difference_type>(take));
 
-                std::string full = app.tokenizer.decode(emitted_ids);
-                std::string delta;
-                if (full.size() >= emitted_text.size() &&
-                    full.compare(0, emitted_text.size(), emitted_text) == 0) {
-                    delta = full.substr(emitted_text.size());
-                } else {
-                    delta = full;
-                }
-                emitted_text = full;
-                if (!delta.empty()) {
+                ParsedAssistantOutput parsed =
+                    parse_assistant_output(app.tokenizer.decode_raw(emitted_ids));
+                std::string reasoning_delta =
+                    channel_delta(parsed.reasoning_content, emitted_reasoning);
+                if (!reasoning_delta.empty()) {
                     ok = write_sse(sink, chat_completion_chunk(
-                        id, created, chat.model, {{"content", delta}}));
+                        id, created, chat.model, {{"reasoning_content", reasoning_delta}}));
+                    if (!ok) return;
+                }
+                std::string content_delta =
+                    channel_delta(parsed.content, emitted_content);
+                if (!content_delta.empty()) {
+                    ok = write_sse(sink, chat_completion_chunk(
+                        id, created, chat.model, {{"content", content_delta}}));
                 }
             };
 
@@ -653,6 +676,8 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                         parse_assistant_output(app.tokenizer.decode_raw(generated));
                     emitted_ids = generated;
                     json delta = json::object();
+                    if (!parsed.reasoning_content.empty())
+                        delta["reasoning_content"] = parsed.reasoning_content;
                     if (!parsed.tool_calls.empty()) {
                         delta["tool_calls"] = tool_calls_json(parsed.tool_calls);
                     } else if (!parsed.content.empty()) {
@@ -666,10 +691,16 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     if (generated.size() > (size_t)chat.max_tokens)
                         generated.resize((size_t)chat.max_tokens);
                     emitted_ids = generated;
-                    emitted_text = app.tokenizer.decode(emitted_ids);
-                    if (!emitted_text.empty()) {
+                    ParsedAssistantOutput parsed =
+                        parse_assistant_output(app.tokenizer.decode_raw(emitted_ids));
+                    json delta = json::object();
+                    if (!parsed.reasoning_content.empty())
+                        delta["reasoning_content"] = parsed.reasoning_content;
+                    if (!parsed.content.empty())
+                        delta["content"] = parsed.content;
+                    if (!delta.empty()) {
                         ok = write_sse(sink, chat_completion_chunk(
-                            id, created, chat.model, {{"content", emitted_text}}));
+                            id, created, chat.model, std::move(delta)));
                     }
                 }
 
@@ -769,7 +800,9 @@ void usage(const char* p) {
         "  --experts <spec>           expert placement: auto, layer-owner, replicate, shard, ranges:N,N,..., gpus:N\n"
         "  --gpus <spec>              GPU selection: all, or future comma-list (default: all)\n"
         "  --print-placement          print resolved placement during model load (default)\n"
-        "  --no-print-placement       suppress placement report during model load\n",
+        "  --no-print-placement       suppress placement report during model load\n"
+        "  --chat-template-kwargs <json>  JSON object merged into chat template vars,\n"
+        "                             e.g. '{\"enable_thinking\": true}' (default: {})\n",
         p);
 }
 
@@ -795,6 +828,7 @@ ServerOptions parse_args(int argc, char** argv) {
         else if (a == "--gpus")              apply_gpus_spec(next());
         else if (a == "--print-placement")   opts.print_placement = true;
         else if (a == "--no-print-placement") opts.print_placement = false;
+        else if (a == "--chat-template-kwargs") opts.chat_template_kwargs = parse_chat_template_kwargs(next());
         else throw std::runtime_error("unknown arg: " + a);
     }
     if (opts.model_dir.empty()) throw std::runtime_error("--model is required");
@@ -836,8 +870,8 @@ int main(int argc, char** argv) {
                     return;
                 }
                 ChatRequest chat = parse_chat_request(req, app);
-                std::vector<int> prompt_ids = app.tokenizer.build_prompt_json(chat.messages,
-                                                                              chat.tools);
+                std::vector<int> prompt_ids = app.tokenizer.build_prompt_json(
+                    chat.messages, chat.tools, app.opts.chat_template_kwargs);
                 if ((int)prompt_ids.size() + chat.max_tokens > app.model.kv_cache_max_seq()) {
                     bad_request("prompt_tokens + max_tokens exceeds server max_seq");
                 }

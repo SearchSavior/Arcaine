@@ -90,6 +90,18 @@ target_link_options(test_tokenizer   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_libraries(test_tokenizer PRIVATE DNNL::dnnl)
 
 # ---------------------------------------------------------------------------
+# --chat-template-kwargs parsing + chat-template merge. Logic is SYCL-free, but
+# the global -fsycl-targets flag means every target must also pass -fsycl.
+# Pass a model dir as argv[1] to exercise the render-merge assertions.
+add_executable(test_chat_template_kwargs
+    src/utils/test_chat_template_kwargs.cpp
+    src/common/preprocess/chat_template.cpp
+    src/common/preprocess/tokenizer.cpp)
+target_compile_options(test_chat_template_kwargs PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(test_chat_template_kwargs    PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_libraries(test_chat_template_kwargs  PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
 # Inference benchmark. Goes through the model registry, so it links the same
 # architecture + common sources as the main binary.
 add_executable(bench src/bench.cpp ${COMMON_SRCS} ${ARCH_SRCS})

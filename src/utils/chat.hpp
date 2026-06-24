@@ -16,8 +16,11 @@ public:
 
     std::vector<int> build_prompt(const std::string& user_prompt);
     std::vector<int> build_prompt(const std::vector<ChatTemplateMessage>& messages);
-    std::vector<int> build_prompt_json(const nlohmann::ordered_json& messages,
-                                       const nlohmann::ordered_json& tools);
+    std::vector<int> build_prompt_json(
+        const nlohmann::ordered_json& messages,
+        const nlohmann::ordered_json& tools,
+        const nlohmann::ordered_json& chat_template_kwargs =
+            nlohmann::ordered_json::object());
     std::string decode(const std::vector<int>& token_ids);
     std::string decode_raw(const std::vector<int>& token_ids);
     std::vector<std::string> pieces(const std::vector<int>& token_ids);

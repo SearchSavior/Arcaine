@@ -39,7 +39,8 @@ PromptBuildResult build_chat_prompt_json(
     nlohmann::ordered_json messages,
     nlohmann::ordered_json tools = nlohmann::ordered_json::array(),
     bool add_generation_prompt = true,
-    bool enable_thinking = false
+    bool enable_thinking = false,
+    nlohmann::ordered_json chat_template_kwargs = nlohmann::ordered_json::object()
 );
 
 std::string decode_tokens(
