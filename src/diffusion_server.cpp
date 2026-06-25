@@ -525,8 +525,6 @@ json chat_response(const std::string& id, const ChatRequest& chat,
             ? json(nullptr)
             : json(parsed.content)},
     };
-    if (!parsed.reasoning_content.empty())
-        message["reasoning_content"] = parsed.reasoning_content;
     if (!parsed.tool_calls.empty())
         message["tool_calls"] = tool_calls_json(parsed.tool_calls);
 
@@ -600,12 +598,11 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                 id, created, chat.model, {{"role", "assistant"}}));
 
             std::vector<int> emitted_ids;
-            std::string emitted_reasoning;
             std::string emitted_content;
 
-            // Prefix-diff a freshly parsed channel against what we already
+            // Prefix-diff freshly parsed content against what we already
             // streamed; on a non-prefix change re-emit the whole string,
-            // matching the prior single-channel content behavior.
+            // matching the prior content behavior.
             auto channel_delta = [](const std::string& full, std::string& emitted) -> std::string {
                 std::string delta;
                 if (full.size() >= emitted.size() &&
@@ -647,13 +644,6 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
 
                 ParsedAssistantOutput parsed =
                     parse_assistant_output(app.tokenizer.decode_raw(emitted_ids));
-                std::string reasoning_delta =
-                    channel_delta(parsed.reasoning_content, emitted_reasoning);
-                if (!reasoning_delta.empty()) {
-                    ok = write_sse(sink, chat_completion_chunk(
-                        id, created, chat.model, {{"reasoning_content", reasoning_delta}}));
-                    if (!ok) return;
-                }
                 std::string content_delta =
                     channel_delta(parsed.content, emitted_content);
                 if (!content_delta.empty()) {
@@ -676,8 +666,6 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                         parse_assistant_output(app.tokenizer.decode_raw(generated));
                     emitted_ids = generated;
                     json delta = json::object();
-                    if (!parsed.reasoning_content.empty())
-                        delta["reasoning_content"] = parsed.reasoning_content;
                     if (!parsed.tool_calls.empty()) {
                         delta["tool_calls"] = tool_calls_json(parsed.tool_calls);
                     } else if (!parsed.content.empty()) {
@@ -694,8 +682,6 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     ParsedAssistantOutput parsed =
                         parse_assistant_output(app.tokenizer.decode_raw(emitted_ids));
                     json delta = json::object();
-                    if (!parsed.reasoning_content.empty())
-                        delta["reasoning_content"] = parsed.reasoning_content;
                     if (!parsed.content.empty())
                         delta["content"] = parsed.content;
                     if (!delta.empty()) {

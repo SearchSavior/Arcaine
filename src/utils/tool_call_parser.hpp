@@ -11,7 +11,6 @@ struct ParsedToolCall {
 
 struct ParsedAssistantOutput {
     std::string content;
-    std::string reasoning_content;
     std::vector<ParsedToolCall> tool_calls;
 };
 

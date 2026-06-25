@@ -190,26 +190,22 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw_text) {
         search = s;
     }
 
-    // Capture the model's reasoning (thought channel) as reasoning_content
-    // instead of discarding it. An unterminated block means we are mid-stream
-    // and still inside the reasoning, so treat its remainder as reasoning.
+    // Strip the model's thought channel from public content. An unterminated
+    // block means we are mid-stream and still inside the reasoning, so drop
+    // the remainder for now.
     const std::string thought_start = "<|channel>thought\n";
     const std::string thought_end = "<channel|>";
-    std::string reasoning;
     while (true) {
         size_t s = content.find(thought_start);
         if (s == std::string::npos) break;
         size_t body = s + thought_start.size();
         size_t e = content.find(thought_end, body);
         if (e == std::string::npos) {
-            reasoning += content.substr(body);
             content.erase(s);
             break;
         }
-        reasoning += content.substr(body, e - body);
         content.erase(s, e + thought_end.size() - s);
     }
-    out.reasoning_content = trim_copy(reasoning);
 
     erase_all(content, "<turn|>");
     erase_all(content, "<|tool_response>");
