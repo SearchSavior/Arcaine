@@ -137,7 +137,10 @@ target_link_options(diffusion_gemma   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG}
 target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
 # OpenAI-compatible HTTP API server for DiffusionGemma.
-add_executable(diffusion_server src/diffusion_server.cpp src/utils/tool_call_parser.cpp ${DIFFUSION_SRCS})
+add_executable(diffusion_server
+    src/diffusion_server.cpp
+    src/utils/gemma4_tool_call_parser.cpp
+    ${DIFFUSION_SRCS})
 target_compile_options(diffusion_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)

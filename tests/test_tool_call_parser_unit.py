@@ -37,13 +37,13 @@ def parser_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
     if shutil.which("g++") is None:
         pytest.skip("g++ is required for the C++ parser unit harness")
 
-    build_dir = tmp_path_factory.mktemp("tool_call_parser")
-    harness = build_dir / "tool_call_parser_harness.cpp"
-    binary = build_dir / "tool_call_parser_harness"
+    build_dir = tmp_path_factory.mktemp("gemma4_tool_call_parser")
+    harness = build_dir / "gemma4_tool_call_parser_harness.cpp"
+    binary = build_dir / "gemma4_tool_call_parser_harness"
     harness.write_text(
         textwrap.dedent(
             r'''
-            #include "utils/tool_call_parser.hpp"
+            #include "utils/gemma4_tool_call_parser.hpp"
             #include <nlohmann/json.hpp>
             #include <iostream>
             #include <iterator>
@@ -74,7 +74,8 @@ def parser_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "g++",
             "-std=c++17",
             str(harness),
-            str(REPO_ROOT / "src/utils/tool_call_parser.cpp"),
+            str(REPO_ROOT / "src/utils/gemma4_tool_call_parser.cpp"),
+            str(REPO_ROOT / "src/common/preprocess/tokenizer.cpp"),
             "-I",
             str(REPO_ROOT / "src"),
             "-I",
@@ -178,6 +179,78 @@ def test_parses_nested_arrays_and_objects(
         "query": "intel gpu",
         "filters": {"vendor": "intel", "ids": [1, 2, 3], "enabled": False},
     }
+
+
+def test_parses_tool_call_with_extra_trailing_brace(
+    parser_harness: Path,
+    diffusiongemma_tokenizer_config: dict,
+):
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    parsed = parse_with_harness(
+        parser_harness,
+        f"{stc_token}call:bash{{command:{escape_token}"
+        "uv venv .venv\nsource .venv/bin/activate\npython stability_proof.py"
+        f"{escape_token}}}}}{etc_token}",
+    )
+
+    assert parsed["content"] == ""
+    assert len(parsed["tool_calls"]) == 1
+    call = parsed["tool_calls"][0]
+    assert call["name"] == "bash"
+    assert json.loads(call["arguments"]) == {
+        "command": "uv venv .venv\nsource .venv/bin/activate\npython stability_proof.py",
+    }
+
+
+def test_parses_tool_call_with_duplicated_nested_braces(
+    parser_harness: Path,
+    diffusiongemma_tokenizer_config: dict,
+):
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    parsed = parse_with_harness(
+        parser_harness,
+        f"{stc_token}call:edit{{edits:[{{{{newText:{escape_token}"
+        "dy_noisy = np.diff(y_noisy) / h"
+        f"{escape_token},oldText:{escape_token}"
+        "dy_noisy = np.diff(y_noisy, h) / h"
+        f"{escape_token}}}],path:{escape_token}stability_proof.py{escape_token}}}}}{etc_token}",
+    )
+
+    assert parsed["content"] == ""
+    assert len(parsed["tool_calls"]) == 1
+    call = parsed["tool_calls"][0]
+    assert call["name"] == "edit"
+    assert json.loads(call["arguments"]) == {
+        "edits": [
+            {
+                "newText": "dy_noisy = np.diff(y_noisy) / h",
+                "oldText": "dy_noisy = np.diff(y_noisy, h) / h",
+            }
+        ],
+        "path": "stability_proof.py",
+    }
+
+
+def test_parses_visible_content_before_malformed_edit_tool_call(
+    parser_harness: Path,
+    diffusiongemma_tokenizer_config: dict,
+):
+    special = diffusiongemma_tokenizer_config["model_specific_special_tokens"]
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    parsed = parse_with_harness(
+        parser_harness,
+        f"{special['soc_token']}thought\n{special['eoc_token']}"
+        "The error occurred because np.diff does not take a step size.\n\n"
+        f"{stc_token}call:edit{{edits:[{{{{newText:{escape_token}"
+        "dy_noisy = np.diff(y_noisy) / h"
+        f"{escape_token},oldText:{escape_token}"
+        "dy_noisy = np.diff(y_noisy, h) / h"
+        f"{escape_token}}}],path:{escape_token}stability_proof.py{escape_token}}}}}{etc_token}",
+    )
+
+    assert parsed["content"] == "The error occurred because np.diff does not take a step size."
+    assert len(parsed["tool_calls"]) == 1
+    assert parsed["tool_calls"][0]["name"] == "edit"
 
 
 def test_removes_gemma_tokenizer_thinking_and_special_tokens_from_content(

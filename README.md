@@ -12,6 +12,8 @@ Initial release implements
 - NVFP4 support for DiffusionGemma using hand-optimized SPIR-V FP4/FP8 rescaling kernels + latest oneDNN support NVFP4 matmul and reorder
 - small chat cli
 - produce html visualizations that replay denoising steps with diffusion-gemma
+- openai /v1/chat/completions for diffusiongemma
+- tool call parser, validated with pi + tests
 
 It's early days and the project is expected to move quickly- there are a ton of details to iron out.
 
@@ -49,8 +51,9 @@ The CMake targets add the NVFP4/DPAS SPIR-V translator extension at link time.
 Do not pass `-Xspirv-translator` as a global compile flag; DPC++ will warn that
 it is unused during normal host compilation.
 
-For an AOT Battlemage build, add the SYCL target explicitly:
+For an B70 and maybe B50/B60 Battlemage build, add the SYCL target explicitly:
 
+B60 and B50 might be intel_gpu_bmg_g21
 ```bash
 cmake -B build -G Ninja \
   -DCMAKE_CXX_COMPILER=icpx \
@@ -85,23 +88,13 @@ curl http://127.0.0.1:7461/v1/models \
 
 ```bash
 curl http://127.0.0.1:7461/v1/chat/completions \
-  -H "Authorization: Bearer local" \
   -H "Content-Type: application/json" \
-  -d '{"model":"diffusiongemma-26B-A4B-it-NVFP4","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":64}'
+  -d '{"model":"diffusiongemma-26B-A4B-it-NVFP4","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":1000,"stream":true,"arcaine_stream_drafts":true}'
 ```
 
 Streaming uses OpenAI-style append-only content deltas. Add
 `"arcaine_stream_drafts":true` to receive custom `arcaine.diffusion_step` SSE
 events with the mutable denoising canvas text.
-
-The OpenAI-client integration tests are opt-in and expect a running server:
-
-```bash
-ARCAINE_TEST_OPENAI_BASE_URL=http://127.0.0.1:7461/v1 \
-ARCAINE_TEST_MODEL=diffusiongemma-26B-A4B-it-NVFP4 \
-ARCAINE_TEST_API_KEY=local \
-pytest tests/test_openai_tool_calling.py
-```
 
 
 ## Notes

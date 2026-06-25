@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <exception>
+#include <fstream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -23,7 +24,7 @@
 #include "diffusion_gemma/model.hpp"
 #include "utils/chat.hpp"
 #include "utils/chat_template_kwargs.hpp"
-#include "utils/tool_call_parser.hpp"
+#include "utils/gemma4_tool_call_parser.hpp"
 
 using json = nlohmann::ordered_json;
 
@@ -39,6 +40,8 @@ struct ServerOptions {
     int steps = -1;
     unsigned seed = 42;
     bool print_placement = true;
+    bool debug = false;
+    std::string debug_log_path = "arcaine_debug.log";
     DiffPlacementOptions placement;
     json chat_template_kwargs = json::object();
 };
@@ -80,6 +83,7 @@ struct AppState {
     std::time_t created = std::time(nullptr);
     std::string api_key;
     TokenizerBridge tokenizer;
+    Gemma4TokenBoundaryParser token_boundaries;
     DiffusionGemmaModel model;
     std::mutex generate_mu;
 
@@ -87,6 +91,7 @@ struct AppState {
         : opts(std::move(o)),
           api_key(std::getenv("ARCAINE_API_KEY") ? std::getenv("ARCAINE_API_KEY") : ""),
           tokenizer(opts.model_dir),
+          token_boundaries(opts.model_dir),
           model(opts.model_dir, opts.max_seq, opts.placement, opts.print_placement) {}
 };
 
@@ -129,6 +134,24 @@ std::string now_string() {
 void log_line(const char* level, const std::string& message) {
     std::fprintf(stderr, "[api][%s][%s] %s\n", now_string().c_str(), level, message.c_str());
     std::fflush(stderr);
+}
+
+void init_debug_log(const ServerOptions& opts) {
+    if (!opts.debug) return;
+    std::ofstream out(opts.debug_log_path, std::ios::trunc);
+    if (!out)
+        throw std::runtime_error("cannot open debug log: " + opts.debug_log_path);
+    out << "[api][" << now_string() << "][debug] debug log started\n";
+}
+
+void debug_log(const AppState& app, const json& entry) {
+    if (!app.opts.debug) return;
+    std::ofstream out(app.opts.debug_log_path, std::ios::app);
+    if (!out) {
+        log_line("error", "cannot append debug log: " + app.opts.debug_log_path);
+        return;
+    }
+    out << entry.dump(2) << "\n";
 }
 
 std::string request_label(const httplib::Request& req) {
@@ -290,15 +313,28 @@ json parse_tool_calls_field(const json& tool_calls) {
             bad_request("tool call function.name must be a string");
         if (!fn.contains("arguments"))
             bad_request("tool call function.arguments is required");
-        std::string arguments = fn.at("arguments").is_string()
-            ? fn.at("arguments").get<std::string>()
-            : fn.at("arguments").dump();
+        json arguments;
+        if (fn.at("arguments").is_string()) {
+            const std::string raw_arguments = fn.at("arguments").get<std::string>();
+            try {
+                json parsed_arguments = json::parse(raw_arguments);
+                arguments = parsed_arguments.is_object()
+                    ? std::move(parsed_arguments)
+                    : json(raw_arguments);
+            } catch (const std::exception&) {
+                arguments = raw_arguments;
+            }
+        } else {
+            arguments = fn.at("arguments").is_object()
+                ? fn.at("arguments")
+                : json(fn.at("arguments").dump());
+        }
 
         json normalized = {
             {"type", "function"},
             {"function", {
                 {"name", fn.at("name").get<std::string>()},
-                {"arguments", arguments},
+                {"arguments", std::move(arguments)},
             }},
         };
         if (call.contains("id") && call.at("id").is_string())
@@ -457,6 +493,11 @@ std::string metrics_log(const ResponseMetrics& m) {
            " duration=" + std::to_string(m.duration);
 }
 
+std::string boundary_counts_log(const Gemma4TokenBoundaryCounts& counts) {
+    return "reasoning_tokens=" + std::to_string(counts.reasoning_tokens) +
+           " response_tokens=" + std::to_string(counts.response_tokens);
+}
+
 json chat_completion_chunk(const std::string& id, std::time_t created,
                            const std::string& model, json delta,
                            json finish_reason = nullptr, json usage = nullptr,
@@ -570,13 +611,39 @@ void handle_non_streaming(const ChatRequest& chat, const std::vector<int>& promp
         : "tool_calls";
     ResponseMetrics metrics = make_metrics((int)prompt_ids.size(), (int)generated.size(),
                                            ttft_s, duration_s, app.model.stats());
-    set_json(res, 200, chat_response(completion_id(), chat, std::time(nullptr), parsed,
-                                     (int)prompt_ids.size(), (int)generated.size(),
-                                     finish_reason, metrics));
+    Gemma4TokenBoundaryCounts boundary_counts = app.token_boundaries.count(generated);
+    const std::string id = completion_id();
+    const std::time_t created = std::time(nullptr);
+    json response = chat_response(id, chat, created, parsed,
+                                  (int)prompt_ids.size(), (int)generated.size(),
+                                  finish_reason, metrics);
+    set_json(res, 200, response);
+    debug_log(app, {
+        {"ts", now_string()},
+        {"type", "chat.completion"},
+        {"id", id},
+        {"model", chat.model},
+        {"stream", false},
+        {"has_tools", chat.has_tools},
+        {"prompt_tokens", (int)prompt_ids.size()},
+        {"prompt_text", app.tokenizer.decode_raw(prompt_ids)},
+        {"messages", chat.messages},
+        {"tools", chat.tools},
+        {"requested_max_tokens", chat.max_tokens},
+        {"generated_tokens", (int)generated.size()},
+        {"reasoning_tokens", boundary_counts.reasoning_tokens},
+        {"response_tokens", boundary_counts.response_tokens},
+        {"finish_reason", finish_reason},
+        {"raw_model_text", app.tokenizer.decode_raw(generated)},
+        {"public_content", parsed.content},
+        {"tool_calls", tool_calls_json(parsed.tool_calls)},
+        {"response", response},
+    });
     log_line("info", "completion generated model=" + chat.model +
                      " output_tokens=" + std::to_string(generated.size()) +
                      " finish_reason=" + finish_reason +
                      " tool_calls=" + std::to_string(parsed.tool_calls.size()) +
+                     " " + boundary_counts_log(boundary_counts) +
                      " " + metrics_log(metrics));
 }
 
@@ -701,9 +768,45 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                                                        (int)emitted_ids.size(),
                                                        ttft_s, duration_s,
                                                        app.model.stats());
+                Gemma4TokenBoundaryCounts boundary_counts = app.token_boundaries.count(generated);
+                ParsedAssistantOutput final_parsed =
+                    parse_assistant_output(app.tokenizer.decode_raw(generated));
+                json final_delta = json::object();
+                if (!final_parsed.tool_calls.empty()) {
+                    final_delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls);
+                } else if (!final_parsed.content.empty()) {
+                    final_delta["content"] = final_parsed.content;
+                }
+                debug_log(app, {
+                    {"ts", now_string()},
+                    {"type", "chat.completion.stream"},
+                    {"id", id},
+                    {"model", chat.model},
+                    {"stream", true},
+                    {"has_tools", chat.has_tools},
+                    {"prompt_tokens", (int)prompt_ids.size()},
+                    {"prompt_text", app.tokenizer.decode_raw(prompt_ids)},
+                    {"messages", chat.messages},
+                    {"tools", chat.tools},
+                    {"requested_max_tokens", chat.max_tokens},
+                    {"generated_tokens", (int)generated.size()},
+                    {"emitted_tokens", (int)emitted_ids.size()},
+                    {"reasoning_tokens", boundary_counts.reasoning_tokens},
+                    {"response_tokens", boundary_counts.response_tokens},
+                    {"finish_reason", finish_reason},
+                    {"raw_model_text", app.tokenizer.decode_raw(generated)},
+                    {"public_content", final_parsed.content},
+                    {"emitted_content", emitted_content},
+                    {"tool_calls", tool_calls_json(final_parsed.tool_calls)},
+                    {"final_delta", final_delta},
+                    {"final_chunk", chat_completion_chunk(
+                        id, created, chat.model, json::object(), finish_reason,
+                        nullptr, metrics_json(metrics))},
+                });
                 log_line("info", "stream completion generated model=" + chat.model +
                                  " output_tokens=" + std::to_string(emitted_ids.size()) +
                                  " finish_reason=" + finish_reason +
+                                 " " + boundary_counts_log(boundary_counts) +
                                  " " + metrics_log(metrics));
                 if (ok) {
                     ok = write_sse(sink, chat_completion_chunk(
@@ -787,6 +890,7 @@ void usage(const char* p) {
         "  --gpus <spec>              GPU selection: all, or future comma-list (default: all)\n"
         "  --print-placement          print resolved placement during model load (default)\n"
         "  --no-print-placement       suppress placement report during model load\n"
+        "  --debug                    write full debug responses to ./arcaine_debug.log\n"
         "  --chat-template-kwargs <json>  JSON object merged into chat template vars,\n"
         "                             e.g. '{\"enable_thinking\": true}' (default: {})\n",
         p);
@@ -814,6 +918,7 @@ ServerOptions parse_args(int argc, char** argv) {
         else if (a == "--gpus")              apply_gpus_spec(next());
         else if (a == "--print-placement")   opts.print_placement = true;
         else if (a == "--no-print-placement") opts.print_placement = false;
+        else if (a == "--debug")             opts.debug = true;
         else if (a == "--chat-template-kwargs") opts.chat_template_kwargs = parse_chat_template_kwargs(next());
         else throw std::runtime_error("unknown arg: " + a);
     }
@@ -831,6 +936,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     try {
         ServerOptions opts = parse_args(argc, argv);
+        init_debug_log(opts);
         std::printf("[api] loading model from %s ...\n", opts.model_dir.c_str());
         AppState app(std::move(opts));
         std::printf("[api] serving model id '%s'\n", app.opts.served_model_name.c_str());
