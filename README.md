@@ -1,8 +1,18 @@
 # Arcaine
 
-Arcaine is a from scratch inference engine builting using SYCL + oneDNN meant to deliver bleeding edge performance on intel devices with important features missing everywhere else in the stack.
 
-Note: this project makes heavy use of AI tools and generated code and may not be *artisinal*.
+
+
+[![Discord](https://img.shields.io/discord/1341627368581628004?logo=Discord&logoColor=%23ffffff&label=Discord&link=https%3A%2F%2Fdiscord.gg%2FmaMY7QjG)](https://discord.gg/Bzz9hax9Jq)
+[![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-Echo9Zulu-yellow)](https://huggingface.co/Echo9Zulu)
+
+
+
+
+
+Arcaine is an inference engine builting using SYCL + oneDNN meant to deliver bleeding edge performance on intel devices with a focus on custom tooling, hardware specialized kernels and bespoke model implementations.
+
+[Note] this project makes heavy use of AI tools and generated code and may not be *artisinal*.
 
 
 Initial release implements
