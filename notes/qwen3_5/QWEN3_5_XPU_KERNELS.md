@@ -312,9 +312,10 @@ FetchContent from `github.com/intel/sycl-tla` (`CMakeLists.txt:339-371`).
 `cute::gemm` are **defined in the sycl-tla dependency, not in this repo** (sycl-tla is not
 vendored in the source tree — it is fetched during the build). So whether the final lowering
 emits the SYCL `joint_matrix` intrinsics or targets the DPAS instruction through another path
-is a property of sycl-tla that **cannot be determined from this repository alone**. What is
-verifiable here: the application kernels program the matrix engine exclusively through cute
-atoms. The stack is:
+is a property of sycl-tla. **This is now resolved in §8.2** by reading `intel/sycl-tla` at the
+pinned revision directly: the answer is **inline vISA assembly**, not `joint_matrix`. What is
+verifiable in *this* repo: the application kernels program the matrix engine exclusively through
+cute atoms. The stack is:
 
 ```
 cute::gemm(mma, A, B, C)                       # issue
@@ -388,6 +389,77 @@ prefetch pipeline by hand. The repo deliberately chose (a); the `WGTile`/`SGLayo
 §3.3 are the tuned configuration you'd otherwise have to rediscover. Note oneDNN (option in
 §7) hides DPAS entirely behind its matmul primitive — for plain projections that's the least
 work.
+
+### 8.2 Resolved: how SYCL-TLA actually emits DPAS (read from `intel/sycl-tla`)
+
+Pulled `intel/sycl-tla` at the revision vllm-xpu-kernels pins
+(`CUTLASS_REVISION = cd763790ad2f74d7294435ecf77682bac0062c3a`, `CMakeLists.txt:322-324`;
+default target `intel_gpu_bmg_g21` = Battlemage, `:359-361`) and read the atom headers in full.
+**`grep joint_matrix include/` across all of sycl-tla returns zero — the SYCL `joint_matrix`
+C++ API is never used.** Instead there are **three** DPAS backends, all reaching the hardware
+without `joint_matrix`:
+
+1. **Modern `XE_DPAS_TT` — inline vISA/GenISA assembly** (`include/cute/arch/mma_xe.hpp:78-115`).
+   This is the atom vllm-xpu-kernels instantiates (`XE_DPAS_TT<8, float, …>`). The `fma`
+   emits a raw `asm` block:
+   ```
+   dpas.<TB>.<TA>.8.<M> (M1, 16) DST.0 SRC0.0 SRC1_UD.0 SRC2_UD(0,0)
+   ```
+   - `.8.` = **systolic depth 8** (8 K-substeps per issue); `(M1, 16)` = SIMD-16 exec
+     (one **subgroup of 16** lanes executes one DPAS); `M` = repeat count (rows).
+   - Two forms: accumulate-in-place (`C==D`, `DST.0 DST.0 …`) and separate-C
+     (`DST.0 SRC0.0 …`), `mma_xe.hpp:91-113`.
+   - A/B operands aliased as **UD (uint32)** registers → the VNNI-packed layout the systolic
+     array consumes. On non-Xe targets the atom is a `CUTE_INVALID_CONTROL_PATH` (`:127-130`).
+   - Supported dtypes (`:135-169`): tf32, **bf16, fp16** (fp32 or same-type accumulate), int8,
+     **int4**, and mixed int8×int4 — this is what backs the bf16/fp16 attention GEMMs and the
+     int4/mxfp4 MoE experts.
+2. **Legacy builtin** (`mma_xe_legacy_builtin.hpp`): OpenCL-style subgroup matrix-MAD builtins
+   `intel_sub_group_bf16_bf16_matrix_mad_k16` / `…_f16_f16_…_k16` / `…_i8_i8_…_k32` /
+   `…_tf32_tf32_…_k8` (`:35-58`). Note `k16`/`k32`/`k8` = the K depth per dtype. One case
+   (fp16-acc-fp16) is commented "*builtins do not work*" and falls back to SPIR-V (`:65-69, 116`).
+3. **Legacy SPIR-V** (`mma_xe_legacy_spirv.hpp`): the
+   `__spirv_SubgroupMatrixMultiplyAccumulateINTEL` cooperative-matrix intrinsic (`:34-62`) with
+   an operand-flags struct (`SPIRV_MatrixABf16`, `…Int8`, `…Tf32`, signedness, …, `:64-76`).
+   **This is the same SPIR-V instruction the high-level `joint_matrix` API also lowers to — but
+   sycl-tla calls the `__spirv_*` intrinsic directly, skipping the C++ matrix API.**
+
+So for Arcaine the precise answer is: the DPAS path is **not** `joint_matrix`. The production
+atom is **hand-written vISA `dpas`**; sycl-tla keeps SPIR-V-intrinsic and OpenCL-builtin atoms
+as alternates. If Arcaine wants the same instruction without depending on sycl-tla, the
+portable route is the `__spirv_SubgroupMatrixMultiplyAccumulateINTEL` intrinsic (or
+`joint_matrix`, which lowers to it); the max-control route is the inline `dpas` asm.
+
+**MMA atom shape/layout** (`mma_traits_xe.hpp`):
+- `Shape_MNK = (M, 16, K)`; **N is fixed at 16** (= subgroup width); `K = 256 /
+  max(bits(A),bits(B))` → **16 for bf16/fp16, 32 for int8, 64 for int4, 8 for tf32**
+  (`mma_xe.hpp:50`, `mma_traits_xe.hpp:70-80`).
+- `ThrID = SGSize (16)` → **one subgroup = one DPAS**; the GDN/GEMM `SGLayout` policies (§3.3)
+  replicate this atom across 2×2 / 2×1 / 4×2 subgroups.
+- **B is VNNI-transformed** (`BLayout`, `:87-90`), pack factor `BV = 32/bits(B)` (2 for 16-bit,
+  4 for 8-bit). A and C are work-item-interleaved row-major (`:83-94`).
+
+**The 2D block copies are also inline vISA** (`copy_xe_2d.hpp`), the LSC (Load-Store-Cache)
+hardware block messages:
+- `XE_LOAD_2D` → `lsc_load_block2d.ugm … nn` (plain), `XE_LOAD_2D_VNNI` → `… nt` (the `t` =
+  VNNI transform, restricted to 8/16-bit B operands), `XE_LOAD_2D_TRANSPOSE` → `… tn`
+  (32/64-bit) (`:82-138`).
+- `XE_PREFETCH_2D` → `lsc_load_block2d.ugm.ca.ca … %null` — the software prefetch is a cached
+  (`.ca.ca` = L1+L3) 2D block load to the null register (`:146-151`); this is the
+  `prefetch_dist=3` pipeline in §3.3/§8.1.
+- `XE_STORE_2D` → `lsc_store_block2d.ugm` (height ≤ 8) (`:160-178`). Hardware limits are
+  asserted in `XE_Copy_Op_2D_Base` (height ≤ 32 load, Bits·Width ≤ 512, block count ≤ 4≠3,
+  `:55-68`).
+
+**Barriers are SPIR-V split barriers** (`xe_split_barrier.hpp`): `barrier_arrive`/`barrier_wait`
+→ `__spirv_ControlBarrier{Arrive,Wait}INTEL(scope, …)` (`:52-80`); the GDN GEMM's
+`barrier_scope = 2` is `ScopeWorkgroup` (`:34-40`). (The FMHA mainloop additionally uses its own
+even-lower-level `sbarrier.signal/wait` + `lsc_fence.ugm` inline asm — see §8.1.)
+
+**Net**: every "target" the vllm kernels lean on — the DPAS MMA, the 2D block loads/stores with
+VNNI, the prefetch, the split barriers — bottoms out in **inline GenISA/vISA assembly and
+`__spirv_*` intrinsics inside sycl-tla**, compiled for `intel_gpu_bmg_g21`. There is no
+`joint_matrix` anywhere in the path.
 
 ---
 
