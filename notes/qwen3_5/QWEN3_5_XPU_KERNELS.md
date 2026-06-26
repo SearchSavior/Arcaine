@@ -300,10 +300,21 @@ Patterns that recur and are worth standardizing in Arcaine's kernel layer:
 
 ### 8.1 Matrix-engine (DPAS) programming model — and the `joint_matrix` question
 
-**The matrix-multiply work does *not* use the SYCL `joint_matrix` API directly.** A grep for
-`joint_matrix` across `csrc/` returns **zero** hits. Instead, every matmul-shaped kernel
-(GDN delta rule, grouped GEMM, FMHA) drives the Xe **DPAS** (Dot-Product-Accumulate-Systolic)
-units through **CUTLASS-SYCL's `cute` MMA abstraction**. The stack is:
+**Verified by reading the matrix kernels in full** (`gdn_attn/xe_2/gemm.hpp` 1–490,
+`chunk_gated_delta_rule_kernels_xe2.hpp` 1–1631, `grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp`
+1–372, `attn/xe_2/collective/chunk_prefill_mainloop.hpp`): **none of this repo's kernels call
+the SYCL `joint_matrix` API directly.** Every matmul-shaped kernel (GDN delta rule, grouped
+GEMM, FMHA) drives the Xe **DPAS** (Dot-Product-Accumulate-Systolic) units through the **`cute`
+MMA abstraction from SYCL-TLA** — Intel's CUTLASS-for-SYCL, pulled at build time via
+FetchContent from `github.com/intel/sycl-tla` (`CMakeLists.txt:339-371`).
+
+**Important boundary**: the DPAS *atom* (`XE_DPAS_TT`), the 2D-block copy atoms, and
+`cute::gemm` are **defined in the sycl-tla dependency, not in this repo** (sycl-tla is not
+vendored in the source tree — it is fetched during the build). So whether the final lowering
+emits the SYCL `joint_matrix` intrinsics or targets the DPAS instruction through another path
+is a property of sycl-tla that **cannot be determined from this repository alone**. What is
+verifiable here: the application kernels program the matrix engine exclusively through cute
+atoms. The stack is:
 
 ```
 cute::gemm(mma, A, B, C)                       # issue
@@ -347,8 +358,25 @@ using MMA = TiledMMAHelper<MMA_Atom<decltype(op)>,
 - **int4 experts** go through a specialized caller `XE_GEMM_4BITS_CALLER(GroupSize)` for
   group sizes 32/64/128/256 (`grouped_gemm_xe2.hpp:178-196`) — same DPAS atom, with an
   in-fragment dequant of the 4-bit B operand against `ptr_scales`.
-- **Arch gating**: some MMA shapes are taken only on Battlemage (`if (vllm::xpu::is_bmg())`
-  selects the 16³ inverse MMA, `chunk_gated_delta_rule_kernels_xe2.hpp:1348`).
+- **Arch gating with a correctness workaround**: the chunked delta rule launches **five**
+  kernels — `chunk_prepare` (decay cumsum), `chunk_compute_A`, the triangular **inverse**,
+  `chunk_compute_wu`, `chunk_fwd_o` (`kernel_launcher`, `:1249-1501`). The inverse has **two
+  implementations chosen at runtime**: on Battlemage (`is_bmg()`) a blocked 4×4 DPAS inverse
+  using 16×16 MMA tiles (`chunk_inverse_opt_kernel`, `:388`, `:1348`); on PVC a **native
+  non-MMA SLM kernel** because "PVC has acc issue of sycl tla" for this op (`:1382-1411`). A
+  port must keep the same numerically-stable fallback option.
+- **Register-sharing fusions** (read in `gemm.hpp`): `gemm_TTS_fused_2A` (`:381-489`) issues
+  two DPAS ops sharing one B fragment in registers — used in `chunk_fwd_o` to compute `W×S` and
+  `Q×S` from a single `S[dv]` load (`:1106-1123`); `gemm_TTS_k_multi` (`:282-379`) folds a
+  per-K scale vector (`beta`/`g`) into the A fragment before the MAD.
+- **FMHA uses two DPAS tilings**: `chunk_prefill_mainloop.hpp` is templated on `TiledMMAQK_`
+  (Q·K) and `TiledMMAPV_` (P·V) separately (`:73-74`), the classic flash-attention two-GEMM
+  pipeline with "P in registers" (`XeDefault<Stages>`, `:46-47`), synchronized with raw
+  inline-asm split barriers `sbarrier.signal/wait` + `lsc_fence.ugm` (`:53-62`).
+- **Grouped-GEMM tile policy is chosen by average tokens-per-expert**: `A_avg_M = total_M /
+  num_experts` selects `w{4,8,16}a16_policy_m_{8,16,32}` (and by N for w16a16)
+  (`grouped_gemm_xe2_interface.hpp:287-368`) — small per-expert batches (MoE decode) use
+  M-skinny tiles. int4 packs 2 weights/byte (`B_K = size(2)*2`, `:203-205`).
 
 **Why it matters for Arcaine**: if you want the same DPAS throughput you have two options —
 (a) depend on CUTLASS-SYCL `cute` and reuse these `XE_DPAS_TT` atoms + tile policies verbatim
