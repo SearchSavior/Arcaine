@@ -456,10 +456,60 @@ hardware block messages:
 `barrier_scope = 2` is `ScopeWorkgroup` (`:34-40`). (The FMHA mainloop additionally uses its own
 even-lower-level `sbarrier.signal/wait` + `lsc_fence.ugm` inline asm — see §8.1.)
 
+**Backend selection** (read in `mma_xe_legacy.hpp:38-42` + `xe_mma_builder.inl`): the legacy
+named atoms (`XE_8x16x16_F32BF16BF16F32_TT`, …, full MNK×dtype zoo in `mma_xe_legacy.hpp`)
+pick builtin-vs-SPIR-V **at compile time by oneAPI version** — `__INTEL_LLVM_COMPILER <
+20250200` (or `CUTLASS_SYCL_BUILTIN_ENABLE`) → OpenCL builtins, else SPIR-V intrinsic. But the
+**CollectiveBuilder always uses the modern inline-asm `XE_DPAS_TT`** via `xe_dpas_tt_op_selector`
+(`xe_mma_builder.inl:44-53`; `DPAS_M = gcd(8, TileM)`, up to 32 subgroups/WG). So the FMHA and
+generic GEMM paths get the vISA `dpas`, same as the GDN kernels.
+
+### 8.3 The rest of the lowering path (copy / reorder / barrier), read in full
+
+Completing the "don't skip anything" pass over every atom the vllm kernels call:
+
+- **2D block copies** = a split design: the **address payload descriptor** is built with
+  **Intel IGC builtins** `__builtin_IB_subgroup_createBlock2DAddressPayload(base, width-1,
+  height-1, pitch-1, x, y, blockW, blockH, count)` (`copy_traits_xe_2d.hpp:41-52, 147-162`),
+  and the **actual transfer** is the inline-vISA `lsc_{load,store}_block2d.ugm`
+  (`copy_xe_2d.hpp`). Per-copy, only x/y block offsets are mutated
+  (`setBlock2DAddressPayloadBlockX/Y`, `:164-190`); for >2D tensors the base ptr is bumped by
+  `inner_product(coord, tiled_strides)`. **Hardware constraints a port must honor**
+  (`:120-127`): base % 64 B, width % 4 B, pitch % 4 B, x-offset % 4, all dims ≤ 2²⁴; block
+  height ≤ 32 (load) / ≤ 8 (store); ≤ 4 blocks. `block_2d_selector` (`:652-725`) chooses
+  plain/VNNI/transpose: VNNI for 8/16-bit when the MMA consumer wants it, transpose for
+  significant transposition, block width = power-of-2 gcd ≤ 64 B, cache-line aware.
+- **`reorder()` = fused in-register dtype-convert + VNNI repack**, all hand-written vISA in
+  `reorder_xe.hpp` (1426 lines). Beyond plain layout shuffles (`reorder_atom_xe.hpp`'s generic
+  `mov` with strided GRF regions, classified UU/UV/VU/VV/Generic), it carries **dequant
+  sequences for every low-precision type**, each with documented cycle counts: int8/uint8 →
+  half/bf16, fp8 `e5m2`/`e4m3` → half/bf16, **int4/uint4 → half/bf16** (`shr` nibble-expand +
+  `bfn` boolean-func + `0xE4xx` half-bias), **`e2m1` (NVFP4/MXFP4 4-bit float) → half/bf16**,
+  and **`ue8m0` → float** (the MXFP4 shared-exponent **block-scale** decode). This is the
+  int4/mxfp4 MoE-expert dequant from §6, fused into the load→MMA pipeline — and the
+  `e2m1`/`ue8m0` paths are exactly the **NVFP4** decode Arcaine already implements by hand for
+  DiffusionGemma; sycl-tla has vISA reference sequences for them.
+- **1D copies** (`copy_xe.hpp`) are mixed: SLM load/store = inline-vISA `lsc_load.slm` /
+  `lsc_store.slm` (`XE_1D_LDSM`/`XE_1D_STSM`); global load/store = the **SYCL**
+  `group_load`/`group_store` experimental API (`XE_1D_LOAD/STORE_GLOBAL`); reductions =
+  `sycl::atomic_ref` (`XE_ATOMIC`, the grouped-GEMM `atomic_buffer`).
+- **Barriers** = SPIR-V split barriers `__spirv_ControlBarrier{Arrive,Wait}INTEL(scope,…)`
+  (`xe_split_barrier.hpp:52-80`); `barrier_scope = 2` = `ScopeWorkgroup`. The FMHA mainloop
+  drops even lower to raw `sbarrier.signal/wait` + `lsc_fence.ugm` asm (§8.1).
+- **Collective staging**: the default GEMM/FMHA `CollectiveBuilder` declares **no shared
+  memory** (`SmemLayoutAtom = void; // No shared memory usage`, `xe_mma_builder.inl:115-118`) —
+  it is **L1-staged** (`MainloopXeL1Staged<3>`; group/MoE = `…Group<2>`) with operands flowing
+  gmem→registers via 2D block loads + prefetch. SLM-staging helpers (`make_A_slm_copies`,
+  `make_slm_copy`, `copy_traits_xe_2d.hpp:1113-1355`) exist as an alternative but are not the
+  default path. (Contrast: the GDN delta-rule kernels *do* use SLM `local_accessor` for the
+  g/β/A scratch — §3.)
+
 **Net**: every "target" the vllm kernels lean on — the DPAS MMA, the 2D block loads/stores with
-VNNI, the prefetch, the split barriers — bottoms out in **inline GenISA/vISA assembly and
-`__spirv_*` intrinsics inside sycl-tla**, compiled for `intel_gpu_bmg_g21`. There is no
-`joint_matrix` anywhere in the path.
+VNNI, the in-register low-precision dequant, the prefetch, the split barriers — bottoms out in
+**inline GenISA/vISA assembly, Intel IGC `__builtin_IB_*` intrinsics, and SPIR-V `__spirv_*`
+intrinsics inside sycl-tla**, compiled for `intel_gpu_bmg_g21`. The only place the high-level
+SYCL parallelism API appears is 1D global `group_load`/`group_store` and `atomic_ref`. **There
+is no `joint_matrix` anywhere in the path** — confirmed by reading every atom file end to end.
 
 ---
 
