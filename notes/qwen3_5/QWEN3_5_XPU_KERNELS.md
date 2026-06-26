@@ -651,8 +651,61 @@ load-imbalance and quantization are the Xe2-specific challenges.
 
 ---
 
-**Document version**: 1.1
+## 11. Two deeper mechanisms (read end-to-end)
+
+### 11.1 The quantized-expert mainloop — int4/MXFP4 MoE GEMM in detail
+`xe_mma_mixed_input.hpp` (`CollectiveMma<MainloopIntelXeXMX16MixedPrecision<Stages>, …>`) is the
+collective for Qwen3.5-MoE's int4/MXFP4/fp8 experts. It is the dense `xe_mma.hpp` pipeline plus
+an **in-register dequant stage**, with several bandwidth tricks:
+
+- **Dequant fused before each DPAS** (`operator()`, `:831-869`): per K-tile it does
+  `copy(quantized A/B → quant_frag)` → `transform_quant(quant_frag → mma_frag, scale, zero)` →
+  `cute::gemm(mma_A, mma_B, accum)`. `transform_quant` (`:503-620`) applies `(x − zero)·scale`
+  (groupwise) or `x·scale` (tensorwise) into the MMA fragment — so the 4-bit weight is upconverted
+  to the MMA dtype in registers immediately before the matrix multiply, never materialized in
+  memory.
+- **Group-strided scale/zero reload** (the key bandwidth win, `:840-849`): scales/zeros are
+  reloaded only every `k_reload_factor = group_size / BLK_K` K-tiles — i.e. only when the K-loop
+  crosses a quant-group boundary, not every iteration. For Qwen3.5-MoE `group_size = 32`, the
+  scale fragment is fetched ~`32/BLK_K`× less often than the weights.
+- **Bit-width-specialized scale/zero load atoms** (`scale_zero_copy_traits`, `:49-90`): 4-bit →
+  `XE_2D_Packed_U4x1x128_LD_N` (8 int4 along K packed into one int32, N-major); 8/16/32-bit
+  variants. Zero-points are packed along K (`zero_elements_packed_along_k`) and unpacked
+  in-register. Scales are broadcast across lanes with `shfl_sync` (`:576`) — a 1×32 scale atom
+  yields 2 values reused per subgroup, avoiding redundant global loads.
+- **FP8 path**: `convert_FP8_to_FP16` (`:534`) for the e4m3/e5m2 expert variant.
+- Everything else (prefetch `Stages` ahead, split barriers, VNNI reorder) is shared with the
+  dense mainloop. Net: the int4 MoE expert GEMM costs ~the same global-memory traffic as a
+  4-bit-weight matmul, with dequant hidden in the register pipeline and scale traffic amortized
+  over the quant group.
+
+### 11.2 Stream-K / split-K scheduling — filling the machine on small GEMMs
+`xe_persistent_tile_scheduler_params_streamk.hpp` + `kernel/xe_tile_scheduler_streamk.hpp` add a
+**K-splitting** scheduler, complementary to the MoE atomic-counter scheduler (§10.3):
+
+- **Problem**: data-parallel tiling gives one output tile per workgroup. When `#(M·N tiles) <
+  #Xe-cores` the GPU underfills and tail effects dominate — exactly Qwen3.5 **decode** (M = 1
+  token), the **GDN** linear-attention per-head matmuls (small M/N, work is in K = head/state
+  dim), and MoE experts with few tokens.
+- **DecompositionMode** (`:76-85`): `Heuristic` (pick automatically from tiles-vs-units),
+  `DataParallel` (one tile/WG), `SplitK` (fixed `splits`), `StreamK` (fine-grained K split).
+- **Stream-K mechanism**: the K-iteration space is divided across "units"; each computes a
+  *partial* accumulator into a `reduction_workspace_`, then partials are reduced. "Big units"
+  take one extra K-chunk to absorb the K residual (`big_units_`, `divmod_k_tiles_per_sk_unit_`,
+  `:110-130`). This converts idle cores on a skinny GEMM into parallel K-reducers.
+- **ReductionMode** (`:55-73`): `Deterministic` — turnstile lock, partials accumulated in K
+  order → reproducible FP; `Nondeterministic` — atomic accumulate without ordering → faster but
+  FP-rounding depends on order. A port must pick per the reproducibility requirement.
+- **The three schedulers, when to use which**: *data-parallel* (enough tiles to fill the GPU —
+  large prefill GEMM); *stream-K / split-K* (too few tiles, large K — decode, GDN); *persistent
+  atomic-counter* (`grouped_gemm`, §10.3 — many ragged independent problems, balance across the
+  M/expert dimension). Qwen3.5 touches all three across its layers and batch regimes.
+
+---
+
+**Document version**: 1.2
 **Reference**: `vllm-project/vllm-xpu-kernels@main` + `intel/sycl-tla@cd763790`
-(`include/cute/{arch,atom}/*xe*`, `include/cutlass/gemm/{collective,kernel,dispatch_policy}` Xe,
+(`include/cute/{arch,atom}/*xe*`, `include/cutlass/gemm/{collective,kernel,dispatch_policy}` Xe
+incl. `xe_mma.hpp`, `xe_mma_mixed_input.hpp`, `xe_*_tile_scheduler_streamk*`,
 `csrc/xpu/{gdn_attn,attn,grouped_gemm,onednn,sycl}`, `csrc/moe`, `csrc/quantization/fused_kernels`)
 **Companion**: `QWEN3_5_ARCHITECTURE.md`
