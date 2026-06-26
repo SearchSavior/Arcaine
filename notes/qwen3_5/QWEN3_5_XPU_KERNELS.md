@@ -547,6 +547,112 @@ Caveats:
 
 ---
 
-**Document version**: 1.0
-**Reference**: `vllm-project/vllm-xpu-kernels@main`, `csrc/xpu/{gdn_attn,attn,grouped_gemm,onednn,sycl}`, `csrc/moe`, `csrc/fused_qknorm_rope.cpp`
+## 10. Xe2 hardware facts → kernel-writing techniques (dense + MoE)
+
+This section distills the *hardware facts* that drive the kernel designs above, read out of
+`sycl-tla` and the vllm-xpu kernels, and maps each to the Qwen3.5 dense and MoE codepaths.
+These are the numbers/constraints to design around when writing Xe2 (Battlemage `bmg_g21/g31`)
+kernels.
+
+### 10.1 The hardware-fact table
+
+| Fact | Value / rule | Source | Consequence |
+|---|---|---|---|
+| **Subgroup = 16 for DPAS** | `SubgroupSize = 16` | `dispatch_policy.hpp:1306`, `mma_traits_xe.hpp:81` | one subgroup issues one DPAS; MMA N is fixed at 16 |
+| **Subgroup = 32 for memory/elementwise** | `reqd_sub_group_size(32)` | `fused_silu_mul_mxfp4_quant.cpp:42`, `fused_qknorm_rope.cpp:24` | wider SIMD for load/store/reduce-bound kernels; pick per kernel, not globally |
+| **Large GRF mode** | `intel::grf_size<256>` | `…interface.hpp:121`, GDN `:1286` | matrix kernels run register-resident; request 256-reg GRF |
+| **Workgroup = up to 32 subgroups** | `Num_SGs = ATOM_M*ATOM_N*ATOM_K`, `MaxSG=32` | `xe_mma.hpp:99`, `xe_mma_builder.inl:95` | size WG to a full Xe-core's subgroup budget |
+| **DPAS systolic depth = 8** | `dpas.<TB>.<TA>.8.<M>` | `mma_xe.hpp:98` | K-substeps per issue = 8 |
+| **DPAS K per atom** | `K = 256/max(bitsA,bitsB)` → 16 bf16/fp16, 32 int8, 64 int4, 8 tf32 | `mma_xe.hpp:50` | bigger K-step for lower precision = more work/issue |
+| **B operand must be VNNI** | pack factor `BV = 32/bits(B)` | `mma_traits_xe.hpp:70,89` | weights need VNNI layout (or VNNI 2D-load / reorder) |
+| **2D block load: dims ≤ 2²⁴, base %64 B, width/pitch %4 B, x %4** | asserts | `copy_traits_xe_2d.hpp:120-127,175` | tensor base/stride alignment is a *hard* requirement |
+| **2D block: height ≤ 32 load / ≤ 8 store, ≤ 4 blocks, width ≤ 64 B** | static_asserts | `copy_xe_2d.hpp:58-61` | caps the per-message tile |
+| **Cache line = 64 B (512 bit)** | prefetch width = `gcd(shape, 512/bits)` | `copy_traits_xe_2d.hpp:1562` | prefetch in whole cache lines |
+| **Copy alignment = 128-bit; batch stride = 512-bit** | `can_implement` | `xe_mma.hpp:145-146` | min element alignment for the 2D copy path |
+| **GEMM mainloop uses NO SLM** | `SmemLayoutAtom = void` | `xe_mma_builder.inl:115`, `xe_mma.hpp` | operands gmem→GRF; SLM only for reductions/scratch |
+| **Pipeline depth = Stages (2–3)** | `MainloopXeL1Staged<Stages>`, prefetch `Stages` ahead | `dispatch_policy.hpp:1304`, `xe_mma.hpp:255-270` | software-pipelined L1 prefetch, not SLM double-buffer |
+| **Split barriers** | `barrier_arrive(2)` / `barrier_wait(2)` (scope 2 = workgroup) | `xe_mma.hpp:262,277`, `xe_split_barrier.hpp` | arrive early, do work, wait late — hides latency |
+| **PVC ≠ BMG** | `is_bmg()` selects DPAS triangular inverse; PVC uses native SLM (sycl-tla accuracy bug) | `chunk_gated_delta_rule_kernels_xe2.hpp:1348-1411` | keep an arch-gated fallback |
+
+### 10.2 Dense Qwen3.5 path — techniques
+
+The dense tower is full-attention layers + linear-attention (GDN) layers + dense SwiGLU MLP.
+
+- **Dense MLP / projection GEMM** → `MainloopXeL1Staged` (`xe_mma.hpp`). The reference pattern:
+  register-resident A/B via 2D block loads, **prefetch `Stages` k-tiles ahead into L1**,
+  `copy → reorder(→VNNI) → cute::gemm(DPAS) ` inside split barriers, fp32 accumulator. No SLM.
+  This is the template for any plain `[M,K]·[K,N]` on Xe2.
+- **Full attention (FMHA)** → two DPAS tilings (`TiledMMAQK`, `TiledMMAPV`) with the softmax
+  epilogue kept in registers (§8.1) — "P in registers" `XeDefault` policy; varlen via
+  `cu_seqlens`. QK-norm + partial RoPE stay *outside* the FMHA (fused in
+  `fused_qknorm_rope.cpp`, SIMD32, one subgroup per (token,head)).
+- **GDN linear attention** (the novel part):
+  - *Causal Conv1d*: SLM-staged with an explicit `Width-1` halo = the rolling conv state
+    (`chunk_causal_conv1d_tiled_xe2.hpp`); 256 features/WG (`wg_size 64 × elems 4`); **fuses
+    L2-norm into the conv epilogue** when `2·head_k_dim ≤ 256` — eliminates a full-tensor pass.
+  - *Chunked gated delta rule*: a **5-kernel pipeline** (prepare → compute_A → inverse →
+    compute_wu → fwd_o) where the matmuls are 64×64×32 DPAS tiles with the four tuned
+    `SGLayout` policies (2×2 / 2×1 / 4×2 / 1×1); the triangular inverse is a blocked 4×4 of
+    16×16 DPAS on BMG, native-SLM on PVC; `g = -exp(A_log)·softplus(a+dt_bias)` in fp32.
+  - *Register-sharing fusions*: `gemm_TTS_fused_2A` shares one B fragment across two DPAS issues
+    (W×S and Q×S from one state load); `gemm_TTS_k_multi` folds a per-K decay scale into the A
+    fragment before the MAD.
+
+### 10.3 MoE Qwen3.5 path — techniques
+
+The MoE tower replaces every MLP with 256-expert top-8 routing + a shared expert. The
+load-imbalance and quantization are the Xe2-specific challenges.
+
+- **Persistent work-stealing tile scheduler** (the key MoE technique, `grouped_gemm_xe2.hpp:106-217`):
+  ragged rows-per-expert means static tile→WG assignment starves some WGs. Instead a global
+  `atomic_buffer` counter hands out the *next* tile across all experts; each WG, after finishing
+  a tile, does `cutlass::atomicAdd(atomic_buffer,1)`, broadcasts the new id through SLM
+  (`slm_mem[0]`), and recomputes its `(expert, m, n)` coord. This keeps all subgroups busy
+  across the uneven expert sizes. The dispatch policy is `KernelXePtrArrayCooperative`
+  (`MainloopXeL1StagedGroup`).
+- **Tile policy by average tokens-per-expert**: `A_avg_M = total_M/num_experts` selects
+  M-skinny tiles (`w*a16_policy_m_{8,16,32}`) for MoE decode vs square tiles for prefill
+  (`grouped_gemm_xe2_interface.hpp:287-368`). Per-expert batches are tiny, so the M tile must be
+  too or the array runs under-filled.
+- **Dedicated mixed-precision mainloops** for the int4/MXFP4 experts:
+  `MainloopIntelXeXMX16(Group)MixedPrecision`, `…W8A8`, `…GroupFP8`, `…FP8Scaling`
+  (`dispatch_policy.hpp:1263-1287`) — there is a purpose-built collective for each Qwen3.5-MoE
+  quant scheme.
+- **Fused in-register dequant** for the expert weights: the `reorder()` step converts int4 / e2m1
+  (MXFP4) / ue8m0 (MXFP4 scale) / fp8 → bf16/half *and* VNNI-packs in one vISA sequence (§8.3),
+  so the 4-bit expert weight is upconverted on the path from 2D-load to DPAS — no separate
+  dequant kernel.
+- **Fused SwiGLU + MXFP4 quant** for the expert activations (`fused_silu_mul_mxfp4_quant.cpp`):
+  one pass computes `silu(gate)·up`, the per-group (32-wide) absmax via **butterfly subgroup
+  reduction** (`permute_group_by_xor`, no SLM), the **ue8m0 power-of-two scale**
+  `exp2(ceil(log2(absmax/FP4_MAX)))`, and packs two e2m1 nibbles/byte — SIMD32, 16-byte
+  vectorized loads. This is the down-proj input prep, fused to avoid a round trip.
+- **On-device routing/scatter** (`csrc/moe/`): softmax/sigmoid top-k scoring with subgroup
+  reductions (`topk.cpp`), `fused_moe_prologue` (permute + scale gather into a workspace),
+  `moe_align_sum` (pad per-expert counts to tile size), `moe_gather`/`remap_hidden_states` —
+  the whole route→GEMM→unroute stays on the GPU, driven by index tensors, no host sync.
+
+### 10.4 Rules of thumb (distilled)
+
+1. **Pick subgroup size per kernel**: 16 if it issues DPAS, 32 if it's load/store/reduce-bound.
+2. **Keep GEMM operands in registers** (large GRF + 2D block loads); reserve SLM for reductions,
+   conv halos, and cross-subgroup scratch — not for staging GEMM operands.
+3. **Prefetch whole cache lines `Stages` tiles ahead** and wrap `copy→reorder→gemm` in split
+   barriers; depth 2–3 is the tuned range.
+4. **VNNI-pack B** and, for quantized weights, **fuse dequant into the reorder** (int4/e2m1/fp8
+   → bf16/half) so upconvert rides the load→MMA pipeline.
+5. **Respect 2D-block alignment** (base %64 B, width/pitch %4 B, dims ≤ 2²⁴) at the tensor level
+   or the fast copy path silently won't apply.
+6. **For ragged/grouped work (MoE), use a persistent atomic-counter scheduler**, and size the M
+   tile to the *average* tokens-per-expert, not the global M.
+7. **Fuse the elementwise neighbors into the matmul producer/consumer**: L2-norm into conv1d,
+   QK-norm into RoPE, SiLU·mul into the quant, decay-scale into the delta-rule GEMM.
+8. **Arch-gate**: BMG and PVC differ (e.g. the delta-rule inverse); keep a correctness fallback.
+
+---
+
+**Document version**: 1.1
+**Reference**: `vllm-project/vllm-xpu-kernels@main` + `intel/sycl-tla@cd763790`
+(`include/cute/{arch,atom}/*xe*`, `include/cutlass/gemm/{collective,kernel,dispatch_policy}` Xe,
+`csrc/xpu/{gdn_attn,attn,grouped_gemm,onednn,sycl}`, `csrc/moe`, `csrc/quantization/fused_kernels`)
 **Companion**: `QWEN3_5_ARCHITECTURE.md`
