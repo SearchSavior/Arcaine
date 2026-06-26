@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <stdexcept>
 
-#include "diffusion_gemma/model.hpp"
+#include "modeling/diffusion_gemma/model.hpp"
 #include "utils/chat.hpp"
 #include "utils/viz.hpp"
 #include "common/gpu/placement.hpp"

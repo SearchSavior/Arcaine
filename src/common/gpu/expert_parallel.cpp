@@ -1,5 +1,5 @@
 #include "expert_parallel.hpp"
-#include "../../diffusion_gemma/arena.hpp"
+#include "../../modeling/diffusion_gemma/arena.hpp"
 #include "ops.hpp"
 #include "../kernels/elementwise.hpp"
 #include "../../utils/profile.hpp"

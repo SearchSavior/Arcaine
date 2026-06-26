@@ -1,5 +1,5 @@
 #include "common/registry.hpp"
-#include "gemma4_unified/register.hpp"
+#include "modeling/gemma4_unified/register.hpp"
 
 // Wires every architecture compiled into this binary into the registry. Add a
 // new arch by including its register.hpp and calling its registrar here.

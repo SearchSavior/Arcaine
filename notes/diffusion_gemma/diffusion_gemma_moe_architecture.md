@@ -428,7 +428,7 @@ ASCII (cache=8, two populated entries, canvas=4): every canvas row sees populate
 
 ## 14. Implementation Guide for the SYCL Engine
 
-Suggested home: `src/diffusion_gemma/` (sibling to `gemma4_unified/`), registered as `model_type: "diffusion_gemma"`. Because the text block is Gemma4-shaped, much of `common/layers/attention_ops.hpp`, the dual-RoPE, RMSNorm, embedding, softcap, and the vision tower carry over directly.
+Suggested home: `src/modeling/diffusion_gemma/` (sibling to `src/modeling/gemma4_unified/`), registered as `model_type: "diffusion_gemma"`. Because the text block is Gemma4-shaped, much of `common/layers/attention_ops.hpp`, the dual-RoPE, RMSNorm, embedding, softcap, and the vision tower carry over directly.
 
 **Reuse directly:**
 - GQA attention with Q/K norm and `scale=1.0`; sliding/full split; dual RoPE (sliding default 256-dim θ=1e4, full proportional 512-dim θ=1e6 partial 0.25); full-layer K=V sharing with V un-RoPE'd.

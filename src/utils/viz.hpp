@@ -1,7 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
-#include "../diffusion_gemma/model.hpp"
+#include "../modeling/diffusion_gemma/model.hpp"
 
 class TokenizerBridge;
 

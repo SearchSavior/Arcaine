@@ -41,8 +41,8 @@ set_target_properties(onnxruntime PROPERTIES
 
 # ---------------------------------------------------------------------------
 # Source groups
-#   common/   — architecture-independent engine (registry, preprocessing, ...)
-#   <arch>/   — one directory per model architecture; add a sibling to extend.
+#   common/         — architecture-independent engine (registry, preprocessing, ...)
+#   modeling/<arch> — one directory per model architecture; add a sibling to extend.
 # ---------------------------------------------------------------------------
 set(COMMON_SRCS
     src/register_builtins.cpp
@@ -54,13 +54,13 @@ set(COMMON_SRCS
 )
 
 set(GEMMA4_SRCS
-    src/gemma4_unified/loader.cpp
-    src/gemma4_unified/attention.cpp
-    src/gemma4_unified/ffn.cpp
-    src/gemma4_unified/vision_embedder.cpp
-    src/gemma4_unified/audio_embedder.cpp
-    src/gemma4_unified/model.cpp
-    src/gemma4_unified/register.cpp
+    src/modeling/gemma4_unified/loader.cpp
+    src/modeling/gemma4_unified/attention.cpp
+    src/modeling/gemma4_unified/ffn.cpp
+    src/modeling/gemma4_unified/vision_embedder.cpp
+    src/modeling/gemma4_unified/audio_embedder.cpp
+    src/modeling/gemma4_unified/model.cpp
+    src/modeling/gemma4_unified/register.cpp
 )
 
 # All built-in architectures linked into the inference/bench binaries.
@@ -118,14 +118,14 @@ set_target_properties(bench PROPERTIES
 set(DIFFUSION_SRCS
     src/common/preprocess/tokenizer.cpp
     src/common/preprocess/chat_template.cpp
-    src/diffusion_gemma/loader.cpp
-    src/diffusion_gemma/moe.cpp
+    src/modeling/diffusion_gemma/loader.cpp
+    src/modeling/diffusion_gemma/moe.cpp
     src/common/gpu/expert_parallel.cpp
     src/common/gpu/placement.cpp
-    src/diffusion_gemma/activation_plan.cpp
-    src/diffusion_gemma/attention.cpp
-    src/diffusion_gemma/generate.cpp
-    src/diffusion_gemma/model.cpp
+    src/modeling/diffusion_gemma/activation_plan.cpp
+    src/modeling/diffusion_gemma/attention.cpp
+    src/modeling/diffusion_gemma/generate.cpp
+    src/modeling/diffusion_gemma/model.cpp
     src/common/gpu/mem_planner.cpp
     src/utils/chat.cpp
     src/utils/viz.cpp

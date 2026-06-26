@@ -8,7 +8,7 @@
 #include <limits>
 #include <memory>
 
-#include "common/model.hpp"
+#include "common/model_interface.hpp"
 #include "common/registry.hpp"
 #include "common/sampler.hpp"
 #include "common/preprocess/chat_template.hpp"

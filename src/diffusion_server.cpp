@@ -21,7 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include "common/gpu/placement.hpp"
-#include "diffusion_gemma/model.hpp"
+#include "modeling/diffusion_gemma/model.hpp"
 #include "utils/chat.hpp"
 #include "utils/chat_template_kwargs.hpp"
 #include "utils/gemma4_tool_call_parser.hpp"

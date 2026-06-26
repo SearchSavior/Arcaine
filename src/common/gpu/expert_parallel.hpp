@@ -1,5 +1,5 @@
 #pragma once
-#include "../../diffusion_gemma/weights.hpp"
+#include "../../modeling/diffusion_gemma/weights.hpp"
 #include "engine.hpp"
 #include "buffer.hpp"
 #include <vector>

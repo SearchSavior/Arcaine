@@ -7,9 +7,9 @@
 
 
 
-Arcaine is an inference engine builting using SYCL + oneDNN meant to deliver bleeding edge performance on intel devices with a focus on custom tooling, hardware specialized kernels and bespoke model implementations.
+Arcaine is an inference engine builting using SYCL + oneDNN meant to deliver bleeding edge performance on intel devices with a focus on custom tooling, hardware specialized kernels and bespoke model implementations. 
 
-[Note] this project makes heavy use of AI tools and generated code and may not be *artisinal*.
+
 
 
 Initial release implements
@@ -21,6 +21,7 @@ Initial release implements
 - produce html visualizations that replay denoising steps with diffusion-gemma
 - openai /v1/chat/completions for diffusiongemma
 - tool call parser, validated with pi + tests
+- llama bench style tool
 
 It's early days and the project is expected to move quickly- there are a ton of details to iron out.
 

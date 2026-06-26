@@ -31,7 +31,7 @@
 #include <cmath>
 #include <stdexcept>
 
-#include "diffusion_gemma/model.hpp"
+#include "modeling/diffusion_gemma/model.hpp"
 #include "utils/chat.hpp"
 #include "common/gpu/expert_parallel.hpp"
 #include "common/gpu/mem_planner.hpp"

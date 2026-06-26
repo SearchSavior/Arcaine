@@ -24,7 +24,7 @@
 
 #include <memory>
 
-#include "common/model.hpp"
+#include "common/model_interface.hpp"
 #include "common/registry.hpp"
 #include "common/gpu/device_select.hpp"
 #include "common/gpu/engine.hpp"

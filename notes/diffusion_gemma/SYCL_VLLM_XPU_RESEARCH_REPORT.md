@@ -40,10 +40,10 @@ Highest-value next work:
 
 ### Router
 
-`src/diffusion_gemma/moe.cpp` computes router scores on the GPU, then downloads
+`src/modeling/diffusion_gemma/moe.cpp` computes router scores on the GPU, then downloads
 `seq * E` BF16 scores to the host and performs softmax, top-k, renormalization,
 and per-expert scale application on the CPU. See
-`src/diffusion_gemma/moe.cpp:103-140`.
+`src/modeling/diffusion_gemma/moe.cpp:103-140`.
 
 This is simple and correct, but it creates a hard synchronization point per MoE
 layer. It also feeds the expert path host vectors (`idx`, `weight`) instead of

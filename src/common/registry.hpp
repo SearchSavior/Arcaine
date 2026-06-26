@@ -4,7 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "model.hpp"
+#include "model_interface.hpp"
 
 // ---------------------------------------------------------------------------
 // Maps a config.json `model_type` string to a factory that builds the matching
