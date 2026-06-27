@@ -16,9 +16,28 @@
 #include <string>
 #include <vector>
 
+// DIFF_PERSIST_XFER_STAGE: reuse the host staging buffer across cross-GPU hops
+// instead of allocating a fresh std::vector on each call (the split decode path
+// hops twice per step).  Default off; identical bytes either way.
+static bool persist_xfer_stage_enabled() {
+    static bool enabled = [] {
+        const char* e = std::getenv("DIFF_PERSIST_XFER_STAGE");
+        return e && std::strcmp(e, "0") && std::strcmp(e, "off") &&
+               std::strcmp(e, "false") && std::strcmp(e, "no");
+    }();
+    return enabled;
+}
+
 // Cross-GPU copy via host staging (devices have no P2P here).
 static void transfer(sycl::queue& src_q, const bf16* src,
                      sycl::queue& dst_q, bf16* dst, size_t n) {
+    if (persist_xfer_stage_enabled()) {
+        static thread_local std::vector<bf16> stage;
+        if (stage.size() < n) stage.resize(n);
+        src_q.memcpy(stage.data(), src, n * sizeof(bf16)).wait();
+        dst_q.memcpy(dst, stage.data(), n * sizeof(bf16)).wait();
+        return;
+    }
     std::vector<bf16> stage(n);
     src_q.memcpy(stage.data(), src, n * sizeof(bf16)).wait();
     dst_q.memcpy(dst, stage.data(), n * sizeof(bf16)).wait();
@@ -150,7 +169,8 @@ void DiffusionGemmaModel::encode_block(const std::vector<int>& ids, int past_len
 void DiffusionGemmaModel::decode_step(
     const std::vector<int>& canvas_ids, const bf16* soft_or_null, int enc_len,
     float temp, std::vector<int>& argmax, std::vector<float>& entropy,
-    std::vector<int>& denoiser, GpuBuffer<bf16>& soft_next, std::mt19937& rng)
+    std::vector<int>& denoiser, GpuBuffer<bf16>& soft_next, std::mt19937& rng,
+    bool want_soft_next)
 {
     int seq = (int)canvas_ids.size();
     int H = cfg_.text.hidden_size;
@@ -207,7 +227,7 @@ void DiffusionGemmaModel::decode_step(
     // sample in one kernel.  BF16 probabilities are only materialized when the
     // exact self-conditioning matmul needs them (see SoftNextMode).
     SoftNextCfg sn = soft_next_cfg();
-    bool need_probs = (sn.mode == SoftNextMode::Exact);
+    bool need_probs = want_soft_next && (sn.mode == SoftNextMode::Exact);
     diffarena::Alloc<bf16> probs_bf16;
     if (need_probs) probs_bf16 = ar0.alloc<bf16>((size_t)seq * V);
     GpuBuffer<int32_t> amax_dev(seq, q0), deno_dev(seq, q0);
@@ -225,7 +245,7 @@ void DiffusionGemmaModel::decode_step(
     // the logits buffer is released.
     GpuBuffer<int32_t> topk_idx_dev;
     GpuBuffer<float>   topk_w_dev;
-    if (sn.mode == SoftNextMode::TopK) {
+    if (want_soft_next && sn.mode == SoftNextMode::TopK) {
         topk_idx_dev = GpuBuffer<int32_t>((size_t)seq * sn.k, q0);
         topk_w_dev   = GpuBuffer<float>((size_t)seq * sn.k, q0);
         DIFF_PROF(q0, "lm.topk_select");
@@ -242,6 +262,8 @@ void DiffusionGemmaModel::decode_step(
       ent_dev.download(entropy.data(), seq);
       for (int i = 0; i < seq; ++i) { argmax[i] = a[i]; denoiser[i] = d[i]; } }
     // soft_next: next-step self-conditioning signal (embed_scale_ folded in).
+    // Skipped on the final step, whose signal would never be consumed.
+    if (!want_soft_next) { soft_next = GpuBuffer<bf16>(); q0.wait(); return; }
     soft_next = GpuBuffer<bf16>((size_t)seq * H, q0);
     { DIFF_PROF(q0, "lm.soft_next");
       switch (sn.mode) {

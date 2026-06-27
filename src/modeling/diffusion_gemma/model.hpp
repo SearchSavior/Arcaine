@@ -68,15 +68,19 @@ private:
     void encode_block(const std::vector<int>& ids, int past_len);
 
     // One denoising step: decode the canvas, produce per-position argmax /
-    // entropy / multinomial sample, and the self-conditioning signal for the
-    // next step (left in `soft_next`).
+    // entropy / multinomial sample, and (when `want_soft_next`) the
+    // self-conditioning signal for the next step (left in `soft_next`).  The
+    // final scheduled step has no successor, so its `soft_next` is pure waste —
+    // callers may pass want_soft_next=false to skip it (and, in exact mode, the
+    // vocab-wide probs@embed GEMM that produces it).
     void decode_step(const std::vector<int>& canvas_ids,
                      const bf16* soft_or_null, int enc_len, float temp,
                      std::vector<int>& argmax,
                      std::vector<float>& entropy,
                      std::vector<int>& denoiser,
                      GpuBuffer<bf16>& soft_next,
-                     std::mt19937& rng);
+                     std::mt19937& rng,
+                     bool want_soft_next = true);
 
     DiffConfig    cfg_;
     DiffPerfStats stats_;

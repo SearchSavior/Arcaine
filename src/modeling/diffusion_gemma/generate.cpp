@@ -29,6 +29,9 @@ std::vector<int> DiffusionGemmaModel::generate(
 
     DiffStopping stopping(cfg_.gen.stability_threshold, cfg_.gen.confidence_threshold);
     bool force_denoise_steps = std::getenv("DIFF_FORCE_DENOISE_STEPS") != nullptr;
+    // DIFF_SKIP_LAST_SOFT_NEXT: the final scheduled step (step==1) has no
+    // successor to consume its self-conditioning signal, so skip producing it.
+    bool skip_last_soft_next = std::getenv("DIFF_SKIP_LAST_SOFT_NEXT") != nullptr;
     std::uniform_int_distribution<int> uni(0, V - 1);
 
     std::vector<int> output;
@@ -57,9 +60,10 @@ std::vector<int> DiffusionGemmaModel::generate(
         for (int step = N; step >= 1; --step) {
             float temp = diff_temperature(step, N, cfg_.gen.t_min, cfg_.gen.t_max);
             GpuBuffer<bf16> soft_next;
+            bool want_soft_next = !(skip_last_soft_next && step == 1);
             auto td0 = Clk::now();
             decode_step(current, soft ? soft->data() : nullptr, enc_len, temp,
-                        argmax, entropy, denoiser, soft_next, rng);
+                        argmax, entropy, denoiser, soft_next, rng, want_soft_next);
             stats_.decode_s += secs(td0, Clk::now());
             stats_.decode_passes += 1;
 
@@ -67,7 +71,7 @@ std::vector<int> DiffusionGemmaModel::generate(
             current = entropy_bound_accept_renoise(current, denoiser, entropy,
                                                    cfg_.gen.entropy_bound, V, rng,
                                                    &accepted);
-            soft.emplace(std::move(soft_next));
+            if (want_soft_next) soft.emplace(std::move(soft_next));
 
             bool stop = stopping.update(argmax, entropy);
             double me = 0; for (float e : entropy) me += e; me /= entropy.size();
