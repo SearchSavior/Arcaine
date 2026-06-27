@@ -849,3 +849,34 @@ inline void embedding_lookup_q8_0(
         });
     });
 }
+
+// out[t, :] = scale * sum_{s<k} w[t,s] * dequant(table[idx[t,s], :])   (Q8_0 table)
+// Top-k weighted embedding gather; counterpart to weighted_embed_gather for BF16.
+inline void weighted_embed_gather_q8_0(
+    sycl::queue& q,
+    const Q8Linear& table,
+    const int32_t* idx,    // (seq, k)
+    const float* w,        // (seq, k)
+    bf16* out,             // (seq, H)
+    int seq, int k, int H,
+    float scale)
+{
+    if (table.in_features != H || table.weight_scale_rows.empty())
+        throw std::runtime_error("weighted_embed_gather_q8_0: invalid Q8_0 embedding table");
+    const int8_t* qs = table.weight_qs.data();
+    const float* sc = table.weight_scale_rows.data();
+    int groups = H / 32;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>(seq, H), [=](sycl::id<2> id) {
+            int t = (int)id[0], d = (int)id[1];
+            float acc = 0.0f;
+            for (int s = 0; s < k; ++s) {
+                int tok = idx[(size_t)t * k + s];
+                float val = (float)qs[(size_t)tok * H + d] *
+                            sc[(size_t)tok * groups + d / 32];
+                acc += w[(size_t)t * k + s] * val;
+            }
+            out[(size_t)t * H + d] = float_to_bf16(acc * scale);
+        });
+    });
+}

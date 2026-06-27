@@ -24,21 +24,47 @@ static void transfer(sycl::queue& src_q, const bf16* src,
     dst_q.memcpy(dst, stage.data(), n * sizeof(bf16)).wait();
 }
 
-// Cheap self-conditioning signal.  The exact path materializes BF16 probs over
-// the whole vocab and forms soft_next = probs(seq,V) @ embed(V,H) — a vocab-wide
-// GEMM as expensive as the LM head itself.  The "hard" path instead gathers the
-// argmax token's embedding (seq,H), skipping both the probs buffer and the GEMM.
-// Works for Q8_0 and BF16 embedding tables.  DIFF_SOFT_NEXT=hard|argmax enables
-// it (DIFF_Q8_SOFT_NEXT kept for back-compat with the original Q8-only flag).
-static bool hard_soft_next_enabled() {
-    static bool enabled = [] {
-        auto on = [](const char* env) {
-            return env && (!std::strcmp(env, "argmax") || !std::strcmp(env, "hard") ||
-                           !std::strcmp(env, "1") || !std::strcmp(env, "on"));
+// Self-conditioning ("soft_next") signal modes — a per-step hot-path knob for
+// the next-step conditioning embedding, selected by DIFF_SOFT_NEXT:
+//   exact (default)  soft_next = probs(seq,V) @ embed(V,H).  Faithful, but a
+//                    vocab-wide GEMM as expensive as the LM head, plus a seq*V
+//                    probs buffer.
+//   hard | argmax    gather the argmax token's embedding (seq,H).  Cheapest;
+//                    drops both the probs buffer and the GEMM.
+//   topk[:K]         top-K weighted embedding (default K=8).  Accuracy-
+//                    preserving middle ground: k*H per row, no probs buffer.
+// DIFF_Q8_SOFT_NEXT is honored for back-compat with the original Q8-only flag.
+enum class SoftNextMode { Exact, Hard, TopK };
+struct SoftNextCfg { SoftNextMode mode; int k; };
+
+static SoftNextCfg soft_next_cfg() {
+    static SoftNextCfg cfg = [] {
+        auto parse = [](const char* e, SoftNextCfg& out) -> bool {
+            if (!e) return false;
+            if (!std::strcmp(e, "argmax") || !std::strcmp(e, "hard") ||
+                !std::strcmp(e, "1") || !std::strcmp(e, "on")) {
+                out = {SoftNextMode::Hard, 1}; return true;
+            }
+            if (!std::strcmp(e, "exact") || !std::strcmp(e, "full") ||
+                !std::strcmp(e, "0") || !std::strcmp(e, "off")) {
+                out = {SoftNextMode::Exact, 0}; return true;
+            }
+            if (!std::strncmp(e, "topk", 4)) {
+                int k = 8;
+                const char* colon = std::strchr(e, ':');
+                if (colon) k = std::atoi(colon + 1);
+                k = std::max(1, std::min(k, 64));   // bound local-memory top-k storage
+                out = {SoftNextMode::TopK, k}; return true;
+            }
+            return false;
         };
-        return on(std::getenv("DIFF_SOFT_NEXT")) || on(std::getenv("DIFF_Q8_SOFT_NEXT"));
+        SoftNextCfg out{SoftNextMode::Exact, 0};
+        if (parse(std::getenv("DIFF_SOFT_NEXT"), out) ||
+            parse(std::getenv("DIFF_Q8_SOFT_NEXT"), out))
+            return out;
+        return SoftNextCfg{SoftNextMode::Exact, 0};
     }();
-    return enabled;
+    return cfg;
 }
 
 DiffusionGemmaModel::DiffusionGemmaModel(const std::string& model_dir, int max_seq_len, DiffPlacementOptions placement, bool print_placement) {
@@ -177,12 +203,13 @@ void DiffusionGemmaModel::decode_step(
           matmul_bf16(hidden.data(), seq, H, w_.embed_tokens.data(), V, logits_bf16.data(), ctx0); }
     hidden.reset();
 
-    // F1: softcap + temperature + softmax + argmax + entropy +
-    // multinomial sample in one kernel. Only BF16 probabilities are
-    // materialized for the self-conditioning matmul.
-    bool hard_soft_next = hard_soft_next_enabled();
+    // F1: softcap + temperature + softmax + argmax + entropy + multinomial
+    // sample in one kernel.  BF16 probabilities are only materialized when the
+    // exact self-conditioning matmul needs them (see SoftNextMode).
+    SoftNextCfg sn = soft_next_cfg();
+    bool need_probs = (sn.mode == SoftNextMode::Exact);
     diffarena::Alloc<bf16> probs_bf16;
-    if (!hard_soft_next) probs_bf16 = ar0.alloc<bf16>((size_t)seq * V);
+    if (need_probs) probs_bf16 = ar0.alloc<bf16>((size_t)seq * V);
     GpuBuffer<int32_t> amax_dev(seq, q0), deno_dev(seq, q0);
     GpuBuffer<float>   ent_dev(seq, q0);
     std::vector<float> u(seq);
@@ -191,8 +218,21 @@ void DiffusionGemmaModel::decode_step(
     { DIFF_PROF(q0, "lm.softmax_sample");
       fused_logits_head(q0, logits_bf16.data(),
                         cfg_.text.final_logit_softcapping, 1.0f / temp,
-                        u_dev.data(), hard_soft_next ? nullptr : probs_bf16.data(),
+                        u_dev.data(), need_probs ? probs_bf16.data() : nullptr,
                         amax_dev.data(), ent_dev.data(), deno_dev.data(), seq, V); }
+
+    // TopK soft_next reads the same logits for its selection — extract before
+    // the logits buffer is released.
+    GpuBuffer<int32_t> topk_idx_dev;
+    GpuBuffer<float>   topk_w_dev;
+    if (sn.mode == SoftNextMode::TopK) {
+        topk_idx_dev = GpuBuffer<int32_t>((size_t)seq * sn.k, q0);
+        topk_w_dev   = GpuBuffer<float>((size_t)seq * sn.k, q0);
+        DIFF_PROF(q0, "lm.topk_select");
+        topk_soft_select(q0, logits_bf16.data(),
+                         cfg_.text.final_logit_softcapping, 1.0f / temp,
+                         sn.k, topk_idx_dev.data(), topk_w_dev.data(), seq, V);
+    }
     logits_bf16.reset();
 
     argmax.resize(seq); entropy.resize(seq); denoiser.resize(seq);
@@ -201,25 +241,41 @@ void DiffusionGemmaModel::decode_step(
       amax_dev.download(a.data(), seq); deno_dev.download(d.data(), seq);
       ent_dev.download(entropy.data(), seq);
       for (int i = 0; i < seq; ++i) { argmax[i] = a[i]; denoiser[i] = d[i]; } }
-    // soft_next = probs @ embed * embed_scale   (next-step signal).
+    // soft_next: next-step self-conditioning signal (embed_scale_ folded in).
     soft_next = GpuBuffer<bf16>((size_t)seq * H, q0);
     { DIFF_PROF(q0, "lm.soft_next");
-      if (hard_soft_next) {
-          // Gather the argmax token embedding (already includes embed_scale_).
+      switch (sn.mode) {
+      case SoftNextMode::Hard:
+          // Gather the argmax token embedding.
           if (!w_.embed_tokens_q8.empty())
               embedding_lookup_q8_0(q0, w_.embed_tokens_q8, amax_dev.data(),
                                     soft_next.data(), seq, H, embed_scale_);
           else
               embedding_lookup(q0, w_.embed_tokens.data(), amax_dev.data(),
                                soft_next.data(), seq, H, embed_scale_);
-      } else if (!w_.embed_tokens_q8.empty()) {
-          matmul_q8_0_nn(probs_bf16.data(), seq, V, w_.embed_tokens_q8, H,
-                         soft_next.data(), ctx0);
-      } else {
-          matmul_bf16_nn(probs_bf16.data(), seq, V, w_.embed_tokens.data(), H, soft_next.data(), ctx0);
-      }
-      probs_bf16.reset();
-      if (!hard_soft_next)
-          scale_inplace(q0, soft_next.data(), seq * H, embed_scale_); }
+          break;
+      case SoftNextMode::TopK:
+          // Top-k weighted embedding gather.
+          if (!w_.embed_tokens_q8.empty())
+              weighted_embed_gather_q8_0(q0, w_.embed_tokens_q8, topk_idx_dev.data(),
+                                         topk_w_dev.data(), soft_next.data(),
+                                         seq, sn.k, H, embed_scale_);
+          else
+              weighted_embed_gather(q0, w_.embed_tokens.data(), topk_idx_dev.data(),
+                                    topk_w_dev.data(), soft_next.data(),
+                                    seq, sn.k, H, embed_scale_);
+          break;
+      case SoftNextMode::Exact:
+          // soft_next = probs @ embed, then * embed_scale.
+          if (!w_.embed_tokens_q8.empty())
+              matmul_q8_0_nn(probs_bf16.data(), seq, V, w_.embed_tokens_q8, H,
+                             soft_next.data(), ctx0);
+          else
+              matmul_bf16_nn(probs_bf16.data(), seq, V, w_.embed_tokens.data(), H,
+                             soft_next.data(), ctx0);
+          probs_bf16.reset();
+          scale_inplace(q0, soft_next.data(), seq * H, embed_scale_);
+          break;
+      } }
     q0.wait();
 }

@@ -136,6 +136,110 @@ inline void fused_logits_head(
 }
 
 // ---------------------------------------------------------------------------
+// F1c — top-k soft-conditioning select.  Per canvas row, find the top-k tokens
+// of the softcapped/tempered distribution and their renormalized softmax
+// weights, WITHOUT materializing the (seq,V) probs buffer.  Feeds a top-k
+// weighted embedding gather (see weighted_embed_gather*) so the next-step
+// self-conditioning signal costs k*H per row instead of the full V*H GEMM —
+// the accuracy-preserving middle ground between exact probs@embed and the
+// argmax-only "hard" path.
+//
+// Z cancels under top-k renormalization, so only the global max is needed for
+// numerical stability: weight_i = exp(proc_i - m) / sum_{j in topk} exp(proc_j - m).
+// Selection is k parallel argmax passes (k*V work, still << V*H), masking
+// already-picked columns — same construction as the MoE router top-k.
+// ---------------------------------------------------------------------------
+inline void topk_soft_select(
+    sycl::queue& q,
+    const bf16* logits,    // (seq, V)
+    float softcap, float inv_temp,
+    int k,
+    int32_t* topk_idx,     // (seq, k)
+    float*   topk_w,       // (seq, k) renormalized softmax weights
+    int seq, int V)
+{
+    constexpr int WG = 256;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sf(sycl::range<1>(WG), h);
+        sycl::local_accessor<int, 1>   si(sycl::range<1>(WG), h);
+        sycl::local_accessor<int, 1>   sel(sycl::range<1>(k), h);
+        sycl::local_accessor<float, 1> selv(sycl::range<1>(k), h);
+        h.parallel_for(
+            sycl::nd_range<1>((size_t)seq * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                int row = it.get_group(0);
+                int lid = it.get_local_id(0);
+                const bf16* x = logits + (size_t)row * V;
+
+                auto proc = [=](int c) {
+                    float v = bf16_to_float(x[c]);
+                    return sycl::tanh(v / softcap) * softcap * inv_temp;
+                };
+
+                for (int s = 0; s < k; ++s) {
+                    // Parallel argmax over columns not already selected.
+                    float m = -3.4028235e38f; int am = -1;
+                    for (int c = lid; c < V; c += WG) {
+                        bool taken = false;
+                        for (int j = 0; j < s; ++j) if (sel[j] == c) { taken = true; break; }
+                        if (taken) continue;
+                        float p = proc(c);
+                        if (p > m || (p == m && (am < 0 || c < am))) { m = p; am = c; }
+                    }
+                    sf[lid] = m; si[lid] = am;
+                    it.barrier(sycl::access::fence_space::local_space);
+                    for (int o = WG / 2; o > 0; o >>= 1) {
+                        if (lid < o) {
+                            if (sf[lid + o] > sf[lid] ||
+                                (sf[lid + o] == sf[lid] && si[lid + o] >= 0 &&
+                                 (si[lid] < 0 || si[lid + o] < si[lid]))) {
+                                sf[lid] = sf[lid + o]; si[lid] = si[lid + o];
+                            }
+                        }
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (lid == 0) { sel[s] = si[0]; selv[s] = sf[0]; }
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+
+                // Renormalized softmax over the k selected (selv[0] == global max).
+                if (lid == 0) {
+                    float m0 = selv[0];
+                    float z = 0.0f;
+                    for (int s = 0; s < k; ++s) { float e = sycl::exp(selv[s] - m0); selv[s] = e; z += e; }
+                    float inv_z = z > 0.0f ? 1.0f / z : 0.0f;
+                    for (int s = 0; s < k; ++s) {
+                        topk_idx[(size_t)row * k + s] = sel[s];
+                        topk_w[(size_t)row * k + s]   = selv[s] * inv_z;
+                    }
+                }
+            });
+    });
+}
+
+// out[t, :] = scale * sum_{s<k} w[t,s] * table[idx[t,s], :]   (BF16 table)
+inline void weighted_embed_gather(
+    sycl::queue& q,
+    const bf16* table,     // (vocab, H)
+    const int32_t* idx,    // (seq, k)
+    const float* w,        // (seq, k)
+    bf16* out,             // (seq, H)
+    int seq, int k, int H, float scale)
+{
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>(seq, H), [=](sycl::id<2> id) {
+            int t = (int)id[0], d = (int)id[1];
+            float acc = 0.0f;
+            for (int s = 0; s < k; ++s) {
+                int tok = idx[(size_t)t * k + s];
+                acc += w[(size_t)t * k + s] * bf16_to_float(table[(size_t)tok * H + d]);
+            }
+            out[(size_t)t * H + d] = float_to_bf16(acc * scale);
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // F1b — parallel multinomial over probs rows.  Thread k owns a contiguous
 // column chunk; partial sums + local exclusive scan find the chunk containing
 // the target, which is then rescanned serially.

@@ -15,6 +15,20 @@ namespace {
 static constexpr int kTailCap = 64;
 static int round_up(int v, int m) { return (v + m - 1) / m * m; }
 
+// Tail capacity for the batched cold-expert GEMM.  Cold experts each occupy T
+// padded rows; experts hotter than T spill to exact-size GEMMs.  Larger T moves
+// more experts into the (padded) batched path; smaller T tightens padding waste
+// but pushes more experts onto the per-expert exact path.  Hot-path tuning knob
+// for the MoE load distribution (inspect with DIFF_MOE_STATS).
+static int moe_tail_cap() {
+    static int value = [] {
+        const char* env = std::getenv("DIFF_MOE_TAIL_CAP");
+        int v = env ? std::atoi(env) : kTailCap;
+        return v > 0 ? v : kTailCap;
+    }();
+    return value;
+}
+
 // Expert activations are carved from the per-GPU liveness arena (see arena.hpp).
 // run_shard allocates ~16 temporaries per layer per pass; the arena hands them
 // out from a pre-sized device chunk (no per-call sycl::malloc churn — the same
@@ -501,7 +515,7 @@ static void run_shard(
     q.memset(out, 0, (size_t)seq * H * sizeof(bf16));
     if (A == 0) return;
 
-    int T = std::min(kTailCap, round_up(seq, 8));
+    int T = std::min(moe_tail_cap(), round_up(seq, 8));
     bool q8_compact_exact = shard.q8 && !q8_use_hybrid_expert_kernel();
     struct Hot { int expert, rows_off, m; };
     std::vector<Hot> hot;
