@@ -747,3 +747,104 @@ inline void matmul_nvfp4_grouped_rows_xe2(
             });
     });
 }
+
+// xe2v2: per-expert DPAS grouped NVFP4 GEMM, aligned to the xe2 idiom.
+// Replaces the k-split + SLM-reduction + global-LUT dequant of the v1 xe2
+// kernel with a single-subgroup, register-blocked-M design (cf. the q8
+// grouped-expert kernel): one work-group per (expert, N/16 tile), BLK M-tiles
+// resident in registers, B dequanted once per k-step and reused across BLK
+// rows, arithmetic e2m1*e4m3 dequant (no lookup table, no global traffic).
+// Per-expert work-groups make the row->expert mapping exact (no tile straddles
+// into another expert's weights), so correctness does not rely on per-expert row
+// padding. Gated by DIFF_NVFP4_GROUPED_GEMM=xe2v2 for A/B vs hybrid/oneDNN.
+inline void matmul_nvfp4_grouped_rows_xe2_v2(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int K,
+    const int32_t* expert_offsets,
+    const int32_t* rows_per_expert,
+    int localE,
+    const uint8_t* const* W_packed_by_expert,
+    const uint8_t* const* W_scale_by_expert,
+    const float* const* dst_scale_by_expert,
+    int N,
+    bf16* C)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        throw std::runtime_error("xe2v2 grouped NVFP4 matmul requires K%16 and N%16");
+    if (localE <= 0) return;
+    constexpr int BLK = 4;
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / 16;
+    int ntiles = N / 16;
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)ntiles * 16),
+                              sycl::range<2>(1, 16)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int e = (int)it.get_group(0);
+                int lane = (int)it.get_local_id(1);
+                int n = (int)it.get_group(1) * 16 + lane;
+                int offset = expert_offsets[e];
+                int count = rows_per_expert[e];
+                if (count <= 0) return;
+                int mt = (count + 7) / 8;
+
+                const uint8_t* w = W_packed_by_expert[e];
+                const uint8_t* ws = W_scale_by_expert[e];
+                const uint8_t* wrow_base = w + (size_t)n * halfK;
+                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
+
+                for (int tile0 = 0; tile0 < mt; tile0 += BLK) {
+                    diff_dpas_v8f c[BLK];
+                    for (int t = 0; t < BLK; ++t) c[t] = diff_dpas_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+                    for (int kt = 0; kt < ktiles; ++kt) {
+                        int k0 = kt * 16;
+                        float wscale = nvfp4_e4m3_fast(ws[(size_t)kt * N + n]);
+                        const uint8_t* wrow = wrow_base + k0 / 2;
+                        diff_dpas_v8i b;
+                        for (int j = 0; j < 8; ++j) {
+                            uint8_t by = wrow[j];
+                            uint16_t lo = float_to_bf16(nvfp4_e2m1_fast(by & 0x0f) * wscale);
+                            uint16_t hi = float_to_bf16(nvfp4_e2m1_fast(by >> 4) * wscale);
+                            b[j] = (int)((uint32_t)lo | ((uint32_t)hi << 16));
+                        }
+                        int kk = k0 + lane;
+                        for (int t = 0; t < BLK; ++t) {
+                            int tile = tile0 + t;
+                            if (tile >= mt) break;  // uniform across the subgroup
+                            int m0 = offset + tile * 8;
+                            diff_dpas_v8s a;
+                            for (int m = 0; m < 8; ++m) {
+                                int row = m0 + m;
+                                uint16_t av = 0;
+                                if ((row - offset) < count) {
+                                    uint8_t byte = A_packed[(size_t)row * halfK + kk / 2];
+                                    uint8_t nib = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
+                                    av = float_to_bf16(
+                                        nvfp4_e2m1_fast(nib) *
+                                        nvfp4_e4m3_fast(A_scale[(size_t)row * ktiles + kt]));
+                                }
+                                a[m] = (short)av;
+                            }
+                            c[t] = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                                16, a, b, c[t], kNvfp4DpasBF16);
+                        }
+                    }
+                    for (int t = 0; t < BLK; ++t) {
+                        int tile = tile0 + t;
+                        if (tile >= mt) break;
+                        int m0 = offset + tile * 8;
+                        for (int m = 0; m < 8; ++m) {
+                            int row = m0 + m;
+                            if ((row - offset) < count)
+                                C[(size_t)row * N + n] = float_to_bf16(c[t][m] * inv_dst);
+                        }
+                    }
+                }
+            });
+    });
+}

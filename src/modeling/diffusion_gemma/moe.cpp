@@ -115,15 +115,19 @@ struct RouterRoutes {
     RouterRoutes& operator=(RouterRoutes&&) noexcept = default;
 };
 
+// Compute router softmax + top-k on the GPU instead of downloading the per-layer
+// scores to the host (a blocking copy that stalls the queue every MoE layer) and
+// sorting there.  Numerically equivalent to the host path; default on, opt out
+// with DIFF_ROUTER_GPU_TOPK=0.  Falls back to host routing when the device
+// per-expert-scale buffer is unavailable (see router()).
 static bool router_gpu_topk_enabled() {
     static bool enabled = [] {
         const char* env = std::getenv("DIFF_ROUTER_GPU_TOPK");
-        if (!env) return false;
+        if (!env) return true;
         if (!std::strcmp(env, "0") || !std::strcmp(env, "off") ||
             !std::strcmp(env, "false") || !std::strcmp(env, "no"))
             return false;
-        return !std::strcmp(env, "1") || !std::strcmp(env, "on") ||
-               !std::strcmp(env, "true") || !std::strcmp(env, "gpu");
+        return true;
     }();
     return enabled;
 }

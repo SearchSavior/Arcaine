@@ -15,6 +15,20 @@ namespace {
 static constexpr int kTailCap = 64;
 static int round_up(int v, int m) { return (v + m - 1) / m * m; }
 
+// Tail capacity for the batched cold-expert GEMM.  Cold experts each occupy T
+// padded rows; experts hotter than T spill to exact-size GEMMs.  Larger T moves
+// more experts into the (padded) batched path; smaller T tightens padding waste
+// but pushes more experts onto the per-expert exact path.  Hot-path tuning knob
+// for the MoE load distribution (inspect with DIFF_MOE_STATS).
+static int moe_tail_cap() {
+    static int value = [] {
+        const char* env = std::getenv("DIFF_MOE_TAIL_CAP");
+        int v = env ? std::atoi(env) : kTailCap;
+        return v > 0 ? v : kTailCap;
+    }();
+    return value;
+}
+
 // Expert activations are carved from the per-GPU liveness arena (see arena.hpp).
 // run_shard allocates ~16 temporaries per layer per pass; the arena hands them
 // out from a pre-sized device chunk (no per-call sycl::malloc churn — the same
@@ -81,6 +95,17 @@ static bool nvfp4_grouped_gemm_xe2_enabled() {
         if (!env) return false;
         return !std::strcmp(env, "xe2") || !std::strcmp(env, "dpas") ||
                !std::strcmp(env, "xmx") || !std::strcmp(env, "1");
+    }();
+    return enabled;
+}
+
+// xe2v2: the rewritten per-expert DPAS kernel (arithmetic dequant, no k-split,
+// no global LUT). Distinct value so the old xe2 path is preserved for A/B.
+static bool nvfp4_grouped_gemm_xe2v2_enabled() {
+    static bool enabled = [] {
+        const char* env = std::getenv("DIFF_NVFP4_GROUPED_GEMM");
+        if (!env) return false;
+        return !std::strcmp(env, "xe2v2");
     }();
     return enabled;
 }
@@ -327,7 +352,8 @@ static bool run_shard_nvfp4_gpu_layout(
 
     int HG = H / 16;
     int IG = moe_inter / 16;
-    bool use_xe2_gemm = nvfp4_grouped_gemm_xe2_enabled();
+    bool use_xe2v2 = nvfp4_grouped_gemm_xe2v2_enabled();
+    bool use_xe2_gemm = !use_xe2v2 && nvfp4_grouped_gemm_xe2_enabled();
     std::vector<const uint8_t*> gate_w(localE), gate_s(localE), down_w(localE), down_s(localE);
     std::vector<const float*> gate_dst(localE), down_dst(localE);
     std::vector<float> gate_input(localE), down_input(localE);
@@ -374,7 +400,12 @@ static bool run_shard_nvfp4_gpu_layout(
 
     auto gu = ar.alloc<bf16>((size_t)A_all * 2 * moe_inter);
     { DIFF_PROF(q, prof.gateup_mm);
-      if (use_xe2_gemm) {
+      if (use_xe2v2) {
+          matmul_nvfp4_grouped_rows_xe2_v2(ctx, xe_packed.data(), xe_scale.data(), H,
+                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
+                                           gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
+                                           2 * moe_inter, gu.data());
+      } else if (use_xe2_gemm) {
           matmul_nvfp4_grouped_rows_xe2(ctx, xe_packed.data(), xe_scale.data(), H,
                                         row_expert_dev.data(), A_all,
                                         gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
@@ -403,7 +434,12 @@ static bool run_shard_nvfp4_gpu_layout(
 
     auto Ye = ar.alloc<bf16>((size_t)A_all * H);
     { DIFF_PROF(q, prof.down_mm);
-      if (use_xe2_gemm) {
+      if (use_xe2v2) {
+          matmul_nvfp4_grouped_rows_xe2_v2(ctx, act_packed.data(), act_scale.data(), moe_inter,
+                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
+                                           down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
+                                           H, Ye.data());
+      } else if (use_xe2_gemm) {
           matmul_nvfp4_grouped_rows_xe2(ctx, act_packed.data(), act_scale.data(), moe_inter,
                                         row_expert_dev.data(), A_all,
                                         down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
@@ -501,7 +537,7 @@ static void run_shard(
     q.memset(out, 0, (size_t)seq * H * sizeof(bf16));
     if (A == 0) return;
 
-    int T = std::min(kTailCap, round_up(seq, 8));
+    int T = std::min(moe_tail_cap(), round_up(seq, 8));
     bool q8_compact_exact = shard.q8 && !q8_use_hybrid_expert_kernel();
     struct Hot { int expert, rows_off, m; };
     std::vector<Hot> hot;
