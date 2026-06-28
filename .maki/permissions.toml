@@ -5,4 +5,6 @@ allow = [
     "timeout *",
     "tail *",
     "echo *",
+    "ls *",
+    "head *",
 ]

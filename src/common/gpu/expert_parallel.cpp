@@ -99,6 +99,17 @@ static bool nvfp4_grouped_gemm_xe2_enabled() {
     return enabled;
 }
 
+// xe2v2: the rewritten per-expert DPAS kernel (arithmetic dequant, no k-split,
+// no global LUT). Distinct value so the old xe2 path is preserved for A/B.
+static bool nvfp4_grouped_gemm_xe2v2_enabled() {
+    static bool enabled = [] {
+        const char* env = std::getenv("DIFF_NVFP4_GROUPED_GEMM");
+        if (!env) return false;
+        return !std::strcmp(env, "xe2v2");
+    }();
+    return enabled;
+}
+
 static bool q8_use_hybrid_expert_kernel() {
     static bool enabled = [] {
         const char* env = std::getenv("DIFF_Q8_EXPERT_KERNEL");
@@ -341,7 +352,8 @@ static bool run_shard_nvfp4_gpu_layout(
 
     int HG = H / 16;
     int IG = moe_inter / 16;
-    bool use_xe2_gemm = nvfp4_grouped_gemm_xe2_enabled();
+    bool use_xe2v2 = nvfp4_grouped_gemm_xe2v2_enabled();
+    bool use_xe2_gemm = !use_xe2v2 && nvfp4_grouped_gemm_xe2_enabled();
     std::vector<const uint8_t*> gate_w(localE), gate_s(localE), down_w(localE), down_s(localE);
     std::vector<const float*> gate_dst(localE), down_dst(localE);
     std::vector<float> gate_input(localE), down_input(localE);
@@ -388,7 +400,12 @@ static bool run_shard_nvfp4_gpu_layout(
 
     auto gu = ar.alloc<bf16>((size_t)A_all * 2 * moe_inter);
     { DIFF_PROF(q, prof.gateup_mm);
-      if (use_xe2_gemm) {
+      if (use_xe2v2) {
+          matmul_nvfp4_grouped_rows_xe2_v2(ctx, xe_packed.data(), xe_scale.data(), H,
+                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
+                                           gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
+                                           2 * moe_inter, gu.data());
+      } else if (use_xe2_gemm) {
           matmul_nvfp4_grouped_rows_xe2(ctx, xe_packed.data(), xe_scale.data(), H,
                                         row_expert_dev.data(), A_all,
                                         gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
@@ -417,7 +434,12 @@ static bool run_shard_nvfp4_gpu_layout(
 
     auto Ye = ar.alloc<bf16>((size_t)A_all * H);
     { DIFF_PROF(q, prof.down_mm);
-      if (use_xe2_gemm) {
+      if (use_xe2v2) {
+          matmul_nvfp4_grouped_rows_xe2_v2(ctx, act_packed.data(), act_scale.data(), moe_inter,
+                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
+                                           down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
+                                           H, Ye.data());
+      } else if (use_xe2_gemm) {
           matmul_nvfp4_grouped_rows_xe2(ctx, act_packed.data(), act_scale.data(), moe_inter,
                                         row_expert_dev.data(), A_all,
                                         down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
