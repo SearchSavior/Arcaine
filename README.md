@@ -27,8 +27,12 @@ It's early days and the project is expected to move quickly- there are a ton of 
 
 ## Performance
 
-Arcaine currently implements DiffusionGemma
+For NVFP4 the current best performing set of env args is
 
+```
+DIFF_ROUTER_GPU_TOPK=on DIFF_SKIP_LAST_SOFT_NEXT=1 DIFF_PERSIST_XFER_STAGE=1 DIFF_SOFT_NEXT=topk:8 DIFF_ONEDNN_SDPA=decode
+```
+These are cobbled together but define the codepath taken at inference time; Arcaine currently contains many A/B style knobs for controlling behavior- so far this has been difficult to scale/maintain, so I expect changes.
 
 ## Supported Models
 
@@ -68,6 +72,8 @@ cmake -B build -G Ninja \
   -DARCAINE_SYCL_TARGETS=intel_gpu_bmg_g31
 cmake --build build -j"$(nproc)"
 ```
+
+
 
 Doing the build makes a few binaries which all accept `--help`.
 
