@@ -1,7 +1,10 @@
 #include "model.hpp"
 #include "sampler.hpp"
+#include "device_sampler.hpp"
 #include "../../utils/profile.hpp"
+#include "../../common/gpu/engine.hpp"
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -29,6 +32,10 @@ std::vector<int> DiffusionGemmaModel::generate(
 
     DiffStopping stopping(cfg_.gen.stability_threshold, cfg_.gen.confidence_threshold);
     bool force_denoise_steps = std::getenv("DIFF_FORCE_DENOISE_STEPS") != nullptr;
+    // DIFF_HOST_SAMPLER: keep the original fully host-side sampler + stopping
+    // (host canvas, host entropy-bound accept/renoise, host stable-and-confident
+    // check) for A/B against the device-resident default path.
+    bool host_sampler = std::getenv("DIFF_HOST_SAMPLER") != nullptr;
     // DIFF_SKIP_LAST_SOFT_NEXT: the final scheduled step (step==1) has no
     // successor to consume its self-conditioning signal, so skip producing it.
     bool skip_last_soft_next = std::getenv("DIFF_SKIP_LAST_SOFT_NEXT") != nullptr;
@@ -48,44 +55,120 @@ std::vector<int> DiffusionGemmaModel::generate(
             stats_.prefill_tokens += (blk == 0) ? (int)prompt_ids.size() : C;
         }
 
-        // 2. Init canvas with uniform-random tokens.
-        std::vector<int> current(C);
-        for (int& t : current) t = uni(rng);
-        std::optional<GpuBuffer<bf16>> soft;
-        stopping.reset();
-        std::vector<int> argmax = current, denoiser;
-        std::vector<float> entropy;
+        // 2-3. Denoise the canvas.  Two paths share the commit tail below:
+        //   * device-resident (default): canvas / argmax / entropy / denoiser
+        //     stay on the GPU; accept/renoise + stable-and-confident stop run as
+        //     small device kernels on the same in-order queue.  The only host
+        //     sync per step is the optional callback payload + 4-byte stop flag.
+        //   * host sampler (DIFF_HOST_SAMPLER): the original path — host canvas,
+        //     host entropy_bound_accept_renoise, host DiffStopping.  Kept for A/B.
+        // Both leave the final denoised canvas in `argmax` (host).
+        std::vector<int> argmax;
 
-        // 3. Denoising loop (cur_step counts down N..1).
-        for (int step = N; step >= 1; --step) {
-            float temp = diff_temperature(step, N, cfg_.gen.t_min, cfg_.gen.t_max);
-            GpuBuffer<bf16> soft_next;
-            bool want_soft_next = !(skip_last_soft_next && step == 1);
-            auto td0 = Clk::now();
-            decode_step(current, soft ? soft->data() : nullptr, enc_len, temp,
-                        argmax, entropy, denoiser, soft_next, rng, want_soft_next);
-            stats_.decode_s += secs(td0, Clk::now());
-            stats_.decode_passes += 1;
+        if (host_sampler) {
+            std::vector<int> current(C);
+            for (int& t : current) t = uni(rng);
+            std::optional<GpuBuffer<bf16>> soft;
+            stopping.reset();
+            argmax = current;
+            std::vector<int> denoiser;
+            std::vector<float> entropy;
 
-            std::vector<char> accepted;
-            current = entropy_bound_accept_renoise(current, denoiser, entropy,
-                                                   cfg_.gen.entropy_bound, V, rng,
-                                                   &accepted);
-            if (want_soft_next) soft.emplace(std::move(soft_next));
+            for (int step = N; step >= 1; --step) {
+                float temp = diff_temperature(step, N, cfg_.gen.t_min, cfg_.gen.t_max);
+                GpuBuffer<bf16> soft_next;
+                bool want_soft_next = !(skip_last_soft_next && step == 1);
+                auto td0 = Clk::now();
+                decode_step(current, soft ? soft->data() : nullptr, enc_len, temp,
+                            argmax, entropy, denoiser, soft_next, rng, want_soft_next);
+                stats_.decode_s += secs(td0, Clk::now());
+                stats_.decode_passes += 1;
 
-            bool stop = stopping.update(argmax, entropy);
-            double me = 0; for (float e : entropy) me += e; me /= entropy.size();
-            if (verbose)
-                std::printf("[blk %d step %2d] temp=%.3f mean_entropy=%.4f%s\n",
-                            blk, step, temp, me, stop ? "  [stop]" : "");
-            if (on_step) {
-                DiffStepEvent ev;
-                ev.block = blk; ev.cur_step = step; ev.temperature = temp;
-                ev.mean_entropy = (float)me; ev.committed = false;
-                ev.canvas = &argmax; ev.entropy = &entropy; ev.accepted = &accepted;
-                on_step(ev);
+                std::vector<char> accepted;
+                current = entropy_bound_accept_renoise(current, denoiser, entropy,
+                                                       cfg_.gen.entropy_bound, V, rng,
+                                                       &accepted);
+                if (want_soft_next) soft.emplace(std::move(soft_next));
+
+                bool stop = stopping.update(argmax, entropy);
+                double me = 0; for (float e : entropy) me += e; me /= entropy.size();
+                if (verbose)
+                    std::printf("[blk %d step %2d] temp=%.3f mean_entropy=%.4f%s\n",
+                                blk, step, temp, me, stop ? "  [stop]" : "");
+                if (on_step) {
+                    DiffStepEvent ev;
+                    ev.block = blk; ev.cur_step = step; ev.temperature = temp;
+                    ev.mean_entropy = (float)me; ev.committed = false;
+                    ev.canvas = &argmax; ev.entropy = &entropy; ev.accepted = &accepted;
+                    on_step(ev);
+                }
+                if (stop && !force_denoise_steps) break;
             }
-            if (stop && !force_denoise_steps) break;
+        } else {
+            ensure_device_buffers(C);
+            auto& q0 = GpuEngine::get(0).queue;
+            diffsamp::init_canvas_random(q0, canvas_dev_.data(), (uint64_t)seed,
+                                         (uint32_t)blk, C, V);
+            std::optional<GpuBuffer<bf16>> soft;
+            GpuBuffer<bf16> soft_next_buf;
+            bool first_step = true;
+            std::vector<float> entropy_h;
+            std::vector<char>  accepted_h;
+
+            for (int step = N; step >= 1; --step) {
+                float temp = diff_temperature(step, N, cfg_.gen.t_min, cfg_.gen.t_max);
+                bool want_soft_next = !(skip_last_soft_next && step == 1);
+                auto td0 = Clk::now();
+
+                diffsamp::fill_uniform(q0, u_dev_.data(), (uint64_t)seed,
+                                       (uint32_t)blk, (uint32_t)step, C);
+                decode_forward(canvas_dev_.data(), soft ? soft->data() : nullptr,
+                               enc_len, C, temp, u_dev_.data(),
+                               argmax_dev_.data(), entropy_dev_.data(),
+                               denoiser_dev_.data(), soft_next_buf, want_soft_next);
+                diffsamp::entropy_bound_renoise(q0, canvas_dev_.data(),
+                                                denoiser_dev_.data(),
+                                                entropy_dev_.data(), accepted_dev_.data(),
+                                                (uint64_t)seed, (uint32_t)blk, (uint32_t)step,
+                                                C, cfg_.gen.entropy_bound, V);
+                diffsamp::stopping_check(q0, argmax_dev_.data(), prev_argmax_dev_.data(),
+                                         entropy_dev_.data(), mean_dev_.data(),
+                                         stop_dev_.data(),
+                                         cfg_.gen.confidence_threshold,
+                                         cfg_.gen.stability_threshold,
+                                         first_step, C);
+                first_step = false;
+                if (want_soft_next) soft.emplace(std::move(soft_next_buf));
+
+                stats_.decode_s += secs(td0, Clk::now());
+                stats_.decode_passes += 1;
+
+                if (on_step || verbose || !force_denoise_steps) {
+                    bool stop = false;
+                    if (!force_denoise_steps) {
+                        int32_t s = 0; stop_dev_.download(&s, 1); stop = (s != 0);
+                    }
+                    double me = 0.0;
+                    if (on_step || verbose) {
+                        entropy_h.resize(C); entropy_dev_.download(entropy_h.data(), C);
+                        for (float e : entropy_h) me += e; me /= C;
+                    }
+                    if (verbose)
+                        std::printf("[blk %d step %2d] temp=%.3f mean_entropy=%.4f%s\n",
+                                    blk, step, temp, me, stop ? "  [stop]" : "");
+                    if (on_step) {
+                        argmax.resize(C); argmax_dev_.download(argmax.data(), C);
+                        accepted_h.resize(C); accepted_dev_.download(accepted_h.data(), C);
+                        DiffStepEvent ev;
+                        ev.block = blk; ev.cur_step = step; ev.temperature = temp;
+                        ev.mean_entropy = (float)me; ev.committed = false;
+                        ev.canvas = &argmax; ev.entropy = &entropy_h; ev.accepted = &accepted_h;
+                        on_step(ev);
+                    }
+                    if (stop && !force_denoise_steps) break;
+                }
+            }
+            if (argmax.empty()) { argmax.resize(C); argmax_dev_.download(argmax.data(), C); }
         }
 
         // 4. Find the first EOS in the denoised canvas; commit up to it.

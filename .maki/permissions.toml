@@ -1,0 +1,8 @@
+[bash]
+allow = [
+    "cd *",
+    "python3 *",
+    "timeout *",
+    "tail *",
+    "echo *",
+]

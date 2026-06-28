@@ -82,10 +82,44 @@ private:
                      std::mt19937& rng,
                      bool want_soft_next = true);
 
+    // Device-only denoiser forward (no host round-trip): embed+selfcond,
+    // decoder layers, final norm, LM head, fused_logits_head, and the
+    // self-conditioning (soft_next) build.  `ids` are the canvas tokens on the
+    // device; `u_dev` (seq floats) must already be filled with sampling
+    // variates.  Writes argmax / entropy / denoiser to the given device
+    // pointers (no D2H).  All heavyweight scratch is arena-scoped internally.
+    // On the device-resident denoising loop (default) this is called every
+    // step without a host sync; the in-order queue serializes it against the
+    // device sampler/stopping kernels that follow.
+    void decode_forward(const int32_t* ids, const bf16* soft_or_null,
+                        int enc_len, int seq, float temp, const float* u_dev,
+                        int32_t* argmax_dev, float* entropy_dev,
+                        int32_t* denoiser_dev, GpuBuffer<bf16>& soft_next,
+                        bool want_soft_next);
+
+    // Allocate (or grow) the persistent device buffers backing the
+    // device-resident denoising loop, sized for one canvas of `seq` tokens.
+    // Idempotent: no-ops when already large enough.
+    void ensure_device_buffers(int seq);
+
     DiffConfig    cfg_;
     DiffPerfStats stats_;
     int         split_layer_ = 0;
     float       embed_scale_ = 1.0f;
     DiffWeights w_;
     DiffKvCache enc_kv_;
+
+    // Persistent device buffers for the device-resident denoising loop (default
+    // path; the host-sampler path under DIFF_HOST_SAMPLER does not use these).
+    // Allocated once by ensure_device_buffers() and reused across blocks/steps.
+    GpuBuffer<int32_t> canvas_dev_;       // input canvas, renoised in place
+    GpuBuffer<int32_t> argmax_dev_;       // argmax of logits (committed output)
+    GpuBuffer<int32_t> denoiser_dev_;     // multinomial sample (accepted into canvas)
+    GpuBuffer<int32_t> prev_argmax_dev_;  // previous argmax (stability check)
+    GpuBuffer<float>   entropy_dev_;      // per-position entropy (nats)
+    GpuBuffer<float>   u_dev_;            // per-step sampling uniforms
+    GpuBuffer<float>   mean_dev_;         // scalar mean-entropy (device stopping)
+    GpuBuffer<int32_t> stop_dev_;         // scalar stop flag (device stopping)
+    GpuBuffer<char>    accepted_dev_;     // accept mask (callback payload)
+    int                dev_buf_seq_ = 0;  // current allocated canvas size
 };
