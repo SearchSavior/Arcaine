@@ -188,7 +188,8 @@ int main(int argc, char** argv) {
     if (model_dir.empty() || (!dry_run_placement && prompt.empty() && !chat)) { usage(argv[0]); return 1; }
 
     if (dry_run_placement) {
-        DiffConfig cfg = DiffConfig::from_dir(model_dir);
+        const char* gguf_env = std::getenv("DIFF_GGUF_Q8_WEIGHTS");
+        DiffConfig cfg = (gguf_env && gguf_env[0]) ? DiffConfig::from_gguf(gguf_env) : DiffConfig::from_dir(model_dir);
         DiffPlacementOptions resolved_placement = resolve_diffusion_placement(cfg, placement);
         int split_layer = resolve_diffusion_split_layer(cfg, resolved_placement);
         std::printf("[model] %d GPU(s); %d layers, split at %d\n",

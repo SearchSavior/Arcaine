@@ -111,6 +111,11 @@ struct DiffSelfCond {
 struct DiffWeights {
     GpuBuffer<bf16>        embed_tokens;  // (vocab, H) — tied: encoder/decoder embed + lm_head. GPU 0.
     Q8Linear               embed_tokens_q8;
+    // Optional transposed (h-major [H,V]) copy of embed_tokens_q8, quantized
+    // per-h (group-32 over V). Built only when DIFF_SOFT_NEXT_TN_TABLE is set, so
+    // soft_next (probs @ embed) runs on the fast TN matmul path instead of the
+    // strided NN kernel. ~+830MB VRAM. GPU 0.
+    Q8Linear               embed_tokens_q8_t;
     GpuBuffer<bf16>        final_norm;    // (H,) decoder.norm. GPU 0.
     DiffSelfCond           self_cond;     // GPU 0
     std::vector<DiffLayer> layers;        // [30]

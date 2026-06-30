@@ -860,6 +860,11 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
                 embed, q0, true, "model.decoder.embed_tokens.weight");
         else
             gw.embed_tokens = upload(embed, q0, "model.decoder.embed_tokens.weight");
+
+        if (q8_soft_next_tn_table() && !gw.embed_tokens_q8.empty()) {
+            std::printf("[load] building transposed embedding table for soft_next TN path\n");
+            gw.embed_tokens_q8_t = build_q8_linear_transposed(gw.embed_tokens_q8, q0);
+        }
     }
     gw.final_norm   = upload(sf.get("model.decoder.norm.weight"), q0, std::string("model.decoder.norm.weight").c_str());
     gw.self_cond.pre_norm  = upload(sf.get("model.decoder.self_conditioning.pre_norm.weight"), q0, std::string("model.decoder.self_conditioning.pre_norm.weight").c_str());

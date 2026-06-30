@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
+#include "../../common/io/gguf.hpp"
 
 struct DiffRope {
     std::string rope_type;
@@ -142,6 +143,84 @@ struct DiffConfig {
             if (g.contains("sampler_config"))
                 cfg.gen.entropy_bound = g.at("sampler_config").value("entropy_bound", cfg.gen.entropy_bound);
         }
+        return cfg;
+    }
+
+    static DiffConfig from_gguf(const std::string& gguf_path) {
+        GgufFile gg(gguf_path);
+        DiffConfig cfg;
+        cfg.model_type = "diffusion_gemma";
+        cfg.quantization_format = "q8_0";
+
+        auto& t = cfg.text;
+        uint32_t u32;  float f32;
+
+        auto need_u32 = [&](const char* k) -> uint32_t {
+            if (!gg.get_u32(k, u32)) throw std::runtime_error(std::string("GGUF config: missing ") + k);
+            return u32;
+        };
+        auto need_f32 = [&](const char* k) -> float {
+            if (!gg.get_f32(k, f32)) throw std::runtime_error(std::string("GGUF config: missing ") + k);
+            return f32;
+        };
+
+        t.hidden_size             = need_u32("diffusion-gemma.embedding_length");
+        t.intermediate_size       = need_u32("diffusion-gemma.feed_forward_length");
+        t.num_hidden_layers       = need_u32("diffusion-gemma.block_count");
+        t.num_attn_heads          = need_u32("diffusion-gemma.attention.head_count");
+        t.head_dim                = need_u32("diffusion-gemma.attention.key_length_swa");
+        t.global_head_dim         = need_u32("diffusion-gemma.attention.key_length");
+        t.num_experts             = need_u32("diffusion-gemma.expert_count");
+        t.top_k_experts           = need_u32("diffusion-gemma.expert_used_count");
+        t.moe_intermediate_size   = need_u32("diffusion-gemma.expert_feed_forward_length");
+        t.sliding_window          = need_u32("diffusion-gemma.attention.sliding_window");
+        t.rms_norm_eps            = need_f32("diffusion-gemma.attention.layer_norm_rms_epsilon");
+        t.final_logit_softcapping = need_f32("diffusion-gemma.final_logit_softcapping");
+        t.bos_token_id            = (int)need_u32("tokenizer.ggml.bos_token_id");
+        t.pad_token_id            = (int)need_u32("tokenizer.ggml.padding_token_id");
+
+        int32_t eos_id;
+        if (!gg.get_i32("tokenizer.ggml.eos_token_id", eos_id))
+            throw std::runtime_error("GGUF config: missing tokenizer.ggml.eos_token_id");
+        t.eos_token_ids = {eos_id};
+
+        std::vector<std::string> tokens;
+        if (!gg.get_str_array("tokenizer.ggml.tokens", tokens))
+            throw std::runtime_error("GGUF config: missing tokenizer.ggml.tokens");
+        t.vocab_size = (int)tokens.size();
+
+        std::vector<int32_t> kv_heads;
+        if (!gg.get_i32_array("diffusion-gemma.attention.head_count_kv", kv_heads))
+            throw std::runtime_error("GGUF config: missing head_count_kv");
+        if (kv_heads.empty()) throw std::runtime_error("GGUF config: empty head_count_kv");
+        t.num_kv_heads = kv_heads[0];
+        t.num_global_kv_heads = (kv_heads.size() > 5) ? kv_heads[5] : kv_heads.back();
+
+        std::vector<uint8_t> swp;
+        if (!gg.get_bool_array("diffusion-gemma.attention.sliding_window_pattern", swp))
+            throw std::runtime_error("GGUF config: missing sliding_window_pattern");
+        t.is_full_attention.resize(swp.size());
+        for (size_t i = 0; i < swp.size(); ++i) t.is_full_attention[i] = !swp[i];
+
+        t.sliding_rope.rope_theta = need_f32("diffusion-gemma.rope.freq_base_swa");
+        t.full_rope.rope_theta    = need_f32("diffusion-gemma.rope.freq_base");
+        t.sliding_rope.partial_rotary_factor = 1.0f;
+        t.sliding_rope.rope_type = "default";
+        t.full_rope.partial_rotary_factor = 0.25f;
+        t.full_rope.rope_type = "proportional";
+        t.use_bidirectional_attention = "vision";
+
+        cfg.canvas_length = (int)need_u32("diffusion.canvas_length");
+        cfg.bos_token_id  = t.bos_token_id;
+        cfg.eos_token_ids = t.eos_token_ids;
+        cfg.gen.eos_token_ids = t.eos_token_ids;
+        cfg.gen.pad_token_id  = t.pad_token_id;
+
+        if (t.hidden_size % 32 != 0)
+            throw std::runtime_error("GGUF config: embedding_length not divisible by 32 (Q8_0)");
+        if ((int)t.is_full_attention.size() != t.num_hidden_layers)
+            throw std::runtime_error("GGUF config: sliding_window_pattern length != block_count");
+
         return cfg;
     }
 };

@@ -16,6 +16,7 @@ services:
         ONEDNN_VERSION: v3.12
         INSTALL_RUST: "1"
     image: arcaine:latest
+    restart: always
 
     # --- Intel GPU passthrough --------------------------------------------
     # Exposes the host's render/card device nodes to the container so SYCL can
@@ -23,12 +24,12 @@ services:
     # (i915 or xe) loaded and /dev/dri present.
     devices:
       - /dev/dri:/dev/dri
-    group_add:
+    #group_add:
       # Only needed when running as a NON-root user inside the container.
       # The 'render' group on the HOST owns /dev/dri/renderD*. Find its GID:
       #   getent group render | cut -d: -f3
       # then export it before `docker compose ...`, e.g. RENDER_GID=110.
-      - "${RENDER_GID:-render}"
+      #- "${RENDER_GID:-render}"
 
     # --- Source + build artifacts -----------------------------------------
     volumes:

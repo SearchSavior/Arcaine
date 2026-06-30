@@ -7,6 +7,7 @@
 class Tokenizer {
 public:
     static Tokenizer from_json(const std::string& path);
+    static Tokenizer from_gguf(const std::string& gguf_path);
 
     std::vector<int> encode(const std::string& text, bool add_bos = true) const;
     std::string      decode(const std::vector<int>& ids, bool skip_special = false,

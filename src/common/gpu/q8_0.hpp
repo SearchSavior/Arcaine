@@ -124,6 +124,84 @@ inline bool q8_soft_next_use_onednn() {
     return enabled;
 }
 
+// When set, the loader materializes a transposed (h-major) copy of the tied
+// embedding table so soft_next (probs @ embed, contracting over the vocab dim)
+// can run on the fast TN matmul path (matmul_q8_0 / oneDNN) instead of the
+// strided NN kernel. A/B against the default unset (NN) path.
+inline bool q8_soft_next_tn_table() {
+    static bool enabled = [] {
+        const char* env = std::getenv("DIFF_SOFT_NEXT_TN_TABLE");
+        return env && (!std::strcmp(env, "1") || !std::strcmp(env, "on") ||
+                       !std::strcmp(env, "true") || !std::strcmp(env, "transposed"));
+    }();
+    return enabled;
+}
+
+// Build a transposed Q8_0 view of `src` (a token-major embedding table
+// [out=V, in=H] quantized per-token, group-32 over H) into an h-major table
+// [out=H, in=V] quantized per-h, group-32 over V, with scales in the
+// [in/32, out] = [V/32, H] layout that matmul_q8_0 expects (oneDNN ba). This
+// lets soft_next contract over the vocab dim with contiguous weight reads.
+// Costs ~+830MB VRAM and a one-time dequant+requant (different grouping axis ->
+// tiny numerical change on the self-conditioning signal).
+inline Q8Linear build_q8_linear_transposed(const Q8Linear& src, sycl::queue& q) {
+    if (src.weight_scale_rows.empty())
+        throw std::runtime_error("build_q8_linear_transposed: src has no row scales");
+    int V = src.out_features;   // vocab (token count)
+    int H = src.in_features;    // hidden
+    if (V % 32 != 0 || H % 32 != 0)
+        throw std::runtime_error("build_q8_linear_transposed: V and H must be divisible by 32");
+    int Hg = H / 32;           // source groups per token (per-token quant)
+    int Vg = V / 32;           // transposed groups per h-row (per-h quant)
+
+    Q8Linear dst;
+    dst.in_features  = V;
+    dst.out_features = H;
+    dst.group_size   = 32;
+    dst.weight_qs    = GpuBuffer<int8_t>((size_t)H * V, q);
+    dst.weight_scale = GpuBuffer<float>((size_t)Vg * H, q);
+
+    const int8_t* qs   = src.weight_qs.data();         // [V, H] token-major
+    const float*  sc   = src.weight_scale_rows.data();  // [V, H/32] = [V, Hg]
+    int8_t* qs_t       = dst.weight_qs.data();          // [H, V] h-major
+    float*  sc_t       = dst.weight_scale.data();       // [V/32, H] = [Vg, H]
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t)H, (size_t)Vg), [=](sycl::id<2> id) {
+            int hh = (int)id[0];
+            int vg = (int)id[1];
+            int hg = hh / 32;
+            int v0 = vg * 32;
+            float vals[32];
+            float maxabs = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                int v = v0 + j;
+                float val = (float)qs[(size_t)v * H + hh] *
+                            sc[(size_t)v * Hg + hg];
+                vals[j] = val;
+                float a = val < 0.0f ? -val : val;
+                if (a > maxabs) maxabs = a;
+            }
+            float scale = maxabs / 127.0f;
+            sc_t[(size_t)vg * H + hh] = scale;
+            if (scale == 0.0f) {
+                for (int j = 0; j < 32; ++j) qs_t[(size_t)hh * V + v0 + j] = 0;
+            } else {
+                float inv = 1.0f / scale;
+                for (int j = 0; j < 32; ++j) {
+                    float x = vals[j] * inv;
+                    int qi = (int)(x + (x >= 0.0f ? 0.5f : -0.5f));
+                    if (qi > 127) qi = 127;
+                    if (qi < -127) qi = -127;
+                    qs_t[(size_t)hh * V + v0 + j] = (int8_t)qi;
+                }
+            }
+        });
+    });
+    q.wait();
+    return dst;
+}
+
 inline void matmul_q8_0_custom_kernel(
     sycl::queue& q,
     const bf16* A,

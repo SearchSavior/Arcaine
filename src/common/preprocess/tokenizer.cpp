@@ -1,4 +1,5 @@
 #include "tokenizer.hpp"
+#include "../io/gguf.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <stdexcept>
@@ -60,6 +61,57 @@ Tokenizer Tokenizer::from_json(const std::string& path) {
         std::string a = merges[i][0].get<std::string>();
         std::string b = merges[i][1].get<std::string>();
         tok.merge_rank_[a + " " + b] = i;
+    }
+
+    return tok;
+}
+
+Tokenizer Tokenizer::from_gguf(const std::string& gguf_path) {
+    GgufFile gg(gguf_path);
+    Tokenizer tok;
+
+    tok.byte_pieces_.resize(256);
+    for (int b = 0; b < 256; ++b) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "<0x%02X>", b);
+        tok.byte_pieces_[b] = buf;
+    }
+
+    std::vector<std::string> tokens;
+    if (!gg.get_str_array("tokenizer.ggml.tokens", tokens))
+        throw std::runtime_error("GGUF tokenizer: missing tokenizer.ggml.tokens");
+    tok.id_to_piece_.resize(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        tok.vocab_[tokens[i]] = (int)i;
+        tok.id_to_piece_[(int)i] = tokens[i];
+    }
+
+    std::vector<int32_t> token_types;
+    if (gg.get_i32_array("tokenizer.ggml.token_type", token_types)) {
+        for (size_t i = 0; i < token_types.size() && i < tokens.size(); ++i) {
+            int tt = token_types[i];
+            if (tt == 2 || tt == 3) {  // CONTROL or USER_DEFINED
+                tok.added_token_to_id_[tokens[i]] = (int)i;
+                tok.added_tokens_by_length_.push_back(tokens[i]);
+                tok.special_token_ids_.insert((int)i);
+            }
+        }
+        std::sort(tok.added_tokens_by_length_.begin(), tok.added_tokens_by_length_.end(),
+                  [](const std::string& a, const std::string& b) { return a.size() > b.size(); });
+    }
+
+    std::vector<std::string> merges;
+    if (gg.get_str_array("tokenizer.ggml.merges", merges)) {
+        for (int i = 0; i < (int)merges.size(); ++i)
+            tok.merge_rank_[merges[i]] = i;
+    }
+
+    uint32_t bos_id;
+    if (gg.get_u32("tokenizer.ggml.bos_token_id", bos_id)) {
+        tok.bos_id_ = (int)bos_id;
+    } else {
+        auto it = tok.vocab_.find("<bos>");
+        tok.bos_id_ = (it != tok.vocab_.end()) ? it->second : -1;
     }
 
     return tok;

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
+#include "tokenizer.hpp"
 
 // Architecture-independent chat templating. Minja renders the model's
 // chat_template.jinja and the native tokenizer.json loader maps text to ids,
@@ -36,6 +37,30 @@ PromptBuildResult build_chat_prompt(
 
 PromptBuildResult build_chat_prompt_json(
     const std::string& model_dir,
+    nlohmann::ordered_json messages,
+    nlohmann::ordered_json tools = nlohmann::ordered_json::array(),
+    bool add_generation_prompt = true,
+    bool enable_thinking = false,
+    nlohmann::ordered_json chat_template_kwargs = nlohmann::ordered_json::object()
+);
+
+PromptBuildResult build_chat_prompt_from_gguf(
+    const std::string& gguf_path,
+    const Tokenizer& tok,
+    const std::string& template_source,
+    const std::string& bos_token,
+    const std::string& eos_token,
+    const std::vector<ChatTemplateMessage>& messages,
+    bool add_generation_prompt = true,
+    bool enable_thinking = false
+);
+
+PromptBuildResult build_chat_prompt_from_gguf_json(
+    const std::string& gguf_path,
+    const Tokenizer& tok,
+    const std::string& template_source,
+    const std::string& bos_token,
+    const std::string& eos_token,
     nlohmann::ordered_json messages,
     nlohmann::ordered_json tools = nlohmann::ordered_json::array(),
     bool add_generation_prompt = true,

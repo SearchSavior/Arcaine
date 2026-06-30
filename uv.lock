@@ -943,7 +943,7 @@ dependencies = [
 requires-dist = [
     { name = "openai", specifier = ">=1.0.0" },
     { name = "pytest", specifier = ">=8.0.0" },
-    { name = "transformers", specifier = ">=4.50.0" },
+    { name = "transformers", specifier = ">=5.12.1" },
     { name = "zensical", specifier = ">=0.0.46" },
 ]
 

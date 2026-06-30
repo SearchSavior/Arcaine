@@ -28,4 +28,8 @@ public:
 private:
     std::string model_dir_;
     Tokenizer tokenizer_;
+    std::string gguf_path_;
+    std::string template_source_;
+    std::string bos_token_;
+    std::string eos_token_;
 };

@@ -87,7 +87,8 @@ static SoftNextCfg soft_next_cfg() {
 }
 
 DiffusionGemmaModel::DiffusionGemmaModel(const std::string& model_dir, int max_seq_len, DiffPlacementOptions placement, bool print_placement) {
-    cfg_ = DiffConfig::from_dir(model_dir);
+    const char* gguf_env = std::getenv("DIFF_GGUF_Q8_WEIGHTS");
+    cfg_ = (gguf_env && gguf_env[0]) ? DiffConfig::from_gguf(gguf_env) : DiffConfig::from_dir(model_dir);
     int L = cfg_.text.num_hidden_layers;
 
     DiffPlacementOptions resolved_placement = resolve_diffusion_placement(cfg_, placement);
@@ -297,7 +298,11 @@ void DiffusionGemmaModel::decode_forward(
           break;
       case SoftNextMode::Exact:
           // soft_next = probs @ embed, then * embed_scale.
-          if (!w_.embed_tokens_q8.empty())
+          if (!w_.embed_tokens_q8_t.empty())
+              // Fast TN path: probs[seq,V] @ embed_t[V,H] via matmul_q8_0 (oneDNN).
+              matmul_q8_0(probs_bf16.data(), seq, V, w_.embed_tokens_q8_t,
+                          soft_next.data(), ctx0);
+          else if (!w_.embed_tokens_q8.empty())
               matmul_q8_0_nn(probs_bf16.data(), seq, V, w_.embed_tokens_q8, H,
                              soft_next.data(), ctx0);
           else

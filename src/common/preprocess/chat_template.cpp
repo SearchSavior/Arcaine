@@ -68,20 +68,19 @@ std::string repeat_token(const std::string& token, int count) {
     return out;
 }
 
-PromptBuildResult render_chat_prompt(
-    const std::string& model_dir,
+PromptBuildResult render_chat_prompt_core(
+    const TokenizerMetadata& meta,
+    const std::string& template_source,
+    const Tokenizer& tok,
     json messages,
     json tools,
     const std::vector<int>& image_token_counts,
     const std::vector<int>& audio_token_counts,
     bool add_generation_prompt,
     bool enable_thinking,
-    json chat_template_kwargs = json::object()
+    json chat_template_kwargs
 ) {
-    const TokenizerMetadata meta = load_tokenizer_metadata(model_dir);
-    const std::string source = read_file(model_dir + "/chat_template.jinja");
-
-    minja::chat_template tmpl(source, meta.bos_token, meta.eos_token);
+    minja::chat_template tmpl(template_source, meta.bos_token, meta.eos_token);
     minja::chat_template_inputs inputs;
     inputs.messages = std::move(messages);
     inputs.tools = std::move(tools);
@@ -109,7 +108,6 @@ PromptBuildResult render_chat_prompt(
         }
     }
 
-    Tokenizer tok = Tokenizer::from_json(model_dir + "/tokenizer.json");
     PromptBuildResult out;
     out.tokens = tok.encode(rendered, /*add_bos=*/false);
     out.mm_token_type_ids.reserve(out.tokens.size());
@@ -129,6 +127,24 @@ PromptBuildResult render_chat_prompt(
         }
     }
     return out;
+}
+
+PromptBuildResult render_chat_prompt(
+    const std::string& model_dir,
+    json messages,
+    json tools,
+    const std::vector<int>& image_token_counts,
+    const std::vector<int>& audio_token_counts,
+    bool add_generation_prompt,
+    bool enable_thinking,
+    json chat_template_kwargs = json::object()
+) {
+    const TokenizerMetadata meta = load_tokenizer_metadata(model_dir);
+    const std::string source = read_file(model_dir + "/chat_template.jinja");
+    Tokenizer tok = Tokenizer::from_json(model_dir + "/tokenizer.json");
+    return render_chat_prompt_core(meta, source, tok, std::move(messages), std::move(tools),
+        image_token_counts, audio_token_counts, add_generation_prompt, enable_thinking,
+        std::move(chat_template_kwargs));
 }
 
 } // namespace
@@ -191,6 +207,65 @@ PromptBuildResult build_chat_prompt_json(
     return render_chat_prompt(model_dir, std::move(messages), std::move(tools),
                               {}, {}, add_generation_prompt, enable_thinking,
                               std::move(chat_template_kwargs));
+}
+
+PromptBuildResult build_chat_prompt_from_gguf(
+    const std::string& gguf_path,
+    const Tokenizer& tok,
+    const std::string& template_source,
+    const std::string& bos_token,
+    const std::string& eos_token,
+    const std::vector<ChatTemplateMessage>& messages,
+    bool add_generation_prompt,
+    bool enable_thinking
+) {
+    (void)gguf_path;
+    if (messages.empty())
+        throw std::runtime_error("chat prompt needs at least one message");
+
+    TokenizerMetadata meta;
+    meta.bos_token = bos_token;
+    meta.eos_token = eos_token;
+
+    json rendered_messages = json::array();
+    for (const ChatTemplateMessage& message : messages) {
+        if (message.role.empty())
+            throw std::runtime_error("chat message role cannot be empty");
+        json content = json::array({{{"type", "text"}, {"text", message.content}}});
+        rendered_messages.push_back({{"role", message.role}, {"content", content}});
+    }
+
+    return render_chat_prompt_core(meta, template_source, tok,
+        std::move(rendered_messages), json::array(),
+        {}, {}, add_generation_prompt, enable_thinking, json::object());
+}
+
+PromptBuildResult build_chat_prompt_from_gguf_json(
+    const std::string& gguf_path,
+    const Tokenizer& tok,
+    const std::string& template_source,
+    const std::string& bos_token,
+    const std::string& eos_token,
+    json messages,
+    json tools,
+    bool add_generation_prompt,
+    bool enable_thinking,
+    json chat_template_kwargs
+) {
+    (void)gguf_path;
+    if (!messages.is_array() || messages.empty())
+        throw std::runtime_error("chat prompt needs at least one message");
+    if (!tools.is_array())
+        throw std::runtime_error("chat prompt tools must be an array");
+
+    TokenizerMetadata meta;
+    meta.bos_token = bos_token;
+    meta.eos_token = eos_token;
+
+    return render_chat_prompt_core(meta, template_source, tok,
+        std::move(messages), std::move(tools),
+        {}, {}, add_generation_prompt, enable_thinking,
+        std::move(chat_template_kwargs));
 }
 
 std::string decode_tokens(
