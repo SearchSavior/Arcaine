@@ -148,6 +148,39 @@ static bool q8_use_grouped_expert_kernel() {
     return enabled;
 }
 
+// DIFF_Q8_GROUPED_EXPERT_BACKEND: switch the active-only grouped expert GEMM
+// from the custom DPAS kernel to oneDNN's experimental grouped (variable-M)
+// matmul, which reuses oneDNN's tiled DPAS GEMM across the M dimension instead
+// of re-reading each expert's weights per 8-row tile.  Requires oneDNN built
+// with -DONEDNN_EXPERIMENTAL_GROUPED_MEMORY=ON; otherwise the #if guard in the
+// dispatch silently falls back to the custom DPAS kernel.  Only active in the
+// compact-exact layout (no inter-expert gaps), where offsets = prefix-sum of
+// round_up(count,8).
+static bool q8_grouped_expert_use_onednn() {
+    static bool enabled = [] {
+        const char* env = std::getenv("DIFF_Q8_GROUPED_EXPERT_BACKEND");
+        return env && (!std::strcmp(env, "onednn") || !std::strcmp(env, "dnnl") ||
+                       !std::strcmp(env, "1") || !std::strcmp(env, "on"));
+    }();
+    return enabled;
+}
+
+// DIFF_ASYNC_EXPERT_DISPATCH: skip redundant in-order-queue drains in the
+// expert dispatch path — (A) the end-of-shard owner_q.wait() after add_inplace
+// and (C) the blocking H2D upload of host-built block metadata, replaced by an
+// on-device block-metadata kernel.  Both rely only on in-order queue ordering
+// (the consumer — postnorm / the grouped GEMM — is submitted later on the same
+// queue) and on the arena's host-side free-list (which needs no GPU completion).
+// Default off for A/B; opt in with =1.
+static bool expert_async_dispatch() {
+    static bool v = [] {
+        const char* e = std::getenv("DIFF_ASYNC_EXPERT_DISPATCH");
+        return e && (!std::strcmp(e, "1") || !std::strcmp(e, "on") ||
+                     !std::strcmp(e, "true") || !std::strcmp(e, "async"));
+    }();
+    return v;
+}
+
 } // namespace
 
 void set_nvfp4_kernel(Nvfp4Kernel kernel) { g_kernel() = kernel; }
@@ -496,6 +529,9 @@ static void run_shard(
 	    int A_all = seq * top_k;
 	    bool device_routes = idx_dev != nullptr && weight_dev != nullptr;
 
+    diffarena::Alloc<int32_t> count_dev;  // hoisted: reused by device-side block-build (C)
+    diffarena::Alloc<int32_t> base_dev;   // hoisted: reused by device-side block-build (C)
+
         if (device_routes && shard.nvfp4 && nvfp4_gpu_layout_enabled() &&
             seq <= nvfp4_gpu_layout_max_seq()) {
             if (run_shard_nvfp4_gpu_layout(ctx, shard, expert_in, out, seq, H,
@@ -507,7 +543,7 @@ static void run_shard(
 	    std::vector<int> count(localE, 0);
 	    int A = 0;
 	    if (device_routes) {
-	        auto count_dev = ar.alloc<int32_t>(localE);
+	        count_dev = ar.alloc<int32_t>(localE);
 	        q.memset(count_dev.data(), 0, (size_t)localE * sizeof(int32_t));
 	        int first = shard.first_expert;
 	        int32_t* count_ptr = count_dev.data();
@@ -569,7 +605,7 @@ static void run_shard(
 	    auto Xe = ar.alloc<bf16>((size_t)total_rows * H);
 	    q.memset(Xe.data(), 0, (size_t)total_rows * H * sizeof(bf16));
 	    if (device_routes) {
-	        auto base_dev = ar.alloc<int32_t>(localE);
+	        base_dev = ar.alloc<int32_t>(localE);
 	        auto cursor_dev = ar.alloc<int32_t>(localE);
 	        std::vector<int32_t> base_i(localE);
 	        for (int e = 0; e < localE; ++e) base_i[e] = base[e];
@@ -958,6 +994,47 @@ static void run_shard(
               } }
             act.reset();
         } else if (q8_use_grouped_expert_kernel()) {
+#if DNNL_EXPERIMENTAL_GROUPED_MEMORY
+            if (q8_grouped_expert_use_onednn() && q8_compact_exact) {
+                // oneDNN grouped offsets[i] = cumulative exclusive-end = total
+                // rows across experts 0..i (monotonic non-decreasing; last entry
+                // == total_rows).  base[e] is 0 for empty experts (only active
+                // experts advance the prefix sum), so it cannot be used directly
+                // -- build the running sum here.  round_up(0,8)==0 so empty
+                // experts contribute 0 and yield equal consecutive offsets, which
+                // oneDNN treats as empty (skipped) groups.
+                std::vector<int32_t> offsets_host(localE);
+                int32_t off_acc = 0;
+                for (int e = 0; e < localE; ++e) {
+                    off_acc += round_up(count[e], 8);
+                    offsets_host[e] = off_acc;
+                }
+                auto offsets_dev = ar.alloc<int32_t>(localE);
+                upload_alloc(q, offsets_dev, offsets_host);
+
+                auto gu = ar.alloc<bf16>((size_t)total_rows * 2 * moe_inter);
+                { DIFF_PROF(q, prof.gateup_mm);
+                  matmul_q8_0_grouped_expert_onednn(
+                      Xe.data(), H, shard.gate_up_proj_q8_batch,
+                      localE, total_rows, offsets_dev.data(),
+                      gu.data(), ctx); }
+                Xe.reset();
+
+                auto act = ar.alloc<bf16>((size_t)total_rows * moe_inter);
+                { DIFF_PROF(q, prof.geglu_pack);
+                  geglu_strided(q, gu.data(), act.data(), total_rows, moe_inter); }
+                gu.reset();
+
+                Ye = ar.alloc<bf16>((size_t)total_rows * H);
+                { DIFF_PROF(q, prof.down_mm);
+                  matmul_q8_0_grouped_expert_onednn(
+                      act.data(), moe_inter, shard.down_proj_q8_batch,
+                      localE, total_rows, offsets_dev.data(),
+                      Ye.data(), ctx); }
+                act.reset();
+            } else
+#endif
+            {
             std::vector<int32_t> block_slot;
             std::vector<int32_t> block_expert;
             block_slot.reserve((size_t)total_rows / 8);
@@ -974,8 +1051,42 @@ static void run_shard(
             int blocks = (int)block_slot.size();
             auto block_slot_dev = ar.alloc<int32_t>(blocks);
             auto block_expert_dev = ar.alloc<int32_t>(blocks);
-            upload_alloc(q, block_slot_dev, block_slot);
-            upload_alloc(q, block_expert_dev, block_expert);
+            if (expert_async_dispatch() && device_routes && q8_compact_exact &&
+                !count_dev.empty() && !base_dev.empty()) {
+                // Build block metadata on-device from the device-resident
+                // counts/offsets, avoiding a blocking H2D upload of the host-
+                // built vectors (and the queue drain it implies).  Gated on
+                // q8_compact_exact: only there is base[e] a dense prefix sum of
+                // round_up(count,8) (so base[e]/8 == sequential block index and
+                // bucket_cap[e] == round_up(count[e],8), making the host clamp a
+                // no-op).  In the T-bucket path base[e]=e*T has gaps for inactive
+                // experts, so base/8 indexing would overflow block_slot_dev — fall
+                // back to the host upload there.  For block b of expert e:
+                // block_slot[b] = base[e] + 8*r, block_expert[b] = e.
+                const int32_t* cnt = count_dev.data();
+                const int32_t* bse = base_dev.data();
+                int32_t* bslot = block_slot_dev.data();
+                int32_t* bexp  = block_expert_dev.data();
+                q.submit([&](sycl::handler& h) {
+                    h.parallel_for(sycl::range<1>((size_t)localE),
+                        [=](sycl::id<1> i) {
+                            int e = (int)i[0];
+                            int c = cnt[e];
+                            if (c == 0) return;
+                            int m = (c + 7) & ~7;
+                            int off = bse[e];
+                            int b0 = off >> 3;
+                            int nb = m >> 3;
+                            for (int r = 0; r < nb; ++r) {
+                                bslot[b0 + r] = off + 8 * r;
+                                bexp[b0 + r]  = e;
+                            }
+                        });
+                });
+            } else {
+                upload_alloc(q, block_slot_dev, block_slot);
+                upload_alloc(q, block_expert_dev, block_expert);
+            }
 
             auto act = ar.alloc<bf16>((size_t)total_rows * moe_inter);
             if (q8_use_fused_expert_geglu()) {
@@ -1006,6 +1117,7 @@ static void run_shard(
                   block_slot_dev.data(), block_expert_dev.data(), blocks,
                   Ye.data(), ctx); }
             act.reset();
+            }
         } else if (q8_use_fused_expert_geglu()) {
             auto act = ar.alloc<bf16>((size_t)total_rows * moe_inter);
             { DIFF_PROF(q, prof.gateup_mm);
@@ -1155,7 +1267,8 @@ void expert_parallel_forward(
 
         if (local) {
             add_inplace(owner_q, out, shard_out, (int)N);
-            owner_q.wait();
+            if (!expert_async_dispatch())
+                owner_q.wait();
         } else {
             auto tmp = diffarena::arena(owner.index).alloc<bf16>(N);
             transfer(q, shard_out, owner_q, tmp.data(), N);
@@ -1221,7 +1334,8 @@ void expert_parallel_forward(
 
         if (local) {
             add_inplace(owner_q, out, shard_out, (int)N);
-            owner_q.wait();
+            if (!expert_async_dispatch())
+                owner_q.wait();
         } else {
             auto tmp = diffarena::arena(owner.index).alloc<bf16>(N);
             transfer(q, shard_out, owner_q, tmp.data(), N);

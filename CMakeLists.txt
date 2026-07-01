@@ -153,3 +153,20 @@ target_link_options(diffusion_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_I
 target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_server PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
+# Q8_0 roofline micro-benchmark: synthetic weights at real decode shapes, no
+# model file needed. Sweeps the matmul M dimension to determine whether the
+# decode path (matmul_q8_0) is compute- or bandwidth-bound. Backend is selected
+# by DIFF_Q8_BACKEND (unset=onednn / the real decode path, custom/dpas=reference).
+add_executable(q8_roofline_bench src/q8_roofline_bench.cpp)
+target_compile_options(q8_roofline_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(q8_roofline_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(q8_roofline_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(q8_roofline_bench PRIVATE DNNL::dnnl)
+
+add_executable(q8_grouped_bench src/q8_grouped_bench.cpp)
+target_compile_options(q8_grouped_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(q8_grouped_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(q8_grouped_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(q8_grouped_bench PRIVATE DNNL::dnnl)

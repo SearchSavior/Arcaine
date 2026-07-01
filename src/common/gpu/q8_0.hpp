@@ -693,6 +693,116 @@ inline void matmul_q8_0_grouped_expert_gateup_geglu(
     });
 }
 
+#if DNNL_EXPERIMENTAL_GROUPED_MEMORY
+// oneDNN experimental grouped (variable-M) matmul for the active-only MoE
+// expert GEMM.  src/dst use grouped encoding ([total_rows, K/N] split into
+// `num_experts` groups via the cumulative exclusive-end `offsets` buffer);
+// weights stay a plain 3D [num_experts, K, N] s8 tensor with per-32-group f32
+// scales -- the same quantization recipe as matmul_q8_0_batched.  Requires
+// oneDNN built with -DONEDNN_EXPERIMENTAL_GROUPED_MEMORY=ON; gated behind
+// DIFF_Q8_GROUPED_EXPERT_BACKEND=onednn in the expert dispatch.
+struct Q8GroupedMatmulKey {
+    int gpu, groups, total_rows, K, N;
+    bool operator==(const Q8GroupedMatmulKey& o) const {
+        return gpu == o.gpu && groups == o.groups
+            && total_rows == o.total_rows && K == o.K && N == o.N;
+    }
+};
+struct Q8GroupedMatmulKeyHash {
+    size_t operator()(const Q8GroupedMatmulKey& k) const {
+        size_t h = std::hash<int>{}(k.gpu);
+        h ^= std::hash<int>{}(k.groups) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.total_rows) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+inline dnnl::matmul& q8_matmul_grouped_primitive(
+    GpuEngine& ctx, int groups, int total_rows, int K, int N)
+{
+    static std::unordered_map<Q8GroupedMatmulKey, dnnl::matmul,
+                               Q8GroupedMatmulKeyHash> cache;
+    Q8GroupedMatmulKey key{ctx.index, groups, total_rows, K, N};
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        using dt = dnnl::memory::data_type;
+        dnnl::primitive_attr attr;
+        attr.set_scales(DNNL_ARG_WEIGHTS,
+                        (1 << 0) | (1 << 1) | (1 << 2),
+                        {1, 32, 1}, dt::f32);
+        attr.set_fpmath_mode(dnnl::fpmath_mode::bf16, /*apply_to_int=*/true);
+        auto src_md = dnnl::memory::desc::grouped(
+            {total_rows, K}, dt::bf16, /*variable_dim_idx=*/0, groups);
+        auto dst_md = dnnl::memory::desc::grouped(
+            {total_rows, N}, dt::bf16, /*variable_dim_idx=*/0, groups);
+        auto weights_md = dnnl::memory::desc(
+            {groups, K, N}, dt::s8,
+            dnnl::memory::dims{(dnnl_dim_t)N * K, 1, (dnnl_dim_t)K});
+        dnnl::matmul::primitive_desc pd(
+            ctx.engine, src_md, weights_md, dst_md, attr);
+        auto result = cache.emplace(key, dnnl::matmul(pd));
+        it = result.first;
+    }
+    return it->second;
+}
+
+inline void matmul_q8_0_grouped_expert_onednn(
+    const bf16* A,
+    int K,
+    const Q8BatchedLinear& W,
+    int num_experts,
+    int total_rows,
+    const int32_t* offsets,
+    bf16* C,
+    GpuEngine& ctx = GpuEngine::get(0))
+{
+    if (W.in_features != K)
+        throw std::runtime_error(
+            "matmul_q8_0_grouped_expert_onednn: input shape mismatch");
+    if (K % 32 != 0)
+        throw std::runtime_error(
+            "matmul_q8_0_grouped_expert_onednn: K must be divisible by 32");
+    if (W.batch != num_experts)
+        throw std::runtime_error(
+            "matmul_q8_0_grouped_expert_onednn: weight batch != num_experts");
+    if (total_rows == 0) return;
+
+    int N = W.out_features;
+    int G = K / 32;
+    using dt = dnnl::memory::data_type;
+    auto src_md = dnnl::memory::desc::grouped(
+        {total_rows, K}, dt::bf16, /*variable_dim_idx=*/0, num_experts);
+    auto dst_md = dnnl::memory::desc::grouped(
+        {total_rows, N}, dt::bf16, /*variable_dim_idx=*/0, num_experts);
+    auto weights_md = dnnl::memory::desc(
+        {num_experts, K, N}, dt::s8,
+        dnnl::memory::dims{(dnnl_dim_t)N * K, 1, (dnnl_dim_t)K});
+    auto scales_md = dnnl::memory::desc(
+        {num_experts, G, N}, dt::f32,
+        dnnl::memory::dims{(dnnl_dim_t)G * N, (dnnl_dim_t)N, 1});
+
+    dnnl::matmul& prim = q8_matmul_grouped_primitive(
+        ctx, num_experts, total_rows, K, N);
+    prim.execute(ctx.stream, {
+        {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
+            src_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            std::vector<void*>{const_cast<bf16*>(A),
+                               const_cast<int32_t*>(offsets)})},
+        {DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+            weights_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            const_cast<int8_t*>(W.weight_qs.data()))},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+            scales_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            const_cast<float*>(W.weight_scale.data()))},
+        {DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
+            dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            std::vector<void*>{C, const_cast<int32_t*>(offsets)})},
+    });
+}
+#endif // DNNL_EXPERIMENTAL_GROUPED_MEMORY
+
 inline void matmul_q8_0_expert_gateup_geglu(
     const bf16* A,
     int M,

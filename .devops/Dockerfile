@@ -26,7 +26,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 #   https://github.com/uxlfoundation/oneDNN/releases
 # (releases land roughly quarterly; v3.5 confirmed, 2026 releases scheduled
 # Feb/May/Aug). Bump this arg to the version you want.
-ARG ONEDNN_VERSION=v3.12
+ARG ONEDNN_VERSION=v3.14
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build git ca-certificates \
@@ -45,6 +45,7 @@ RUN set -eux; \
         -DDNNL_GPU_RUNTIME=SYCL \
         -DDNNL_BUILD_TESTS=OFF \
         -DDNNL_BUILD_EXAMPLES=OFF \
+        -DONEDNN_EXPERIMENTAL_GROUPED_MEMORY=ON \
         -DCMAKE_INSTALL_PREFIX=/opt/onednn; \
     cmake --build /tmp/oneDNN/build -j"$(nproc)"; \
     cmake --install /tmp/oneDNN/build; \
