@@ -174,7 +174,8 @@ void DiffusionGemmaModel::ensure_device_buffers(int seq) {
     canvas_dev_      = GpuBuffer<int32_t>(seq, q0);
     argmax_dev_      = GpuBuffer<int32_t>(seq, q0);
     denoiser_dev_    = GpuBuffer<int32_t>(seq, q0);
-    prev_argmax_dev_ = GpuBuffer<int32_t>(seq, q0);
+    int hist_slots = std::max(1, cfg_.gen.stability_threshold);
+    argmax_history_dev_ = GpuBuffer<int32_t>((size_t)hist_slots * seq, q0);
     entropy_dev_     = GpuBuffer<float>(seq, q0);
     u_dev_           = GpuBuffer<float>(seq, q0);
     mean_dev_        = GpuBuffer<float>(1, q0);

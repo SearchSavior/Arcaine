@@ -115,7 +115,7 @@ private:
     GpuBuffer<int32_t> canvas_dev_;       // input canvas, renoised in place
     GpuBuffer<int32_t> argmax_dev_;       // argmax of logits (committed output)
     GpuBuffer<int32_t> denoiser_dev_;     // multinomial sample (accepted into canvas)
-    GpuBuffer<int32_t> prev_argmax_dev_;  // previous argmax (stability check)
+    GpuBuffer<int32_t> argmax_history_dev_; // stability check: (stability_threshold, canvas) ring buffer
     GpuBuffer<float>   entropy_dev_;      // per-position entropy (nats)
     GpuBuffer<float>   u_dev_;            // per-step sampling uniforms
     GpuBuffer<float>   mean_dev_;         // scalar mean-entropy (device stopping)

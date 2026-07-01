@@ -109,9 +109,12 @@ std::vector<int> DiffusionGemmaModel::generate(
             auto& q0 = GpuEngine::get(0).queue;
             diffsamp::init_canvas_random(q0, canvas_dev_.data(), (uint64_t)seed,
                                          (uint32_t)blk, C, V);
+            if (cfg_.gen.stability_threshold > 0)
+                q0.fill(argmax_history_dev_.data(), (int32_t)-1,
+                       (size_t)cfg_.gen.stability_threshold * C);
+            int history_slot = 0;
             std::optional<GpuBuffer<bf16>> soft;
             GpuBuffer<bf16> soft_next_buf;
-            bool first_step = true;
             std::vector<float> entropy_h;
             std::vector<char>  accepted_h;
 
@@ -131,13 +134,14 @@ std::vector<int> DiffusionGemmaModel::generate(
                                                 entropy_dev_.data(), accepted_dev_.data(),
                                                 (uint64_t)seed, (uint32_t)blk, (uint32_t)step,
                                                 C, cfg_.gen.entropy_bound, V);
-                diffsamp::stopping_check(q0, argmax_dev_.data(), prev_argmax_dev_.data(),
+                diffsamp::stopping_check(q0, argmax_dev_.data(), argmax_history_dev_.data(),
                                          entropy_dev_.data(), mean_dev_.data(),
                                          stop_dev_.data(),
                                          cfg_.gen.confidence_threshold,
                                          cfg_.gen.stability_threshold,
-                                         first_step, C);
-                first_step = false;
+                                         history_slot, C);
+                if (cfg_.gen.stability_threshold > 0)
+                    history_slot = (history_slot + 1) % cfg_.gen.stability_threshold;
                 if (want_soft_next) soft.emplace(std::move(soft_next_buf));
 
                 stats_.decode_s += secs(td0, Clk::now());
