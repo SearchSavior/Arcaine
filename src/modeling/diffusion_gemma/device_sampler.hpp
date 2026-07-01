@@ -106,51 +106,55 @@ inline void entropy_bound_renoise(sycl::queue& q,
 
 // Stable-and-confident stopping, device-side.  Computes:
 //   mean      = mean(entropy)
-//   stable    = (stability_threshold == 0) || (!first_step && argmax == prev_argmax)
+//   stable    = (stability_threshold == 0) || all `stability_threshold` history
+//               slots equal the current argmax (i.e. stability_threshold+1
+//               consecutive identical canvases -- matches the reference's
+//               rolling-history criterion, not just the immediately-preceding
+//               canvas)
 //   confident = mean < confidence_threshold
 //   stop      = stable && confident
-// Writes mean -> *mean_out and stop -> *stop_out, then copies argmax -> prev_argmax
-// for the next step (so callers keep `prev_argmax` device-resident).
+// `history` is a (stability_threshold, seq) device buffer that the caller
+// resets to a sentinel (any value no real token id can take, e.g. -1) at the
+// start of each block; `slot` (0..stability_threshold-1, host-tracked and
+// incremented mod stability_threshold every step) selects which history row
+// this step's argmax rotates into.
+// Writes mean -> *mean_out and stop -> *stop_out.
 inline void stopping_check(sycl::queue& q,
-                           const int32_t* argmax, int32_t* prev_argmax,
+                           const int32_t* argmax, int32_t* history,
                            const float* entropy,
                            float* mean_out, int32_t* stop_out,
                            float confidence_threshold, int stability_threshold,
-                           bool first_step, int seq) {
+                           int slot, int seq) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1>  sent(sycl::range<1>(kMaxCanvas), h);
         sycl::local_accessor<int32_t, 1> sarg(sycl::range<1>(kMaxCanvas), h);
-        sycl::local_accessor<int32_t, 1> sprev(sycl::range<1>(kMaxCanvas), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(kMaxCanvas), sycl::range<1>(kMaxCanvas)),
             [=](sycl::nd_item<1> it) {
                 int i = (int)it.get_local_id(0);
                 if (i < seq) {
-                    sent[i]  = entropy[i];
-                    sarg[i]  = argmax[i];
-                    sprev[i] = first_step ? 0 : prev_argmax[i];
+                    sent[i] = entropy[i];
+                    sarg[i] = argmax[i];
                 } else {
-                    sent[i] = 0.0f; sarg[i] = 0; sprev[i] = 0;
+                    sent[i] = 0.0f; sarg[i] = 0;
                 }
                 it.barrier(sycl::access::fence_space::local_space);
                 if (i == 0) {
                     float sum = 0.0f;
-                    int eq = 0;
-                    for (int j = 0; j < seq; ++j) {
-                        sum += sent[j];
-                        if (sarg[j] == sprev[j]) eq++;
-                    }
+                    for (int j = 0; j < seq; ++j) sum += sent[j];
                     float mean = sum / (float)seq;
-                    bool all_eq = (eq == seq);
-                    bool stable = (stability_threshold == 0)
-                                ? true
-                                : (!first_step && all_eq);
+
+                    bool stable = true;
+                    for (int hstep = 0; hstep < stability_threshold && stable; ++hstep)
+                        for (int j = 0; j < seq; ++j)
+                            if (history[hstep * seq + j] != sarg[j]) { stable = false; break; }
                     bool confident = mean < confidence_threshold;
                     *mean_out = mean;
                     *stop_out = (stable && confident) ? 1 : 0;
                 }
-                // copy argmax -> prev_argmax for the next step
-                if (i < seq) prev_argmax[i] = sarg[i];
+                // rotate this step's argmax into the history ring
+                if (stability_threshold > 0 && i < seq)
+                    history[slot * seq + i] = sarg[i];
             });
     });
 }

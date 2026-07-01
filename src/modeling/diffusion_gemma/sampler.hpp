@@ -48,17 +48,24 @@ inline std::vector<int> entropy_bound_accept_renoise(
     return next;
 }
 
-// Stable-and-confident adaptive stopping (batch size 1).
+// Stable-and-confident adaptive stopping (batch size 1).  "Stable" requires
+// the current canvas to match *all* of the last `stability_threshold`
+// canvases (i.e. stability_threshold+1 consecutive identical canvases),
+// matching the reference's rolling-history criterion -- not just the single
+// immediately-preceding canvas.
 struct DiffStopping {
     int   stability_threshold;
     float confidence_threshold;
-    std::vector<int> prev_argmax;   // history of length 1 (threshold==1)
-    bool  have_prev = false;
+    std::vector<std::vector<int>> history;  // ring buffer, size == stability_threshold
+    int   next_slot = 0;
 
     DiffStopping(int stab, float conf)
         : stability_threshold(stab), confidence_threshold(conf) {}
 
-    void reset() { have_prev = false; prev_argmax.clear(); }
+    void reset() {
+        history.assign(std::max(stability_threshold, 0), std::vector<int>());
+        next_slot = 0;
+    }
 
     // Returns true when the canvas is both stable and confident.
     bool update(const std::vector<int>& argmax, const std::vector<float>& entropy) {
@@ -66,9 +73,11 @@ struct DiffStopping {
         if (stability_threshold == 0) {
             stable = true;
         } else {
-            stable = have_prev && (prev_argmax == argmax);
-            prev_argmax = argmax;
-            have_prev = true;
+            stable = true;
+            for (auto& h : history)
+                if (h != argmax) { stable = false; break; }
+            history[next_slot] = argmax;
+            next_slot = (next_slot + 1) % stability_threshold;
         }
         double mean = 0.0;
         for (float e : entropy) mean += e;

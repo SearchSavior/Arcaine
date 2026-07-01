@@ -1214,10 +1214,11 @@ void decoder_attention_forward(
     }
 
     // Bidirectional decoder attention: full layers see all encoder KV + canvas;
-    // sliding layers see the last sliding_window encoder positions + canvas.
+    // sliding layers see the last sliding_window-1 encoder positions + canvas
+    // (the canvas's own first position fills the window's last slot).
     // Canvas K/V was staged at enc_len, so the right-sliced encoder tail and the
     // canvas rows are still one contiguous cache span.
-    int kv0 = lw.is_full ? 0 : std::max(0, enc_len - cfg.sliding_window);
+    int kv0 = lw.is_full ? 0 : std::max(0, enc_len - cfg.sliding_window + 1);
     const bf16* Kc = enc_kv.k.data() + (size_t)kv0 * row;
     const bf16* Vc = enc_kv.v.data() + (size_t)kv0 * row;
     auto attn = onednn_sdpa_decoder_enabled()
