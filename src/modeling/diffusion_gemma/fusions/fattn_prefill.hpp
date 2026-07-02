@@ -1,33 +1,50 @@
 #pragma once
 // ===========================================================================
-// SKETCH — Fused DPAS flash-attention for the DiffusionGemma *prefill* path.
+// Fused DPAS flash-attention for the DiffusionGemma *prefill* path.
 //
 // Gated by DIFF_FATTN_PREFILL (A/B against the banded batched-GEMM + fused
-// softmax path in gqa_attention).  This is the model-specialized analogue of
-// llama.cpp's `ggml_sycl_flash_attn_ext_tile` (ggml/src/ggml-sycl/fattn-tile.*):
-// same streaming online-softmax algorithm, but the two matmuls are mapped onto
-// Intel DPAS via __spirv_SubgroupMatrixMultiplyAccumulateINTEL (the same
-// systolic intrinsic Arcaine already drives in common/gpu/nvfp4.hpp) instead of
-// llama.cpp's portable half2-FMA vector dots.
+// softmax path in gqa_attention).  Model-specialized analogue of llama.cpp's
+// ggml_sycl_flash_attn_ext_tile: same streaming online-softmax algorithm, but
+// both matmuls are mapped onto Intel DPAS via
+// __spirv_SubgroupMatrixMultiplyAccumulateINTEL (the intrinsic Arcaine already
+// drives in common/gpu/nvfp4.hpp) instead of llama.cpp's half2-FMA vector dots.
 //
-// Correctness contract: this is a *drop-in* for the {score_mm, fused_masked_
-// softmax, value_mm} sequence in gqa_attention() for the causal (encoder /
-// prefill) case.  Q arrives already scaled (the query pre-attn scalar is baked
-// upstream in project_qkv, exactly as the banded path assumes), so this kernel
-// applies NO extra softmax scale.  Output is written time-major (seq, nq, hd)
-// so it needs neither transpose_q_into on the way in nor scatter_ctx on the way
-// out — it reads time-major Q and writes time-major O directly.
+// Correctness contract: drop-in for {score_mm, fused_masked_softmax, value_mm}
+// in gqa_attention() for the causal (encoder/prefill) case.  Q arrives already
+// scaled (query pre-attn scalar baked upstream in project_qkv), so NO extra
+// softmax scale.  Output is written time-major (seq, nq, hd) — no transpose_q_
+// into on the way in, no scatter_ctx on the way out.
+//
+// DPAS mapping (subgroup 16, 8x16 bf16 tiles, f32 accumulate):
+//   S = Q Kᵀ  -> M=query(8) N=key(lane) K=hd(step 16).  K's hd axis is the
+//                cache's contiguous axis AND QKᵀ's contraction axis, so the B
+//                operand VNNI-packs straight from Kc with NO transpose.
+//   O += P V  -> M=query(8) N=hd(lane)  K=key(step 16). V's contraction (key)
+//                is the strided axis, so each KV block of V is staged into SLM
+//                transposed to (hd, kv); the B operand then reads its
+//                contraction contiguously from SLM.
+//
+// A/B tuning knobs (read once at launch; see dispatch at bottom):
+//   DIFF_FATTN_QTILES=1|2|4   query M-tiles per subgroup, sharing one V stage
+//                             (V-load amortization / occupancy). default 1.
+//   DIFF_FATTN_ACC=reg|slm    O accumulator in registers vs SLM
+//                             (register-pressure ceiling, matters at hd=512).
+//                             default reg.
+//   DIFF_FATTN_BK=16|32|48    KV positions staged per outer step; multiple of
+//                             16 (fewer barriers / larger V stage). default 16.
 //
 // STATUS: unverified on hardware (no Intel GPU / icpx in this tree; repo has no
-// tests per AGENTS.md).  Logic is complete — both matmuls, online softmax, band
-// masking, and SLM V-staging.  Bring-up on Battlemage still owns the numeric
-// cross-check vs the banded path and occupancy/register tuning (one subgroup per
-// work-group is deliberately simple; acc[] is MQ*hdt f32/lane).
+// tests per AGENTS.md).  Logic is complete and stub-checked; bring-up on
+// Battlemage owns the numeric cross-check vs the banded path and picking the
+// winning knob combo.  SLM budget (Vt + optional acc) is checked at dispatch;
+// configs that overflow kSlmBudget fall back to the register accumulator.
 // ===========================================================================
 #include <cstdint>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <sycl/sycl.hpp>
 #include "../../../common/gpu/buffer.hpp"
@@ -52,49 +69,47 @@ SYCL_EXTERNAL inline diff_dpas_v8f __spirv_SubgroupMatrixMultiplyAccumulateINTEL
 
 namespace fattn_prefill {
 
-// Operands selector: bf16 A/B inputs, f32 accumulate (matches nvfp4.hpp).
-static constexpr int kDpasBF16 = 0x3000;
-static constexpr int MQ = 8;    // query rows per DPAS M-tile (v8 vectors)
-static constexpr int SG = 16;   // subgroup size == DPAS N/K tile == VNNI depth
-static constexpr int BK = SG;   // KV positions per streamed block
+static constexpr int kDpasBF16 = 0x3000;  // bf16 A/B, f32 accumulate
+static constexpr int MQ  = 8;   // query rows per DPAS M-tile (v8 vectors)
+static constexpr int SG  = 16;  // subgroup size == DPAS N/K tile == VNNI depth
+static constexpr int MAXHDT = 32;                 // hd/16 ceiling (global_head_dim=512)
+static constexpr size_t kSlmBudget = 128 * 1024;  // per-work-group SLM budget (bytes)
 
-// One work-group == one subgroup of 16 lanes, owning MQ=8 query rows of one
-// query head.  It streams the KV band in blocks of BK, keeping the running
-// online-softmax state (m_run, l_run) and the O accumulator in registers.
+// ---------------------------------------------------------------------------
+// Templated kernel.  QT = query M-tiles per subgroup (each MQ rows, all sharing
+// the staged V block); ACC_SLM = keep the O accumulator in SLM instead of
+// registers.  bk (runtime, multiple of SG) = KV positions staged per step.
 //
-// Layouts (all bf16 == uint16 raw bits):
+// One subgroup owns QT*MQ query rows of one head.  Layouts (bf16 == uint16):
 //   Q  : (seq, nq, hd) time-major   Q[qi*nq*hd + h*hd + d]
 //   Kc : (kv_len, nkv, hd)          Kc[kj*nkv*hd + b*hd + d]   (b = h / gqa)
 //   Vc : (kv_len, nkv, hd)          Vc[kj*nkv*hd + b*hd + d]
 //   O  : (seq, nq, hd) time-major   written in place, no scatter
-//
-// DPAS mapping:
-//   S = Q Kᵀ  -> M=query(8) N=key(lane) K=hd(step 16).  K's hd is contiguous,
-//                so the B operand VNNI-packs straight from Kc with NO transpose.
-//   O += P V  -> M=query(8) N=hd(lane)  K=key(step 16). V's contraction (key)
-//                is the strided dim, so each block of V is staged into SLM
-//                transposed to (hd, kv); the DPAS B operand then reads its
-//                contraction contiguously from SLM.
-inline void launch(
+// ---------------------------------------------------------------------------
+template <int QT, bool ACC_SLM>
+inline void flash(
     GpuEngine& gpu,
     const bf16* Q, bf16* O,
     int seq, int nq, int nkv, int hd,
     const bf16* Kc, const bf16* Vc, int kv_len,
-    int past_offset, int sliding_window, bool causal)
+    int past_offset, int sliding_window, bool causal, int bk)
 {
-    // hd must tile the DPAS K/N step; caller falls back to the banded path
-    // otherwise (see gqa_attention dispatch).
-    const int hdt = hd / SG;             // hd tiles (both matmuls)
+    const int hdt = hd / SG;              // hd tiles (both matmuls)
     const int gqa = nq / nkv;
-    const int ntq = (seq + MQ - 1) / MQ; // query tiles per head
-    const int kv0 = past_offset - (kv_len - seq);  // absolute pos of Kc[0]
+    const int qpt = MQ * QT;              // query rows per subgroup
+    const int ntq = (seq + qpt - 1) / qpt;
+    const int kv0 = past_offset - (kv_len - seq);
+    const int nsub = bk / SG;             // 16-key DPAS sub-blocks per stage
+    const int MR = MQ * QT;               // total query rows tracked per subgroup
 
     auto& q = gpu.queue;
     q.submit([&](sycl::handler& h) {
-        // One BK-key block of V, transposed to (hd, kv) so the P·V B operand
-        // reads its contraction (kv) contiguously.  hd*BK bf16 == 8 KiB at
-        // hd=256, 16 KiB at hd=512 — one subgroup per work-group owns it.
-        sycl::local_accessor<bf16, 1> Vt((size_t)hd * BK, h);
+        // Vt: one bk-key block of V transposed to (hd, kv).
+        sycl::local_accessor<bf16, 1> Vt((size_t)hd * bk, h);
+        // acc_slm (ACC_SLM only): [qt][nt][m][lane] O accumulator.
+        sycl::local_accessor<float, 1> AccS(
+            ACC_SLM ? (size_t)QT * hdt * MQ * SG : 1, h);
+
         h.parallel_for(
             sycl::nd_range<1>((size_t)nq * ntq * SG, SG),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
@@ -102,136 +117,219 @@ inline void launch(
                 int  grp  = (int)it.get_group(0);
                 int  lane = (int)it.get_local_id(0);
                 int  head = grp / ntq;
-                int  qtile= grp % ntq;
-                int  qbase= qtile * MQ;
-                int  bkv  = head / gqa;   // shared kv head for this query head
+                int  qbase= (grp % ntq) * qpt;
+                int  bkv  = head / gqa;
 
                 // Per-query online-softmax state (replicated across lanes).
-                float m_run[MQ], l_run[MQ];
-                for (int m = 0; m < MQ; ++m) { m_run[m] = -INFINITY; l_run[m] = 0.0f; }
+                float m_run[MR], l_run[MR];
+                for (int r = 0; r < MR; ++r) { m_run[r] = -INFINITY; l_run[r] = 0.0f; }
 
-                // O accumulator: per lane holds hd column `nt*16+lane` for each
-                // of MQ queries, one v8f per hd tile.  Sized for the largest head
-                // (global_head_dim=512 -> hdt=32); sliding layers (head_dim=256)
-                // use the first 16.  This is the register-pressure ceiling: at
-                // hd=512 that's MQ*32 = 256 f32/lane, the main occupancy knob.
-                diff_dpas_v8f acc[32];
-                for (int nt = 0; nt < hdt; ++nt) acc[nt] = diff_dpas_v8f{};
+                // O accumulator: registers, or SLM.  accr sized to the hd=512
+                // ceiling; only [*][0..hdt) touched.
+                diff_dpas_v8f accr[QT][MAXHDT];
+                if constexpr (!ACC_SLM)
+                    for (int t = 0; t < QT; ++t)
+                        for (int nt = 0; nt < hdt; ++nt) accr[t][nt] = diff_dpas_v8f{};
+                auto acc_idx = [&](int t, int nt, int m) {
+                    return (size_t)((t * hdt + nt) * MQ + m) * SG + lane;
+                };
+                if constexpr (ACC_SLM) {
+                    for (int t = 0; t < QT; ++t)
+                        for (int nt = 0; nt < hdt; ++nt)
+                            for (int m = 0; m < MQ; ++m) AccS[acc_idx(t, nt, m)] = 0.0f;
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
 
-                // Causal / sliding band for this query tile (same math as the
-                // banded gqa_attention path — absolute coords).
+                // Causal / sliding band spanning all QT tiles of this subgroup.
                 int q_lo = past_offset + qbase;
-                int q_hi = past_offset + std::min(qbase + MQ - 1, seq - 1);
+                int q_hi = past_offset + std::min(qbase + qpt - 1, seq - 1);
                 int ke = kv_len, ks = 0;
                 if (causal) {
                     ke = std::min(kv_len, (q_hi - kv0) + 1);
                     ks = (sliding_window == INT_MAX)
                        ? 0 : std::max(0, (q_lo - sliding_window + 1) - kv0);
                 }
-                int ks_aligned = (ks / BK) * BK;
+                int ks_aligned = (ks / bk) * bk;
 
-                for (int kj = ks_aligned; kj < ke; kj += BK) {
-                    int key = kj + lane;              // this lane's key column
-                    bool key_ok = key < kv_len;
-
-                    // ---- 1. S = Q·Kᵀ for this block: c[m] = S[query m][key=lane]
-                    diff_dpas_v8f c = diff_dpas_v8f{};
-                    for (int kt = 0; kt < hdt; ++kt) {
-                        int d0 = kt * SG;
-                        // A: a[m] = Q[query m][d0+lane]  (lane over hd == DPAS K)
-                        diff_dpas_v8s a;
-                        for (int m = 0; m < MQ; ++m) {
-                            int qi = qbase + m;
-                            uint16_t qv = (qi < seq)
-                                ? Q[(size_t)qi * nq * hd + head * hd + d0 + lane] : 0;
-                            a[m] = (short)qv;
-                        }
-                        // B: b[i] VNNI-packs K[key][bkv][d0+2i .. +2i+1] (hd
-                        // contiguous -> no transpose).  lane == key == DPAS N.
-                        diff_dpas_v8i b;
-                        const bf16* krow = key_ok
-                            ? Kc + (size_t)key * nkv * hd + (size_t)bkv * hd + d0
-                            : nullptr;
-                        for (int i = 0; i < 8; ++i) {
-                            uint16_t lo = krow ? krow[2 * i]     : 0;
-                            uint16_t hi = krow ? krow[2 * i + 1] : 0;
-                            b[i] = (int)((uint32_t)lo | ((uint32_t)hi << 16));
-                        }
-                        c = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(SG, a, b, c, kDpasBF16);
-                    }
-
-                    // ---- 2. mask + online softmax; produce P[m] for this lane's key
-                    float P[MQ];
-                    for (int m = 0; m < MQ; ++m) {
-                        int qi = qbase + m;
-                        float s = c[m];
-                        bool masked = !key_ok || qi >= seq;
-                        if (causal && !masked) {
-                            int qg = past_offset + qi, kg = kv0 + key;
-                            masked = kg > qg ||
-                                (sliding_window != INT_MAX && kg < qg - sliding_window + 1);
-                        }
-                        if (masked) s = -INFINITY;
-
-                        float bmax = sycl::reduce_over_group(sg, s, sycl::maximum<float>());
-                        if (bmax == -INFINITY) { P[m] = 0.0f; continue; }  // block fully masked for q m
-                        float m_new = sycl::fmax(m_run[m], bmax);
-                        float corr  = sycl::exp(m_run[m] == -INFINITY ? 0.0f : m_run[m] - m_new);
-                        float p     = (s == -INFINITY) ? 0.0f : sycl::exp(s - m_new);
-                        float bsum  = sycl::reduce_over_group(sg, p, sycl::plus<float>());
-
-                        l_run[m] = l_run[m] * corr + bsum;
-                        m_run[m] = m_new;
-                        // rescale the O accumulator rows for query m by corr
-                        for (int nt = 0; nt < hdt; ++nt) acc[nt][m] *= corr;
-                        P[m] = p;   // this lane's contribution (key = kj+lane)
-                    }
-
-                    // ---- 3a. stage this block's V into SLM, transposed to
-                    // (hd, kv).  Global read is coalesced (consecutive lanes hit
-                    // consecutive hd == stride 1); the transpose lands in the SLM
-                    // write.  OOB keys store 0 (their P is already 0 anyway, so
-                    // they cannot contribute — this only guards the load).
+                for (int kj = ks_aligned; kj < ke; kj += bk) {
+                    // ---- stage this bk-key block of V into SLM, transposed to
+                    // (hd, kv).  Global read coalesced (consecutive lanes hit
+                    // consecutive hd == stride 1); transpose lands in the SLM
+                    // write.  OOB keys store 0 (their P is 0 anyway).
                     it.barrier(sycl::access::fence_space::local_space);  // prev block done reading Vt
-                    for (int idx = lane; idx < BK * hd; idx += SG) {
-                        int kvv = idx / hd;   // key within block  (outer -> coalesced d)
-                        int d   = idx % hd;   // hd column
-                        int k   = kj + kvv;
-                        Vt[(size_t)d * BK + kvv] =
+                    for (int idx = lane; idx < bk * hd; idx += SG) {
+                        int kvv = idx / hd, d = idx % hd, k = kj + kvv;
+                        Vt[(size_t)d * bk + kvv] =
                             (k < kv_len) ? Vc[(size_t)k * nkv * hd + (size_t)bkv * hd + d] : 0;
                     }
                     it.barrier(sycl::access::fence_space::local_space);  // Vt filled
 
-                    // ---- 3b. O += P·V for this block.  M=query N=hd(lane) K=key.
-                    // B operand now reads its contraction (kv) contiguously from
-                    // the transposed SLM row for hd = d0+lane.
-                    diff_dpas_v8s pa;                     // A: pa[m] = P[query m][key=lane]
-                    for (int m = 0; m < MQ; ++m) pa[m] = (short)float_to_bf16(P[m]);
-                    for (int nt = 0; nt < hdt; ++nt) {
-                        size_t vrow = (size_t)(nt * SG + lane) * BK;  // hd row, 16 kv contiguous
-                        diff_dpas_v8i b;
-                        for (int i = 0; i < 8; ++i)
-                            b[i] = (int)((uint32_t)Vt[vrow + 2 * i] |
-                                         ((uint32_t)Vt[vrow + 2 * i + 1] << 16));
-                        acc[nt] = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(SG, pa, b, acc[nt], kDpasBF16);
+                    // For each query M-tile and each 16-key sub-block: QKᵀ,
+                    // online-softmax step, P·V accumulate.  All QT tiles reuse
+                    // the one staged Vt.
+                    for (int t = 0; t < QT; ++t) {
+                        for (int sb = 0; sb < nsub; ++sb) {
+                            int keysub = kj + sb * SG;
+                            int key = keysub + lane;
+                            bool key_ok = key < kv_len;
+
+                            // 1. S = Q·Kᵀ : c[m] = S[query m][key=lane]
+                            diff_dpas_v8f c = diff_dpas_v8f{};
+                            for (int kt = 0; kt < hdt; ++kt) {
+                                int d0 = kt * SG;
+                                diff_dpas_v8s a;
+                                for (int m = 0; m < MQ; ++m) {
+                                    int qi = qbase + t * MQ + m;
+                                    uint16_t qv = (qi < seq)
+                                        ? Q[(size_t)qi * nq * hd + head * hd + d0 + lane] : 0;
+                                    a[m] = (short)qv;
+                                }
+                                const bf16* krow = key_ok
+                                    ? Kc + (size_t)key * nkv * hd + (size_t)bkv * hd + d0
+                                    : nullptr;
+                                diff_dpas_v8i b;
+                                for (int i = 0; i < 8; ++i) {
+                                    uint16_t lo = krow ? krow[2 * i]     : 0;
+                                    uint16_t hi = krow ? krow[2 * i + 1] : 0;
+                                    b[i] = (int)((uint32_t)lo | ((uint32_t)hi << 16));
+                                }
+                                c = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(SG, a, b, c, kDpasBF16);
+                            }
+
+                            // 2. mask + online-softmax step -> P[m] for key=lane
+                            float P[MQ];
+                            for (int m = 0; m < MQ; ++m) {
+                                int r = t * MQ + m;
+                                int qi = qbase + r;
+                                float s = c[m];
+                                bool masked = !key_ok || qi >= seq;
+                                if (causal && !masked) {
+                                    int qg = past_offset + qi, kg = kv0 + key;
+                                    masked = kg > qg ||
+                                        (sliding_window != INT_MAX && kg < qg - sliding_window + 1);
+                                }
+                                if (masked) s = -INFINITY;
+
+                                float bmax = sycl::reduce_over_group(sg, s, sycl::maximum<float>());
+                                if (bmax == -INFINITY) { P[m] = 0.0f; continue; }
+                                float m_new = sycl::fmax(m_run[r], bmax);
+                                float corr  = sycl::exp(m_run[r] == -INFINITY ? 0.0f : m_run[r] - m_new);
+                                float p     = (s == -INFINITY) ? 0.0f : sycl::exp(s - m_new);
+                                float bsum  = sycl::reduce_over_group(sg, p, sycl::plus<float>());
+
+                                l_run[r] = l_run[r] * corr + bsum;
+                                m_run[r] = m_new;
+                                // rescale the O accumulator rows for this query by corr
+                                if (corr != 1.0f) {
+                                    if constexpr (ACC_SLM)
+                                        for (int nt = 0; nt < hdt; ++nt) AccS[acc_idx(t, nt, m)] *= corr;
+                                    else
+                                        for (int nt = 0; nt < hdt; ++nt) accr[t][nt][m] *= corr;
+                                }
+                                P[m] = p;
+                            }
+
+                            // 3. O += P·V.  A: pa[m]=P[query m][key=lane].  B:
+                            // Vt row for hd=nt*16+lane, contiguous over kv.
+                            diff_dpas_v8s pa;
+                            for (int m = 0; m < MQ; ++m) pa[m] = (short)float_to_bf16(P[m]);
+                            for (int nt = 0; nt < hdt; ++nt) {
+                                size_t vrow = (size_t)(nt * SG + lane) * bk + sb * SG;
+                                diff_dpas_v8i b;
+                                for (int i = 0; i < 8; ++i)
+                                    b[i] = (int)((uint32_t)Vt[vrow + 2 * i] |
+                                                 ((uint32_t)Vt[vrow + 2 * i + 1] << 16));
+                                if constexpr (ACC_SLM) {
+                                    diff_dpas_v8f cc;
+                                    for (int m = 0; m < MQ; ++m) cc[m] = AccS[acc_idx(t, nt, m)];
+                                    cc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(SG, pa, b, cc, kDpasBF16);
+                                    for (int m = 0; m < MQ; ++m) AccS[acc_idx(t, nt, m)] = cc[m];
+                                } else {
+                                    accr[t][nt] = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                                        SG, pa, b, accr[t][nt], kDpasBF16);
+                                }
+                            }
+                        }
                     }
                 }
 
-                // ---- finalize: O[query][head][hd] = acc / l_run  (time-major)
-                for (int nt = 0; nt < hdt; ++nt) {
-                    int d = nt * SG + lane;
-                    for (int m = 0; m < MQ; ++m) {
-                        int qi = qbase + m;
-                        if (qi >= seq) continue;
-                        float inv = l_run[m] > 0.0f ? 1.0f / l_run[m] : 0.0f;
-                        O[(size_t)qi * nq * hd + head * hd + d] = float_to_bf16(acc[nt][m] * inv);
+                // ---- finalize: O[query][head][hd] = acc / l_run (time-major)
+                for (int t = 0; t < QT; ++t)
+                    for (int nt = 0; nt < hdt; ++nt) {
+                        int d = nt * SG + lane;
+                        for (int m = 0; m < MQ; ++m) {
+                            int r = t * MQ + m, qi = qbase + r;
+                            if (qi >= seq) continue;
+                            float inv = l_run[r] > 0.0f ? 1.0f / l_run[r] : 0.0f;
+                            float a;
+                            if constexpr (ACC_SLM) a = AccS[acc_idx(t, nt, m)];
+                            else                   a = accr[t][nt][m];
+                            O[(size_t)qi * nq * hd + head * hd + d] = float_to_bf16(a * inv);
+                        }
                     }
-                }
             });
     });
 }
 
-// hd tile bound for the fixed-size acc[] register array above.
-inline bool supported(int hd) { return hd % SG == 0 && hd / SG <= 32; }
+inline bool supported(int hd) { return hd % SG == 0 && hd / SG <= MAXHDT; }
+
+// ---------------------------------------------------------------------------
+// Dispatch: read the A/B knobs once, clamp to the supported set, budget-check
+// the SLM footprint, and call the matching template instantiation.
+// ---------------------------------------------------------------------------
+inline void launch(
+    GpuEngine& gpu,
+    const bf16* Q, bf16* O,
+    int seq, int nq, int nkv, int hd,
+    const bf16* Kc, const bf16* Vc, int kv_len,
+    int past_offset, int sliding_window, bool causal)
+{
+    static const int envQT = [] {
+        const char* e = std::getenv("DIFF_FATTN_QTILES");
+        int v = e ? std::atoi(e) : 1;
+        return (v >= 4) ? 4 : (v >= 2) ? 2 : 1;   // {1,2,4}
+    }();
+    static const bool envAccSlm = [] {
+        const char* e = std::getenv("DIFF_FATTN_ACC");
+        return e && std::strcmp(e, "slm") == 0;
+    }();
+    static const int envBK = [] {
+        const char* e = std::getenv("DIFF_FATTN_BK");
+        int v = e ? std::atoi(e) : SG;
+        v = (v / SG) * SG;                        // floor to multiple of 16
+        return v < SG ? SG : v;
+    }();
+
+    int qt = envQT, bk = envBK;
+    bool acc_slm = envAccSlm;
+    const int hdt = hd / SG;
+
+    // SLM budget: Vt (hd*bk bf16) + optional acc (QT*hdt*MQ*SG f32).  Shrink the
+    // knobs (bk, then acc->reg, then QT) until it fits, so a too-aggressive combo
+    // degrades instead of failing to launch.
+    auto slm_bytes = [&](int q_, bool s_, int b_) {
+        size_t v = (size_t)hd * b_ * sizeof(bf16);
+        size_t a = s_ ? (size_t)q_ * hdt * MQ * SG * sizeof(float) : 0;
+        return v + a;
+    };
+    while (bk > SG && slm_bytes(qt, acc_slm, bk) > kSlmBudget) bk -= SG;
+    if (acc_slm && slm_bytes(qt, acc_slm, bk) > kSlmBudget) acc_slm = false;
+    while (qt > 1 && slm_bytes(qt, acc_slm, bk) > kSlmBudget) qt >>= 1;
+
+    // (QT, ACC_SLM) -> template instantiation; BK stays runtime.
+    auto call = [&](auto QTc, auto ACCc) {
+        flash<decltype(QTc)::value, decltype(ACCc)::value>(
+            gpu, Q, O, seq, nq, nkv, hd, Kc, Vc, kv_len,
+            past_offset, sliding_window, causal, bk);
+    };
+    #define FATTN_QT(N) \
+        if (qt == N) { \
+            if (acc_slm) call(std::integral_constant<int,N>{}, std::true_type{}); \
+            else         call(std::integral_constant<int,N>{}, std::false_type{}); \
+            return; \
+        }
+    FATTN_QT(4) FATTN_QT(2) FATTN_QT(1)
+    #undef FATTN_QT
+}
 
 }  // namespace fattn_prefill
