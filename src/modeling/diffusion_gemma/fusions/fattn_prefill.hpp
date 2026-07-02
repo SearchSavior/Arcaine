@@ -19,8 +19,10 @@
 // out — it reads time-major Q and writes time-major O directly.
 //
 // STATUS: unverified on hardware (no Intel GPU / icpx in this tree; repo has no
-// tests per AGENTS.md).  Block sizes and the V read pattern are the first tuning
-// knobs.  Marked TODO where a real bring-up must confirm layout/register cost.
+// tests per AGENTS.md).  Logic is complete — both matmuls, online softmax, band
+// masking, and SLM V-staging.  Bring-up on Battlemage still owns the numeric
+// cross-check vs the banded path and occupancy/register tuning (one subgroup per
+// work-group is deliberately simple; acc[] is MQ*hdt f32/lane).
 // ===========================================================================
 #include <cstdint>
 #include <climits>
@@ -70,8 +72,9 @@ static constexpr int BK = SG;   // KV positions per streamed block
 //   S = Q Kᵀ  -> M=query(8) N=key(lane) K=hd(step 16).  K's hd is contiguous,
 //                so the B operand VNNI-packs straight from Kc with NO transpose.
 //   O += P V  -> M=query(8) N=hd(lane)  K=key(step 16). V's contraction (key)
-//                is the strided dim; packed by a per-lane strided read (TODO:
-//                stage V block into SLM for coalescing on real hardware).
+//                is the strided dim, so each block of V is staged into SLM
+//                transposed to (hd, kv); the DPAS B operand then reads its
+//                contraction contiguously from SLM.
 inline void launch(
     GpuEngine& gpu,
     const bf16* Q, bf16* O,
@@ -88,6 +91,10 @@ inline void launch(
 
     auto& q = gpu.queue;
     q.submit([&](sycl::handler& h) {
+        // One BK-key block of V, transposed to (hd, kv) so the P·V B operand
+        // reads its contraction (kv) contiguously.  hd*BK bf16 == 8 KiB at
+        // hd=256, 16 KiB at hd=512 — one subgroup per work-group owns it.
+        sycl::local_accessor<bf16, 1> Vt((size_t)hd * BK, h);
         h.parallel_for(
             sycl::nd_range<1>((size_t)nq * ntq * SG, SG),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
@@ -104,8 +111,11 @@ inline void launch(
                 for (int m = 0; m < MQ; ++m) { m_run[m] = -INFINITY; l_run[m] = 0.0f; }
 
                 // O accumulator: per lane holds hd column `nt*16+lane` for each
-                // of MQ queries, one v8f per hd tile.  (MQ*hdt f32 per lane.)
-                diff_dpas_v8f acc[/*hdt max*/ 32];
+                // of MQ queries, one v8f per hd tile.  Sized for the largest head
+                // (global_head_dim=512 -> hdt=32); sliding layers (head_dim=256)
+                // use the first 16.  This is the register-pressure ceiling: at
+                // hd=512 that's MQ*32 = 256 f32/lane, the main occupancy knob.
+                diff_dpas_v8f acc[32];
                 for (int nt = 0; nt < hdt; ++nt) acc[nt] = diff_dpas_v8f{};
 
                 // Causal / sliding band for this query tile (same math as the
@@ -177,22 +187,32 @@ inline void launch(
                         P[m] = p;   // this lane's contribution (key = kj+lane)
                     }
 
-                    // ---- 3. O += P·V for this block.  M=query N=hd(lane) K=key
+                    // ---- 3a. stage this block's V into SLM, transposed to
+                    // (hd, kv).  Global read is coalesced (consecutive lanes hit
+                    // consecutive hd == stride 1); the transpose lands in the SLM
+                    // write.  OOB keys store 0 (their P is already 0 anyway, so
+                    // they cannot contribute — this only guards the load).
+                    it.barrier(sycl::access::fence_space::local_space);  // prev block done reading Vt
+                    for (int idx = lane; idx < BK * hd; idx += SG) {
+                        int kvv = idx / hd;   // key within block  (outer -> coalesced d)
+                        int d   = idx % hd;   // hd column
+                        int k   = kj + kvv;
+                        Vt[(size_t)d * BK + kvv] =
+                            (k < kv_len) ? Vc[(size_t)k * nkv * hd + (size_t)bkv * hd + d] : 0;
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);  // Vt filled
+
+                    // ---- 3b. O += P·V for this block.  M=query N=hd(lane) K=key.
+                    // B operand now reads its contraction (kv) contiguously from
+                    // the transposed SLM row for hd = d0+lane.
                     diff_dpas_v8s pa;                     // A: pa[m] = P[query m][key=lane]
                     for (int m = 0; m < MQ; ++m) pa[m] = (short)float_to_bf16(P[m]);
                     for (int nt = 0; nt < hdt; ++nt) {
-                        int d0 = nt * SG;
-                        // B: b[i] VNNI-packs V[kj+2i .. +2i+1][bkv][d0+lane]
-                        // (contraction=key is strided by nkv*hd — TODO SLM stage).
+                        size_t vrow = (size_t)(nt * SG + lane) * BK;  // hd row, 16 kv contiguous
                         diff_dpas_v8i b;
-                        for (int i = 0; i < 8; ++i) {
-                            int k0 = kj + 2 * i, k1 = kj + 2 * i + 1;
-                            uint16_t lo = (k0 < kv_len)
-                                ? Vc[(size_t)k0 * nkv * hd + (size_t)bkv * hd + d0 + lane] : 0;
-                            uint16_t hi = (k1 < kv_len)
-                                ? Vc[(size_t)k1 * nkv * hd + (size_t)bkv * hd + d0 + lane] : 0;
-                            b[i] = (int)((uint32_t)lo | ((uint32_t)hi << 16));
-                        }
+                        for (int i = 0; i < 8; ++i)
+                            b[i] = (int)((uint32_t)Vt[vrow + 2 * i] |
+                                         ((uint32_t)Vt[vrow + 2 * i + 1] << 16));
                         acc[nt] = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(SG, pa, b, acc[nt], kDpasBF16);
                     }
                 }
