@@ -5,6 +5,7 @@
 #include "../../common/kernels/rope.hpp"
 #include "../../common/layers/attention_layout.hpp"  // transpose_q_into, scatter_ctx
 #include "linear_dispatch.hpp"
+#include "fusions/fattn_prefill.hpp"
 #include "arena.hpp"
 #include "../../utils/profile.hpp"
 #include <algorithm>
@@ -850,6 +851,15 @@ void fused_masked_softmax(
 // their coordinates: `q_pos0`/`kv_pos0` stay absolute, and the RoPE baked into
 // K/V at projection is untouched.
 // ---------------------------------------------------------------------------
+// DIFF_FATTN_PREFILL: route the causal (encoder/prefill) attention through the
+// fused DPAS flash-attention kernel (fusions/fattn_prefill.hpp) instead of the
+// banded batched-GEMM + fused-softmax path below.  A/B knob per AGENTS.md; only
+// affects causal calls (decode is bidirectional and untouched).
+static bool fattn_prefill_enabled() {
+    static bool on = std::getenv("DIFF_FATTN_PREFILL") != nullptr;
+    return on;
+}
+
 diffarena::Alloc<bf16> gqa_attention(
     GpuEngine& ctx,
     const bf16* Q, int seq, int nq, int hd,
@@ -863,6 +873,15 @@ diffarena::Alloc<bf16> gqa_attention(
     auto& ar = diffarena::arena(ctx.index);
     auto ctx_tm_a = ar.alloc<bf16>((size_t)seq * nq * hd);  // full output
     bf16* ctx_tm = ctx_tm_a.data();
+
+    // Fused DPAS flash-attention prefill (drop-in for the score_mm + softmax +
+    // value_mm sequence).  Only the causal path; hd must tile the DPAS step.
+    if (causal && fattn_prefill_enabled() && fattn_prefill::supported(hd)) {
+        DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::ScoreMM));
+        fattn_prefill::launch(ctx, Q, ctx_tm, seq, nq, nkv, hd,
+                              Kc, Vc, kv_len, past_offset, sliding_window, causal);
+        return ctx_tm_a;
+    }
 
     // Query-tile height: bound the scores buffer to ~512 MB (bf16) by capping
     // nq*tq*kv_len.  Short prompts collapse to a single full-width tile (tq==seq),
