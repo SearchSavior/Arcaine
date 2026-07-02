@@ -7,4 +7,6 @@ allow = [
     "echo *",
     "ls *",
     "head *",
+    "find *",
+    "docker *",
 ]

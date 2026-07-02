@@ -110,6 +110,17 @@ static bool nvfp4_grouped_gemm_xe2v2_enabled() {
     return enabled;
 }
 
+// xe2v6: lanes->N-tiles with M-tiles lifted into the work-group grid (best
+// small-batch MoE kernel; ~2x over onednn-loop at p<=1024). Single-device path.
+static bool nvfp4_grouped_gemm_xe2v6_enabled() {
+    static bool enabled = [] {
+        const char* env = std::getenv("DIFF_NVFP4_GROUPED_GEMM");
+        if (!env) return false;
+        return !std::strcmp(env, "xe2v6");
+    }();
+    return enabled;
+}
+
 static bool q8_use_hybrid_expert_kernel() {
     static bool enabled = [] {
         const char* env = std::getenv("DIFF_Q8_EXPERT_KERNEL");
@@ -354,17 +365,33 @@ static bool run_shard_nvfp4_gpu_layout(
     int IG = moe_inter / 16;
     bool use_xe2v2 = nvfp4_grouped_gemm_xe2v2_enabled();
     bool use_xe2_gemm = !use_xe2v2 && nvfp4_grouped_gemm_xe2_enabled();
+    bool use_xe2v6 = !use_xe2v2 && !use_xe2_gemm && nvfp4_grouped_gemm_xe2v6_enabled();
+    bool need_coal = use_xe2_gemm || use_xe2v6;
+
+    // xe2v6 sizes its work-group grid by max_mt (max M-tiles across experts),
+    // which requires the per-expert row counts on the host.
+    int max_mt = 1;
+    if (use_xe2v6) {
+        std::vector<int32_t> rpe_h(localE);
+        q.memcpy(rpe_h.data(), rows_per_expert_dev.data(), (size_t)localE * sizeof(int32_t)).wait();
+        for (int e = 0; e < localE; ++e) {
+            int mt = (rpe_h[e] + 7) / 8;
+            if (mt > max_mt) max_mt = mt;
+        }
+        static bool logged = false;
+        if (!logged) { std::fprintf(stderr, "[moe] xe2v6 engaged: localE=%d max_mt=%d\n", localE, max_mt); logged = true; }
+    }
     std::vector<const uint8_t*> gate_w(localE), gate_s(localE), down_w(localE), down_s(localE);
     std::vector<const float*> gate_dst(localE), down_dst(localE);
     std::vector<float> gate_input(localE), down_input(localE);
     for (int e = 0; e < localE; ++e) {
-        gate_w[e] = use_xe2_gemm
+        gate_w[e] = need_coal
             ? nvfp4_coalesced_weight(shard.gate_up_proj_fp4[e], H, 2 * moe_inter, ctx)
             : shard.gate_up_proj_fp4[e].weight_packed.data();
         gate_s[e] = shard.gate_up_proj_fp4[e].weight_scale.data();
         gate_dst[e] = shard.gate_up_proj_fp4[e].dst_scale.data();
         gate_input[e] = shard.gate_up_proj_fp4[e].input_global_scale;
-        down_w[e] = use_xe2_gemm
+        down_w[e] = need_coal
             ? nvfp4_coalesced_weight(shard.down_proj_fp4[e], moe_inter, H, ctx)
             : shard.down_proj_fp4[e].weight_packed.data();
         down_s[e] = shard.down_proj_fp4[e].weight_scale.data();
@@ -405,6 +432,12 @@ static bool run_shard_nvfp4_gpu_layout(
                                            expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
                                            gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
                                            2 * moe_inter, gu.data());
+      } else if (use_xe2v6) {
+          matmul_nvfp4_grouped_rows_xe2_v6(ctx, xe_packed.data(), xe_scale.data(), H,
+                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
+                                           max_mt,
+                                           gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
+                                           2 * moe_inter, gu.data());
       } else if (use_xe2_gemm) {
           matmul_nvfp4_grouped_rows_xe2(ctx, xe_packed.data(), xe_scale.data(), H,
                                         row_expert_dev.data(), A_all,
@@ -437,6 +470,12 @@ static bool run_shard_nvfp4_gpu_layout(
       if (use_xe2v2) {
           matmul_nvfp4_grouped_rows_xe2_v2(ctx, act_packed.data(), act_scale.data(), moe_inter,
                                            expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
+                                           down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
+                                           H, Ye.data());
+      } else if (use_xe2v6) {
+          matmul_nvfp4_grouped_rows_xe2_v6(ctx, act_packed.data(), act_scale.data(), moe_inter,
+                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
+                                           max_mt,
                                            down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
                                            H, Ye.data());
       } else if (use_xe2_gemm) {

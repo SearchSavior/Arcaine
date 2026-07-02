@@ -2,6 +2,9 @@
 #include <dnnl.hpp>
 #include <dnnl_sycl.hpp>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
 #include <cstdint>
 #include <cmath>
 #include <stdexcept>
@@ -316,6 +319,125 @@ inline void matmul_nvfp4_packed(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Batched NVFP4 GEMM (Direction B, Phase 1).
+//
+// oneDNN batched f4_e2m1 matmul. Validated by Probe 1 (nvfp4_batched_probe):
+//   - src scales     [B,M,G] f8_e4m3, mask=7, groups{1,1,16}
+//   - weight scales  [B,G,N] f8_e4m3, mask=7, groups{1,16,1}   (batched; the
+//     shared [G,N] layout is REJECTED by oneDNN at execute — do not use it)
+//   - dst scale      [1]     f32,    mask=0 (shared across the batch)
+// Weights are fed in the raw per-expert layout (each [N,K] f4, K-contiguous,
+// matching the single kernel's tag::ba on {K,N}). Concatenating E experts
+// end-to-end gives a [B,K,N] tensor that is K-contiguous within each batch =>
+// tag::acb (B slow, N mid, K fast). No reorder / no Any-layout path (the bench
+// builds the batched buffer directly from the per-expert packed weights).
+// ---------------------------------------------------------------------------
+
+struct Nvfp4BatchedMatmulKey {
+    int gpu, B, M, K, N;
+    bool operator==(const Nvfp4BatchedMatmulKey& o) const {
+        return gpu == o.gpu && B == o.B && M == o.M && K == o.K && N == o.N;
+    }
+};
+
+struct Nvfp4BatchedMatmulKeyHash {
+    size_t operator()(const Nvfp4BatchedMatmulKey& k) const {
+        size_t h = std::hash<int>{}(k.gpu);
+        auto mix = [&](int v) {
+            h ^= std::hash<int>{}(v) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        };
+        mix(k.B); mix(k.M); mix(k.K); mix(k.N);
+        return h;
+    }
+};
+
+struct Nvfp4BatchedMatmulEntry {
+    dnnl::matmul primitive;
+    dnnl::memory::desc weights_md;
+};
+
+inline Nvfp4BatchedMatmulEntry& nvfp4_matmul_batched_entry(
+    GpuEngine& ctx, int B, int M, int K, int N)
+{
+    static std::unordered_map<Nvfp4BatchedMatmulKey, Nvfp4BatchedMatmulEntry,
+                              Nvfp4BatchedMatmulKeyHash> cache;
+    Nvfp4BatchedMatmulKey key{ctx.index, B, M, K, N};
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        using dt = dnnl::memory::data_type;
+        using tag = dnnl::memory::format_tag;
+        dnnl::primitive_attr attr;
+        attr.set_scales(DNNL_ARG_SRC,     7, {1, 1, 16}, dt::f8_e4m3); // [B,M,G]
+        attr.set_scales(DNNL_ARG_WEIGHTS, 7, {1, 16, 1}, dt::f8_e4m3); // [B,G,N]
+        attr.set_scales(DNNL_ARG_DST,     0, {},          dt::f32);    // [1]
+        auto weights_md = dnnl::memory::desc({B, K, N}, dt::f4_e2m1, tag::acb);
+        dnnl::matmul::primitive_desc pd(ctx.engine,
+            dnnl::memory::desc({B, M, K}, dt::f4_e2m1, tag::abc),
+            weights_md,
+            dnnl::memory::desc({B, M, N}, dt::bf16,     tag::abc),
+            attr);
+        if (nvfp4_verbose()) {
+            auto cwd = pd.weights_desc();
+            auto wd = cwd.get_dims();
+            auto ws = cwd.get_strides();
+            std::fprintf(stderr,
+                "[nvfp4-batched] gpu=%d B=%d M=%d K=%d N=%d impl=%s "
+                "w_dims=(%lld,%lld,%lld) w_strides=(%lld,%lld,%lld)\n",
+                ctx.index, B, M, K, N, pd.impl_info_str(),
+                (long long)wd[0], (long long)wd[1], (long long)wd[2],
+                (long long)ws[0], (long long)ws[1], (long long)ws[2]);
+        }
+        auto result = cache.emplace(key, Nvfp4BatchedMatmulEntry{dnnl::matmul(pd), pd.weights_desc()});
+        it = result.first;
+    }
+    return it->second;
+}
+
+inline void matmul_nvfp4_packed_batched(
+    const uint8_t* A_packed,    // [B, M, K] f4_e2m1 (tag::abc, K contiguous)
+    const uint8_t* A_scale,     // [B, M, G] f8_e4m3 (tag::abc, G contiguous)
+    int B, int M, int K,
+    const uint8_t* W_packed_batch, // [B, K, N] f4_e2m1 (tag::acb, K contiguous)
+    const uint8_t* W_scale_batch,  // [B, G, N] f8_e4m3 (tag::abc, N contiguous)
+    const float*    dst_scale,      // [1]        f32 (shared)
+    int N, bf16* C,                  // [B, M, N] bf16 (tag::abc)
+    GpuEngine& ctx = GpuEngine::get(0))
+{
+    if (K % 16 != 0)
+        throw std::runtime_error("matmul_nvfp4_packed_batched: K must be divisible by 16");
+    int G = K / 16;
+
+    using dt = dnnl::memory::data_type;
+    using tag = dnnl::memory::format_tag;
+    auto src_md         = dnnl::memory::desc({B, M, K}, dt::f4_e2m1, tag::abc);
+    auto dst_md         = dnnl::memory::desc({B, M, N}, dt::bf16,     tag::abc);
+    auto src_scales_md  = dnnl::memory::desc({B, M, G}, dt::f8_e4m3, tag::abc);
+    auto w_scales_md    = dnnl::memory::desc({B, G, N}, dt::f8_e4m3, tag::abc);
+    auto dst_scale_md   = dnnl::memory::desc({1},       dt::f32,     tag::a);
+
+    auto& entry = nvfp4_matmul_batched_entry(ctx, B, M, K, N);
+    entry.primitive.execute(ctx.stream, {
+        {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
+            src_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            const_cast<uint8_t*>(A_packed))},
+        {DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+            entry.weights_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            const_cast<uint8_t*>(W_packed_batch))},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
+            src_scales_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            const_cast<uint8_t*>(A_scale))},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+            w_scales_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            const_cast<uint8_t*>(W_scale_batch))},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
+            dst_scale_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+            const_cast<float*>(dst_scale))},
+        {DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
+            dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
+    });
+}
+
 inline void matmul_nvfp4(
     const bf16* A,
     int M,
@@ -375,6 +497,52 @@ inline float nvfp4_e2m1_fast(uint8_t bits) {
     const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     return (bits & 8) ? -mag[bits & 7] : mag[bits & 7];
 }
+
+// Vectorized (ESIMD simd) arithmetic e2m1 dequant — no LUT, no scalar loop.
+// Validated bit-exact vs nvfp4_e2m1_fast by src/nvfp4_vec_dequant_probe.cpp.
+// nib holds 4-bit e2m1 codes (0..15); returns the dequanted float values.
+namespace esimd_vec {
+namespace esimd_local = sycl::ext::intel::esimd;
+template <int N>
+inline esimd_local::simd<float, N> e2m1(esimd_local::simd<uint16_t, N> nib) {
+    auto s = nib >> 3;
+    auto e = (nib >> 1) & esimd_local::simd<uint16_t, N>(3);
+    auto m = nib & esimd_local::simd<uint16_t, N>(1);
+    auto one = esimd_local::simd<uint16_t, N>(1);
+    auto one_shl_e = one << e;                       // 1,2,4,8
+    auto two_pow = esimd_local::convert<float>(one_shl_e) * 0.5f;  // 0.5,1,2,4
+    auto m_f = esimd_local::convert<float>(m);
+    auto normal = two_pow + two_pow * 0.5f * m_f;     // two_pow*(1+0.5*m)
+    auto subnorm = 0.5f * m_f;
+    auto absval = normal;
+    absval.merge(subnorm, e == esimd_local::simd<uint16_t, N>(0));
+    auto val = absval;
+    val.merge(-absval, s != esimd_local::simd<uint16_t, N>(0));
+    return val;
+}
+
+// Vectorized (ESIMD simd) arithmetic e4m3 dequant — bit-exact vs nvfp4_e4m3_fast.
+// b holds 8-bit e4m3 codes (0..255); returns the dequanted float values.
+// Normal: 2^(exp-7)*(1+mant/8); subnormal (exp==0): mant*2^-9 (= (mant/8)*2^-6).
+// Uses float(1<<exp)/128 instead of exp2() to stay bit-exact and avoid negative-shift UB.
+template <int N>
+inline esimd_local::simd<float, N> e4m3(esimd_local::simd<uint16_t, N> b) {
+    auto s = b >> 7;                                         // sign (bit 7)
+    auto exp = (b >> 3) & esimd_local::simd<uint16_t, N>(0x0f);
+    auto mant = b & esimd_local::simd<uint16_t, N>(0x07);
+    auto one = esimd_local::simd<uint16_t, N>(1);
+    auto one_shl_e = one << exp;                             // 1..32768 (fits uint16)
+    auto two_pow = esimd_local::convert<float>(one_shl_e) * (1.0f / 128.0f);  // 2^-6..2^8
+    auto mant_f = esimd_local::convert<float>(mant) * (1.0f / 8.0f);
+    auto normal = two_pow * (1.0f + mant_f);                // 2^(e-7)*(1+mant/8)
+    auto subnorm = esimd_local::convert<float>(mant) * (1.0f / 512.0f);       // mant*2^-9
+    auto absval = normal;
+    absval.merge(subnorm, exp == esimd_local::simd<uint16_t, N>(0));
+    auto val = absval;
+    val.merge(-absval, s != esimd_local::simd<uint16_t, N>(0));
+    return val;
+}
+}  // namespace esimd_vec
 
 inline int nvfp4_dpas_ksplit_factor(int m_tiles, int k_tiles, int n_tiles) {
     static int target = [] {
@@ -843,6 +1011,790 @@ inline void matmul_nvfp4_grouped_rows_xe2_v2(
                             if ((row - offset) < count)
                                 C[(size_t)row * N + n] = float_to_bf16(c[t][m] * inv_dst);
                         }
+                    }
+                }
+            });
+    });
+}
+
+// xe2v3: block-loaded B via ESIMD lsc_load_2d + ESIMD xmx::dpas (FULL ESIMD — no
+// SPIRV __spirv_SubgroupMatrixMultiplyAccumulateINTEL, whose spir64 codegen would
+// clash with ESIMD's genx64 codegen and fail at link/runtime). One work-group per
+// (expert, n-tile), 16 lanes. dpas is PER-LANE REPLICATED (each lane holds the
+// full 8x16 result tile), so the 16 lanes parallelise across m-tiles: lane l owns
+// m-tile (tile0+l), all sharing the same replicated block-loaded B. B is fetched
+// from the coalesced layout [n/16][k/16][16][8] with one lsc_load_2d per (n_tile,
+// k_tile). Arithmetic e2m1*e4m3 dequant (no global LUT).
+//   B VNNI layout (validated by src/nvfp4_dpas_probe.cpp, layout L2):
+//     B[(kp*N + n)*2 + kparity], kp=k/2, kparity 0=even(low nibble)/1=odd(high).
+//   A row-major [M,K]: A[m*K+k];  C row-major [M,N]: C[m*N+n].
+inline void matmul_nvfp4_grouped_rows_xe2_v3(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int K,
+    const int32_t* expert_offsets,
+    const int32_t* rows_per_expert,
+    int localE,
+    const uint8_t* const* W_coal_by_expert,
+    const uint8_t* const* W_scale_by_expert,
+    const float* const* dst_scale_by_expert,
+    int N,
+    bf16* C)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        throw std::runtime_error("xe2v3 grouped NVFP4 matmul requires K%16 and N%16");
+    if (localE <= 0) return;
+    namespace esimd = sycl::ext::intel::esimd;
+    namespace xmx = sycl::ext::intel::esimd::xmx;
+    namespace esimd_x = sycl::ext::intel::experimental::esimd;
+    using bf16_t = sycl::ext::oneapi::bfloat16;
+    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
+    constexpr int TN = 16;  // dpas N (cols) per tile  = ExecutionSize
+    constexpr int TK = 16;  // dpas K (contraction)    = SystolicDepth * OpsPerChannel
+    constexpr int LANES = 16;
+    constexpr int BW = 8;   // n-row width in bytes (TK/2 nibble-pairs)
+    // Block-load geometry: lsc_load_2d has a minimum pitch of 16 bytes, so an
+    // 8-byte-wide row cannot be loaded at pitch 8 (the HW rounds pitch up to 16,
+    // reading every other n-row). Load 16-byte rows x 8 rows instead (pitch 16 ==
+    // contiguous for the 128-byte slab). Each register row r holds TWO 8-byte
+    // n-rows: col 0..7 -> n=2r, col 8..15 -> n=2r+1. (Isolate probe: a=b=c=0.)
+    constexpr int LBW = 16;
+    constexpr int LBH = 8;
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / TK;
+    int ntiles = N / TN;
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)ntiles * LANES),
+                              sycl::range<2>(1, LANES)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int e = (int)it.get_group(0);
+                int lane = (int)it.get_local_id(1);
+                int nt = (int)it.get_group(1);
+                int offset = expert_offsets[e];
+                int count = rows_per_expert[e];
+                if (count <= 0) return;
+                int mt = (count + TM - 1) / TM;
+
+                const uint8_t* wcoal = W_coal_by_expert[e];
+                const uint8_t* ws = W_scale_by_expert[e];
+                // base of this n_tile's coalesced region: [n_tile][k_tile][16][8],
+                // each (n_tile, k_tile) slab is 128 contiguous bytes (16 rows x 8).
+                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
+                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
+
+                for (int tile0 = 0; tile0 < mt; tile0 += LANES) {
+                    int m_tile = tile0 + lane;        // each lane owns one m-tile
+                    bool active = (m_tile < mt);
+                    esimd::simd<float, TM * TN> c(0.0f);
+                    for (int kt = 0; kt < ktiles; ++kt) {
+                        // --- B: block-load (n_tile, k_tile) slab (replicated) ---
+                        // LBW=16, LBH=8: register row r -> n=2r (col0..7), n=2r+1
+                        // (col8..15); each byte holds k=2kp (low) & k=2kp+1 (high).
+                        auto v = esimd_x::lsc_load_2d<uint8_t, LBW, LBH, /*NBlocks*/1,
+                                                       /*Transposed*/false,
+                                                       /*Transformed*/false>(
+                            wcoal_nt + (size_t)kt * 128,
+                            LBW - 1, LBH - 1, LBW - 1, 0, 0);
+                        // Replicated load: every lane holds the full slab. Dequant to
+                        // VNNI layout L2: b[(kp*N+n)*2 + kparity], kparity 0=even
+                        // (low nibble), 1=odd (high nibble). Validated by dpas probe.
+                        esimd::simd<bf16_t, TK * TN> b;
+                        #pragma unroll
+                        for (int r = 0; r < LBH; ++r) {
+                            #pragma unroll
+                            for (int c = 0; c < LBW; ++c) {
+                                int n = (c < BW) ? 2 * r : 2 * r + 1;
+                                int kp = c & (BW - 1);
+                                uint8_t byte = v[r * LBW + c];
+                                float wscale =
+                                    nvfp4_e4m3_fast(ws[(size_t)kt * N + nt * TN + n]);
+                                float lo = nvfp4_e2m1_fast(byte & 0x0f) * wscale;
+                                float hi = nvfp4_e2m1_fast(byte >> 4) * wscale;
+                                b[(kp * TN + n) * 2 + 0] = bf16_t(lo);
+                                b[(kp * TN + n) * 2 + 1] = bf16_t(hi);
+                            }
+                        }
+                        // --- A: this lane's m-tile, row-major [TM, TK] ---
+                        esimd::simd<bf16_t, TM * TK> a;
+                        #pragma unroll
+                        for (int m = 0; m < TM; ++m) {
+                            int row = offset + m_tile * TM + m;
+                            bool ok = active && ((row - offset) < count);
+                            if (ok) {
+                                float ascale =
+                                    nvfp4_e4m3_fast(A_scale[(size_t)row * ktiles + kt]);
+                                #pragma unroll
+                                for (int k = 0; k < TK; ++k) {
+                                uint8_t byte = A_packed[(size_t)row * halfK + (kt * TK + k) / 2];
+                                uint8_t nib = (k & 1) ? ((byte >> 4) & 0x0f)
+                                                      : (byte & 0x0f);
+                                    a[m * TK + k] =
+                                        bf16_t(nvfp4_e2m1_fast(nib) * ascale);
+                                }
+                            } else {
+                                #pragma unroll
+                                for (int k = 0; k < TK; ++k) a[m * TK + k] = bf16_t(0.0f);
+                            }
+                        }
+                        // --- C += A @ B (dpas: Result = C + A*B; B is VNNI) ---
+                        c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
+                    }
+                    // --- store this lane's 8x16 result tile ---
+                    if (active) {
+                        #pragma unroll
+                        for (int m = 0; m < TM; ++m) {
+                            int row = offset + m_tile * TM + m;
+                            if ((row - offset) >= count) continue;
+                            #pragma unroll
+                            for (int n = 0; n < TN; ++n)
+                                C[(size_t)row * N + nt * TN + n] =
+                                    float_to_bf16(c[m * TN + n] * inv_dst);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+// xe2v4: vectorized-dequant rewrite of v3. Same launch geometry and lane->m-tile
+// mapping (one WG per (expert, n-tile), 16 lanes, B block-loaded+replicated, lanes
+// split the m-tiles), but the e2m1/e4m3 dequant is vectorized over ESIMD simd ops
+// instead of per-byte scalar loops — the dominant cost in v3. B is transposed
+// (n-outer -> kp-outer) via 8 strided selects to match dpas VNNI layout L2 (the
+// only layout the dpas probe accepted). The block-load register linear order
+// equals the flat slab order: v[i]=byte(n=i/8, kp=i%8), so the transpose is a
+// 16x8 -> 8x16 matrix transpose (kp/n field swap), not a gather.
+inline void matmul_nvfp4_grouped_rows_xe2_v4(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int K,
+    const int32_t* expert_offsets,
+    const int32_t* rows_per_expert,
+    int localE,
+    const uint8_t* const* W_coal_by_expert,
+    const uint8_t* const* W_scale_by_expert,
+    const float* const* dst_scale_by_expert,
+    int N,
+    bf16* C)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        throw std::runtime_error("xe2v4 grouped NVFP4 matmul requires K%16 and N%16");
+    if (localE <= 0) return;
+    namespace esimd = sycl::ext::intel::esimd;
+    namespace xmx = sycl::ext::intel::esimd::xmx;
+    namespace esimd_x = sycl::ext::intel::experimental::esimd;
+    using bf16_t = sycl::ext::oneapi::bfloat16;
+    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
+    constexpr int TN = 16;  // dpas N (cols) per tile  = ExecutionSize
+    constexpr int TK = 16;  // dpas K (contraction)    = SystolicDepth * OpsPerChannel
+    constexpr int LANES = 16;
+    constexpr int LBW = 16;  // block-load width (bytes); pitch==width => contiguous 128B
+    constexpr int LBH = 8;   // block-load height (rows)
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / TK;
+    int ntiles = N / TN;
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)ntiles * LANES),
+                              sycl::range<2>(1, LANES)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int e = (int)it.get_group(0);
+                int lane = (int)it.get_local_id(1);
+                int nt = (int)it.get_group(1);
+                int offset = expert_offsets[e];
+                int count = rows_per_expert[e];
+                if (count <= 0) return;
+                int mt = (count + TM - 1) / TM;
+
+                const uint8_t* wcoal = W_coal_by_expert[e];
+                const uint8_t* ws = W_scale_by_expert[e];
+                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
+                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
+
+                for (int tile0 = 0; tile0 < mt; tile0 += LANES) {
+                    int m_tile = tile0 + lane;        // each lane owns one m-tile
+                    bool active = (m_tile < mt);
+                    esimd::simd<float, TM * TN> c(0.0f);
+                    for (int kt = 0; kt < ktiles; ++kt) {
+                        // --- B: block-load the (n_tile,k_tile) slab (replicated) ---
+                        auto v = esimd_x::lsc_load_2d<uint8_t, LBW, LBH, /*NBlocks*/1,
+                                                       /*Transposed*/false,
+                                                       /*Transformed*/false>(
+                            wcoal_nt + (size_t)kt * 128,
+                            LBW - 1, LBH - 1, LBW - 1, 0, 0);
+                        // Transpose n-outer -> kp-outer: bt[kp*16+n] = v[n*8+kp].
+                        esimd::simd<uint8_t, 128> bt;
+                        #pragma unroll
+                        for (int kp = 0; kp < 8; ++kp)
+                            bt.select<16, 1>(kp * 16) = v.select<16, 8>(kp);
+                        // Dequant the 16 e4m3 weight scales for this n-tile
+                        // (contiguous in memory) via a single vectorized load+dequant.
+                        auto wscale_raw = esimd::block_load<uint8_t, 16>(
+                            ws + (size_t)kt * N + (size_t)nt * TN);
+                        auto wscale_deq = esimd_vec::e4m3<16>(
+                            esimd::convert<uint16_t>(wscale_raw));
+                        // Replicate to 128: scale[kp*16+n] = wscale_deq[n].
+                        esimd::simd<float, 128> scale;
+                        #pragma unroll
+                        for (int kp = 0; kp < 8; ++kp)
+                            scale.select<16, 1>(kp * 16) = wscale_deq;
+                        // Dequant lo/hi nibbles, scale, convert to bf16, interleave
+                        // into VNNI L2: b[(kp*16+n)*2+kparity]. Process lo then hi so
+                        // both float tiles are not live simultaneously.
+                        esimd::simd<bf16_t, TK * TN> b;
+                        {
+                            auto lo_nib = esimd::convert<uint16_t>(
+                                bt & esimd::simd<uint8_t, 128>(0x0f));
+                            auto lo_f = esimd_vec::e2m1<128>(lo_nib) * scale;
+                            b.select<128, 2>(0) = esimd::convert<bf16_t>(lo_f);
+                        }
+                        {
+                            auto hi_nib = esimd::convert<uint16_t>(
+                                bt >> 4);
+                            auto hi_f = esimd_vec::e2m1<128>(hi_nib) * scale;
+                            b.select<128, 2>(1) = esimd::convert<bf16_t>(hi_f);
+                        }
+                        // --- A: this lane's m-tile, 8 rows x 8 bytes (row-major) ---
+                        esimd::simd<bf16_t, TM * TK> a;
+                        if (active) {
+                            esimd::simd<uint8_t, 64> abytes;
+                            esimd::simd<uint8_t, TM> ascale_raw(0);
+                            #pragma unroll
+                            for (int m = 0; m < TM; ++m) {
+                                int row = offset + m_tile * TM + m;
+                                bool ok = (row - offset) < count;
+                                int safe_row = ok ? row : offset;
+                                const uint8_t* rp = A_packed +
+                                    (size_t)safe_row * halfK + (size_t)kt * (TK / 2);
+                                abytes.select<8, 1>(m * 8) =
+                                    esimd::block_load<uint8_t, 8>(rp);
+                                if (ok) ascale_raw[m] =
+                                    A_scale[(size_t)safe_row * ktiles + kt];
+                            }
+                            // Vectorized e4m3 dequant of the 8 row scales.
+                        auto ascale_deq = esimd_vec::e4m3<TM>(
+                            esimd::convert<uint16_t>(ascale_raw));
+                        // Replicate per-row scale to 64: ascale_vec[m*8+j]=ascale_deq[m].
+                        esimd::simd<float, 64> ascale_vec;
+                        #pragma unroll
+                        for (int m = 0; m < TM; ++m)
+                            ascale_vec.select<8, 1>(m * 8) =
+                                esimd::simd<float, 8>(ascale_deq[m]);
+                        {
+                            auto lo_nib = esimd::convert<uint16_t>(
+                                abytes & esimd::simd<uint8_t, 64>(0x0f));
+                            auto lo_f = esimd_vec::e2m1<64>(lo_nib) * ascale_vec;
+                            a.select<64, 2>(0) = esimd::convert<bf16_t>(lo_f);
+                        }
+                        {
+                            auto hi_nib = esimd::convert<uint16_t>(
+                                abytes >> 4);
+                            auto hi_f = esimd_vec::e2m1<64>(hi_nib) * ascale_vec;
+                            a.select<64, 2>(1) = esimd::convert<bf16_t>(hi_f);
+                        }
+                        } else {
+                            a = esimd::simd<bf16_t, TM * TK>(bf16_t(0.0f));
+                        }
+                        // --- C += A @ B (dpas: Result = C + A*B; B is VNNI) ---
+                        c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
+                    }
+                    // --- store this lane's 8x16 result tile ---
+                    if (active) {
+                        #pragma unroll
+                        for (int m = 0; m < TM; ++m) {
+                            int row = offset + m_tile * TM + m;
+                            if ((row - offset) >= count) continue;
+                            #pragma unroll
+                            for (int n = 0; n < TN; ++n)
+                                C[(size_t)row * N + nt * TN + n] =
+                                    float_to_bf16(c[m * TN + n] * inv_dst);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+// v5: same full-ESIMD (block_load + xmx::dpas) kernel as v4, but lanes own
+// N-tiles instead of M-tiles. v4 wasted 50-94% of dpas calls because ESIMD
+// subgroups are lockstep: all 16 lanes ran the full kt-loop even when only
+// 1-8 M-tiles were active (MoE, small mt). By making each lane own one
+// N-tile (ntiles=88 >= 16 -> all 16 lanes busy), dpas calls drop 14.7x at
+// p=512. Roles swap vs v4: A is now SHARED across lanes (one M-tile, loaded
+// redundantly/coalesced) and B is PER-LANE (each lane's own N-tile, loaded
+// from the coalesced weight layout via a contiguous 128B block_load). The
+// dequant arithmetic is identical to v4; only the load site + loop nesting
+// differ. The M-tile dimension becomes an inner sequential loop (was the
+// lane-parallel tile0 loop in v4).
+inline void matmul_nvfp4_grouped_rows_xe2_v5(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int K,
+    const int32_t* expert_offsets,
+    const int32_t* rows_per_expert,
+    int localE,
+    const uint8_t* const* W_coal_by_expert,
+    const uint8_t* const* W_scale_by_expert,
+    const float* const* dst_scale_by_expert,
+    int N,
+    bf16* C)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        throw std::runtime_error("xe2v5 grouped NVFP4 matmul requires K%16 and N%16");
+    if (localE <= 0) return;
+    namespace esimd = sycl::ext::intel::esimd;
+    namespace xmx = sycl::ext::intel::esimd::xmx;
+    using bf16_t = sycl::ext::oneapi::bfloat16;
+    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
+    constexpr int TN = 16;  // dpas N (cols) per tile  = ExecutionSize
+    constexpr int TK = 16;  // dpas K (contraction)    = SystolicDepth * OpsPerChannel
+    constexpr int LANES = 16;
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / TK;
+    int ntiles = N / TN;
+    int nchunks = (ntiles + LANES - 1) / LANES;
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)nchunks * LANES),
+                              sycl::range<2>(1, LANES)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int e = (int)it.get_group(0);
+                int lane = (int)it.get_local_id(1);
+                int nt_chunk = (int)it.get_group(1);
+                int nt = nt_chunk * LANES + lane;       // this lane's N-tile
+                int offset = expert_offsets[e];
+                int count = rows_per_expert[e];
+                if (count <= 0) return;
+                int mt = (count + TM - 1) / TM;
+                if (nt >= ntiles) return;               // tail lanes of last chunk
+
+                const uint8_t* wcoal = W_coal_by_expert[e];
+                const uint8_t* ws = W_scale_by_expert[e];
+                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
+                const uint8_t* ws_nt = ws + (size_t)nt * TN;
+                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
+
+                for (int m_tile = 0; m_tile < mt; ++m_tile) {
+                    esimd::simd<float, TM * TN> c(0.0f);
+                    for (int kt = 0; kt < ktiles; ++kt) {
+                        // --- B: this lane's own N-tile slab (128B contiguous) ---
+                        auto v = esimd::block_load<uint8_t, 128>(
+                            wcoal_nt + (size_t)kt * 128);
+                        // Transpose n-outer -> kp-outer: bt[kp*16+n] = v[n*8+kp].
+                        esimd::simd<uint8_t, 128> bt;
+                        #pragma unroll
+                        for (int kp = 0; kp < 8; ++kp)
+                            bt.select<16, 1>(kp * 16) = v.select<16, 8>(kp);
+                        // Dequant the 16 e4m3 weight scales for this N-tile.
+                        auto wscale_raw = esimd::block_load<uint8_t, 16>(
+                            ws_nt + (size_t)kt * N);
+                        auto wscale_deq = esimd_vec::e4m3<16>(
+                            esimd::convert<uint16_t>(wscale_raw));
+                        esimd::simd<float, 128> scale;
+                        #pragma unroll
+                        for (int kp = 0; kp < 8; ++kp)
+                            scale.select<16, 1>(kp * 16) = wscale_deq;
+                        esimd::simd<bf16_t, TK * TN> b;
+                        {
+                            auto lo_nib = esimd::convert<uint16_t>(
+                                bt & esimd::simd<uint8_t, 128>(0x0f));
+                            auto lo_f = esimd_vec::e2m1<128>(lo_nib) * scale;
+                            b.select<128, 2>(0) = esimd::convert<bf16_t>(lo_f);
+                        }
+                        {
+                            auto hi_nib = esimd::convert<uint16_t>(
+                                bt >> 4);
+                            auto hi_f = esimd_vec::e2m1<128>(hi_nib) * scale;
+                            b.select<128, 2>(1) = esimd::convert<bf16_t>(hi_f);
+                        }
+                        // --- A: shared M-tile, 8 rows x 8 bytes (row-major) ---
+                        esimd::simd<uint8_t, 64> abytes;
+                        esimd::simd<uint8_t, TM> ascale_raw(0);
+                        #pragma unroll
+                        for (int m = 0; m < TM; ++m) {
+                            int row = offset + m_tile * TM + m;
+                            bool ok = (row - offset) < count;
+                            int safe_row = ok ? row : offset;
+                            const uint8_t* rp = A_packed +
+                                (size_t)safe_row * halfK + (size_t)kt * (TK / 2);
+                            abytes.select<8, 1>(m * 8) =
+                                esimd::block_load<uint8_t, 8>(rp);
+                            if (ok) ascale_raw[m] =
+                                A_scale[(size_t)safe_row * ktiles + kt];
+                        }
+                        auto ascale_deq = esimd_vec::e4m3<TM>(
+                            esimd::convert<uint16_t>(ascale_raw));
+                        esimd::simd<float, 64> ascale_vec;
+                        #pragma unroll
+                        for (int m = 0; m < TM; ++m)
+                            ascale_vec.select<8, 1>(m * 8) =
+                                esimd::simd<float, 8>(ascale_deq[m]);
+                        esimd::simd<bf16_t, TM * TK> a;
+                        {
+                            auto lo_nib = esimd::convert<uint16_t>(
+                                abytes & esimd::simd<uint8_t, 64>(0x0f));
+                            auto lo_f = esimd_vec::e2m1<64>(lo_nib) * ascale_vec;
+                            a.select<64, 2>(0) = esimd::convert<bf16_t>(lo_f);
+                        }
+                        {
+                            auto hi_nib = esimd::convert<uint16_t>(
+                                abytes >> 4);
+                            auto hi_f = esimd_vec::e2m1<64>(hi_nib) * ascale_vec;
+                            a.select<64, 2>(1) = esimd::convert<bf16_t>(hi_f);
+                        }
+                        // --- C += A @ B (dpas: per-lane, own A & B) ---
+                        c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
+                    }
+                    // --- store this lane's 8x16 result tile ---
+                    #pragma unroll
+                    for (int m = 0; m < TM; ++m) {
+                        int row = offset + m_tile * TM + m;
+                        if ((row - offset) >= count) continue;
+                        #pragma unroll
+                        for (int n = 0; n < TN; ++n)
+                            C[(size_t)row * N + nt * TN + n] =
+                                float_to_bf16(c[m * TN + n] * inv_dst);
+                    }
+                }
+            });
+    });
+}
+
+// v6: parallelize M across work-groups (best of both regimes).
+// v5 serialized the M-tiles in an inner loop, which dominated latency when mt
+// was large (e.g. p=8192 -> mt=8 -> ~8x slower than onednn-loop). v6 lifts m_tile
+// into the work-group grid: dim0 = localE*max_mt, so each work-group does exactly
+// one (expert, m_tile, n_chunk). The 16 lanes still own N-tiles (small-batch win
+// preserved: at mt=1 the grid collapses to v5's shape). B for a given (expert,
+// n_chunk) is loaded by mt work-groups but hits L2; A is unique per (expert, m_tile).
+inline void matmul_nvfp4_grouped_rows_xe2_v6(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int K,
+    const int32_t* expert_offsets,
+    const int32_t* rows_per_expert,
+    int localE,
+    int max_mt,
+    const uint8_t* const* W_coal_by_expert,
+    const uint8_t* const* W_scale_by_expert,
+    const float* const* dst_scale_by_expert,
+    int N,
+    bf16* C)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        throw std::runtime_error("xe2v6 grouped NVFP4 matmul requires K%16 and N%16");
+    if (localE <= 0 || max_mt <= 0) return;
+    namespace esimd = sycl::ext::intel::esimd;
+    namespace xmx = sycl::ext::intel::esimd::xmx;
+    using bf16_t = sycl::ext::oneapi::bfloat16;
+    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
+    constexpr int TN = 16;  // dpas N (cols) per tile  = ExecutionSize
+    constexpr int TK = 16;  // dpas K (contraction)    = SystolicDepth * OpsPerChannel
+    constexpr int LANES = 16;
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / TK;
+    int ntiles = N / TN;
+    int nchunks = (ntiles + LANES - 1) / LANES;
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)localE * max_mt, (size_t)nchunks * LANES),
+                              sycl::range<2>(1, LANES)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int em = (int)it.get_group(0);
+                int e = em / max_mt;
+                int m_tile = em % max_mt;
+                int lane = (int)it.get_local_id(1);
+                int nt_chunk = (int)it.get_group(1);
+                int nt = nt_chunk * LANES + lane;       // this lane's N-tile
+                int offset = expert_offsets[e];
+                int count = rows_per_expert[e];
+                if (count <= 0) return;
+                int mt = (count + TM - 1) / TM;
+                if (m_tile >= mt) return;                // expert has fewer M-tiles than max_mt
+                if (nt >= ntiles) return;                // tail lanes of last chunk
+
+                const uint8_t* wcoal = W_coal_by_expert[e];
+                const uint8_t* ws = W_scale_by_expert[e];
+                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
+                const uint8_t* ws_nt = ws + (size_t)nt * TN;
+                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
+
+                esimd::simd<float, TM * TN> c(0.0f);
+                for (int kt = 0; kt < ktiles; ++kt) {
+                    // --- B: this lane's own N-tile slab (128B contiguous) ---
+                    auto v = esimd::block_load<uint8_t, 128>(
+                        wcoal_nt + (size_t)kt * 128);
+                    // Transpose n-outer -> kp-outer: bt[kp*16+n] = v[n*8+kp].
+                    esimd::simd<uint8_t, 128> bt;
+                    #pragma unroll
+                    for (int kp = 0; kp < 8; ++kp)
+                        bt.select<16, 1>(kp * 16) = v.select<16, 8>(kp);
+                    // Dequant the 16 e4m3 weight scales for this N-tile.
+                    auto wscale_raw = esimd::block_load<uint8_t, 16>(
+                        ws_nt + (size_t)kt * N);
+                    auto wscale_deq = esimd_vec::e4m3<16>(
+                        esimd::convert<uint16_t>(wscale_raw));
+                    esimd::simd<float, 128> scale;
+                    #pragma unroll
+                    for (int kp = 0; kp < 8; ++kp)
+                        scale.select<16, 1>(kp * 16) = wscale_deq;
+                    esimd::simd<bf16_t, TK * TN> b;
+                    {
+                        auto lo_nib = esimd::convert<uint16_t>(
+                            bt & esimd::simd<uint8_t, 128>(0x0f));
+                        auto lo_f = esimd_vec::e2m1<128>(lo_nib) * scale;
+                        b.select<128, 2>(0) = esimd::convert<bf16_t>(lo_f);
+                    }
+                    {
+                        auto hi_nib = esimd::convert<uint16_t>(
+                            bt >> 4);
+                        auto hi_f = esimd_vec::e2m1<128>(hi_nib) * scale;
+                        b.select<128, 2>(1) = esimd::convert<bf16_t>(hi_f);
+                    }
+                    // --- A: this M-tile, 8 rows x 8 bytes (row-major) ---
+                    esimd::simd<uint8_t, 64> abytes;
+                    esimd::simd<uint8_t, TM> ascale_raw(0);
+                    #pragma unroll
+                    for (int m = 0; m < TM; ++m) {
+                        int row = offset + m_tile * TM + m;
+                        bool ok = (row - offset) < count;
+                        int safe_row = ok ? row : offset;
+                        const uint8_t* rp = A_packed +
+                            (size_t)safe_row * halfK + (size_t)kt * (TK / 2);
+                        abytes.select<8, 1>(m * 8) =
+                            esimd::block_load<uint8_t, 8>(rp);
+                        if (ok) ascale_raw[m] =
+                            A_scale[(size_t)safe_row * ktiles + kt];
+                    }
+                    auto ascale_deq = esimd_vec::e4m3<TM>(
+                        esimd::convert<uint16_t>(ascale_raw));
+                    esimd::simd<float, 64> ascale_vec;
+                    #pragma unroll
+                    for (int m = 0; m < TM; ++m)
+                        ascale_vec.select<8, 1>(m * 8) =
+                            esimd::simd<float, 8>(ascale_deq[m]);
+                    esimd::simd<bf16_t, TM * TK> a;
+                    {
+                        auto lo_nib = esimd::convert<uint16_t>(
+                            abytes & esimd::simd<uint8_t, 64>(0x0f));
+                        auto lo_f = esimd_vec::e2m1<64>(lo_nib) * ascale_vec;
+                        a.select<64, 2>(0) = esimd::convert<bf16_t>(lo_f);
+                    }
+                    {
+                        auto hi_nib = esimd::convert<uint16_t>(
+                            abytes >> 4);
+                        auto hi_f = esimd_vec::e2m1<64>(hi_nib) * ascale_vec;
+                        a.select<64, 2>(1) = esimd::convert<bf16_t>(hi_f);
+                    }
+                    // --- C += A @ B (dpas: per-lane, own A & B) ---
+                    c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
+                }
+                // --- store this lane's 8x16 result tile ---
+                #pragma unroll
+                for (int m = 0; m < TM; ++m) {
+                    int row = offset + m_tile * TM + m;
+                    if ((row - offset) >= count) continue;
+                    #pragma unroll
+                    for (int n = 0; n < TN; ++n)
+                        C[(size_t)row * N + nt * TN + n] =
+                            float_to_bf16(c[m * TN + n] * inv_dst);
+                }
+            });
+    });
+}
+
+// v7: SLM-cached B (hardware-aligned fix for the large-batch latency gap).
+// v5/v6 reload B from global every m_tile (mt times) and every kt; at large mt this
+// dominates latency (global block_load stalls, ~4% of 608 GB/s peak -> NOT BW bound but
+// stall/occupancy bound). v7 dequants B once per kt-chunk into SLM (128 KB available, unused
+// by v5/v6), then all mt m_tiles read B from SLM (~5-10 cyc) instead of global.
+// gateup full B = 360 KB > 128 KB -> kt-chunk KC=8 (64 KB chunk); down full B = 90 KB fits.
+// mt (<=8) live float accumulators persist across kt-chunks. Structure = v5 (lanes->N-tiles,
+// M-tile serial inner loop); v6's M-parallelism reverted (it gave no speedup, down p=8192
+// byte-identical v5/v6 -> latency not parallelism is the lever).
+inline void matmul_nvfp4_grouped_rows_xe2_v7(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int K,
+    const int32_t* expert_offsets,
+    const int32_t* rows_per_expert,
+    int localE,
+    const uint8_t* const* W_coal_by_expert,
+    const uint8_t* const* W_scale_by_expert,
+    const float* const* dst_scale_by_expert,
+    int N,
+    bf16* C)
+{
+    if (K % 16 != 0 || N % 16 != 0)
+        throw std::runtime_error("xe2v7 grouped NVFP4 matmul requires K%16 and N%16");
+    if (localE <= 0) return;
+    namespace esimd = sycl::ext::intel::esimd;
+    namespace xmx = sycl::ext::intel::esimd::xmx;
+    using bf16_t = sycl::ext::oneapi::bfloat16;
+    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
+    constexpr int TN = 16;   // dpas N (cols) per tile  = ExecutionSize
+    constexpr int TK = 16;   // dpas K (contraction)    = SystolicDepth * OpsPerChannel
+    constexpr int LANES = 16;
+    constexpr int KC = 8;    // kt-chunk size (SLM budget: KC*128*16 = 16KB? -> see below)
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / TK;
+    int ntiles = N / TN;
+    int nchunks = (ntiles + LANES - 1) / LANES;
+
+    // SLM layout: per lane per kt, the dequantized B is simd<bf16_t,TK*TN> = 256 bf16 = 512 B.
+    // Slot offset(ki,lane) = ki*(LANES*512) + lane*512. Full chunk = KC*LANES*512 =
+    // 8*16*512 = 65536 B = 64 KB (fits 128 KB). One code path for gateup/down (KC=8).
+    constexpr int SLM_SIZE = KC * LANES * 512;
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)nchunks * LANES),
+                              sycl::range<2>(1, LANES)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                esimd::slm_init<SLM_SIZE>();
+                int e = (int)it.get_group(0);
+                int lane = (int)it.get_local_id(1);
+                int nt_chunk = (int)it.get_group(1);
+                int nt = nt_chunk * LANES + lane;       // this lane's N-tile
+                int offset = expert_offsets[e];
+                int count = rows_per_expert[e];
+                if (count <= 0) return;
+                int mt = (count + TM - 1) / TM;
+                if (nt >= ntiles) return;               // tail lanes of last chunk
+
+                const uint8_t* wcoal = W_coal_by_expert[e];
+                const uint8_t* ws = W_scale_by_expert[e];
+                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
+                const uint8_t* ws_nt = ws + (size_t)nt * TN;
+                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
+
+                // mt live accumulators (persist across kt-chunks).
+                esimd::simd<float, TM * TN> acc[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) acc[i] = esimd::simd<float, TM * TN>(0.0f);
+
+                int kchunks = (ktiles + KC - 1) / KC;
+                for (int kc = 0; kc < kchunks; ++kc) {
+                    int kt_base = kc * KC;
+                    int kt_end = kt_base + KC;
+                    if (kt_end > ktiles) kt_end = ktiles;
+                    int kc_len = kt_end - kt_base;
+
+                    // --- Load + dequant this chunk's B into SLM (once per chunk) ---
+                    #pragma unroll
+                    for (int ki = 0; ki < KC; ++ki) {
+                        int kt = kt_base + ki;
+                        uint32_t slm_off = (uint32_t)ki * LANES * 512 + (uint32_t)lane * 512;
+                        if (kt < kt_end) {
+                            auto v = esimd::block_load<uint8_t, 128>(
+                                wcoal_nt + (size_t)kt * 128);
+                            // Transpose n-outer -> kp-outer: bt[kp*16+n] = v[n*8+kp].
+                            esimd::simd<uint8_t, 128> bt;
+                            #pragma unroll
+                            for (int kp = 0; kp < 8; ++kp)
+                                bt.select<16, 1>(kp * 16) = v.select<16, 8>(kp);
+                            auto wscale_raw = esimd::block_load<uint8_t, 16>(
+                                ws_nt + (size_t)kt * N);
+                            auto wscale_deq = esimd_vec::e4m3<16>(
+                                esimd::convert<uint16_t>(wscale_raw));
+                            esimd::simd<float, 128> scale;
+                            #pragma unroll
+                            for (int kp = 0; kp < 8; ++kp)
+                                scale.select<16, 1>(kp * 16) = wscale_deq;
+                            esimd::simd<bf16_t, TK * TN> b;
+                            {
+                                auto lo_nib = esimd::convert<uint16_t>(
+                                    bt & esimd::simd<uint8_t, 128>(0x0f));
+                                auto lo_f = esimd_vec::e2m1<128>(lo_nib) * scale;
+                                b.select<128, 2>(0) = esimd::convert<bf16_t>(lo_f);
+                            }
+                            {
+                                auto hi_nib = esimd::convert<uint16_t>(
+                                    bt >> 4);
+                                auto hi_f = esimd_vec::e2m1<128>(hi_nib) * scale;
+                                b.select<128, 2>(1) = esimd::convert<bf16_t>(hi_f);
+                            }
+                            esimd::slm_block_store(slm_off, b);
+                        }
+                    }
+
+                    // --- For every m_tile, dpas using A(global) + B(SLM) ---
+                    for (int m_tile = 0; m_tile < mt; ++m_tile) {
+                        esimd::simd<float, TM * TN>& c = acc[m_tile];
+                        #pragma unroll
+                        for (int ki = 0; ki < KC; ++ki) {
+                            int kt = kt_base + ki;
+                            if (kt >= kt_end) break;
+                            uint32_t slm_off = (uint32_t)ki * LANES * 512 + (uint32_t)lane * 512;
+                            auto b = esimd::slm_block_load<bf16_t, TK * TN>(slm_off);
+                            // --- A: this M-tile, 8 rows x 8 bytes (row-major) ---
+                            esimd::simd<uint8_t, 64> abytes;
+                            esimd::simd<uint8_t, TM> ascale_raw(0);
+                            #pragma unroll
+                            for (int m = 0; m < TM; ++m) {
+                                int row = offset + m_tile * TM + m;
+                                bool ok = (row - offset) < count;
+                                int safe_row = ok ? row : offset;
+                                const uint8_t* rp = A_packed +
+                                    (size_t)safe_row * halfK + (size_t)kt * (TK / 2);
+                                abytes.select<8, 1>(m * 8) =
+                                    esimd::block_load<uint8_t, 8>(rp);
+                                if (ok) ascale_raw[m] =
+                                    A_scale[(size_t)safe_row * ktiles + kt];
+                            }
+                            auto ascale_deq = esimd_vec::e4m3<TM>(
+                                esimd::convert<uint16_t>(ascale_raw));
+                            esimd::simd<float, 64> ascale_vec;
+                            #pragma unroll
+                            for (int m = 0; m < TM; ++m)
+                                ascale_vec.select<8, 1>(m * 8) =
+                                    esimd::simd<float, 8>(ascale_deq[m]);
+                            esimd::simd<bf16_t, TM * TK> a;
+                            {
+                                auto lo_nib = esimd::convert<uint16_t>(
+                                    abytes & esimd::simd<uint8_t, 64>(0x0f));
+                                auto lo_f = esimd_vec::e2m1<64>(lo_nib) * ascale_vec;
+                                a.select<64, 2>(0) = esimd::convert<bf16_t>(lo_f);
+                            }
+                            {
+                                auto hi_nib = esimd::convert<uint16_t>(
+                                    abytes >> 4);
+                                auto hi_f = esimd_vec::e2m1<64>(hi_nib) * ascale_vec;
+                                a.select<64, 2>(1) = esimd::convert<bf16_t>(hi_f);
+                            }
+                            c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
+                        }
+                    }
+                }
+
+                // --- store all m_tiles' results ---
+                #pragma unroll
+                for (int m_tile = 0; m_tile < 8; ++m_tile) {
+                    if (m_tile >= mt) break;
+                    esimd::simd<float, TM * TN>& c = acc[m_tile];
+                    #pragma unroll
+                    for (int m = 0; m < TM; ++m) {
+                        int row = offset + m_tile * TM + m;
+                        if ((row - offset) >= count) continue;
+                        #pragma unroll
+                        for (int n = 0; n < TN; ++n)
+                            C[(size_t)row * N + nt * TN + n] =
+                                float_to_bf16(c[m * TN + n] * inv_dst);
                     }
                 }
             });
