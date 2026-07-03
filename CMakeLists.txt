@@ -153,3 +153,74 @@ target_link_options(diffusion_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_I
 target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_server PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
+# NVFP4 expert-kernel roofline benchmark (random weights, no model). Header-only
+# GPU deps (engine/buffer/nvfp4/device_select); links only oneDNN. The spirv-ext
+# link option is required for __spirv_SubgroupMatrixMultiplyAccumulateINTEL
+# (xe2/xe2v2 DPAS kernels), matching diffusion_gemma/diffusion_bench.
+add_executable(nvfp4_roofline_bench src/nvfp4_roofline_bench.cpp)
+target_compile_options(nvfp4_roofline_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_roofline_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_roofline_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(nvfp4_roofline_bench PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
+# Phase 0, Probe 1 — oneDNN batched f4_e2m1 matmul feasibility (host-side).
+# SYCL + oneDNN only; needs the engine singleton. Mirrors get_device_props:70-73.
+add_executable(nvfp4_batched_probe src/nvfp4_batched_probe.cpp)
+target_compile_options(nvfp4_batched_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_batched_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_libraries(nvfp4_batched_probe PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
+# Phase 1 numerical-correctness probe for matmul_nvfp4_packed_batched.
+# Hand-verifiable deterministic case (all-1.0 A, K-contiguous 2.0/even-k W).
+# Includes nvfp4.hpp (DPAS intrinsics) => needs the spirv-ext link option.
+add_executable(nvfp4_batched_check src/nvfp4_batched_check.cpp)
+target_compile_options(nvfp4_batched_check PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_batched_check PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_batched_check PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(nvfp4_batched_check PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
+# Phase 0, Probe 2 — hand-rolled Intel block-2D-load primitive (device-side).
+# Uses __builtin_IB_subgroup_createBlock2DAddressPayload + lsc_load_block2d.ugm
+# inline-asm. The spirv-ext link option is required for the Xe subgroup builtins,
+# matching nvfp4_roofline_bench / diffusion_bench above.
+add_executable(nvfp4_blockload_probe src/nvfp4_blockload_probe.cpp)
+target_compile_options(nvfp4_blockload_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_blockload_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_blockload_probe PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(nvfp4_blockload_probe PRIVATE DNNL::dnnl)
+
+# Phase-2 probe: esimd::dpas operand/layout determination for the full-ESIMD
+# xe2v3 kernel (lsc_load_2d + esimd::dpas). Mirrors the blockload probe.
+add_executable(nvfp4_dpas_probe src/nvfp4_dpas_probe.cpp)
+target_compile_options(nvfp4_dpas_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_dpas_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_libraries(nvfp4_dpas_probe PRIVATE DNNL::dnnl)
+
+# Phase-2 probe: determine esimd::dpas operand-distribution semantics across the
+# 16-lane subgroup (per-lane independent vs. N-distributed) by giving lanes
+# DIFFERENT A/B. Decides the lane->work mapping for the full-ESIMD xe2v3 kernel.
+add_executable(nvfp4_dpas_dist_probe src/nvfp4_dpas_dist_probe.cpp)
+target_compile_options(nvfp4_dpas_dist_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_dpas_dist_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_libraries(nvfp4_dpas_dist_probe PRIVATE DNNL::dnnl)
+
+# Phase-2 isolation probe: replicate xe2v3's single-tile data path with known
+# data and dump lane-0's dequanted A / VNNI B / result c vs host ground-truth.
+# Locates the v3 correctness bug (A-load / B-load / dpas stage).
+add_executable(nvfp4_xe2v3_isolate src/nvfp4_xe2v3_isolate.cpp)
+target_compile_options(nvfp4_xe2v3_isolate PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_xe2v3_isolate PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_libraries(nvfp4_xe2v3_isolate PRIVATE DNNL::dnnl)
+
+# Phase-2 probe: validate vectorized (ESIMD simd) arithmetic e2m1 dequant vs the
+# scalar nvfp4_e2m1_fast LUT, as the foundation for the v4 vectorized-dequant
+# kernel. Uses only esimd::simd ops (convert/merge/operators), no SPIRV intrinsic.
+add_executable(nvfp4_vec_dequant_probe src/nvfp4_vec_dequant_probe.cpp)
+target_compile_options(nvfp4_vec_dequant_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_vec_dequant_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_libraries(nvfp4_vec_dequant_probe PRIVATE DNNL::dnnl)

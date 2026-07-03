@@ -26,7 +26,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 #   https://github.com/uxlfoundation/oneDNN/releases
 # (releases land roughly quarterly; v3.5 confirmed, 2026 releases scheduled
 # Feb/May/Aug). Bump this arg to the version you want.
-ARG ONEDNN_VERSION=v3.12
+ARG ONEDNN_VERSION=v3.14
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build git ca-certificates \
