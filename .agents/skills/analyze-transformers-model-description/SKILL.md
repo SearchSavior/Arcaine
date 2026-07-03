@@ -10,10 +10,22 @@ description: >
   architecture so the implementation is hardware-aware from the beginning
 ---
 
+---
+name: analyze-transformers-model-description
+description: >
+  Analyze a Hugging Face transformers model and implement its inference pipeline in SYCL.
+  Use this skill whenever the task involves porting, implementing, or optimizing a
+  transformers architecture (LLM, VLM, encoder, or any modality) as SYCL kernels or a
+  SYCL runtime — including when the user mentions oneAPI, DPC++, Intel GPUs, Level Zero,
+  a "custom inference engine", or asks to run a Hugging Face checkpoint without Python.
+  Builds on the hardware report from the check-available-hardware skill so the
+  implementation is hardware-aware from the beginning.
+---
+
 # Transformers → SYCL implementation
 
 This skill covers the full path from a Hugging Face checkpoint to a correct SYCL
-implementation: hardware discovery, architecture analysis, weight loading (including
+implementation: reviewing the hardware report, architecture analysis, weight loading (including
 quantized checkpoints), a correctness-first kernel plan, and validation against the
 reference implementation.
 
@@ -21,41 +33,25 @@ Work through the phases in order. Do not start writing kernels before Phases 1�
 done — most failed ports come from guessing at the architecture or the hardware instead
 of reading both.
 
-## Phase 1 — Query the hardware
+## Phase 1 — Review the hardware report
 
-The implementation must be informed by the actual device it will run on, not a generic
-GPU mental model. Before writing any code, gather and record:
+Device discovery is handled by the `check-available-hardware` skill, which should
+already have run before this one. The target is always an Intel Xe GPU on the Level
+Zero backend. Do not re-enumerate devices or write probe programs; read the report that
+skill produced and pull out the values that will drive kernel decisions:
 
-```bash
-sycl-ls --verbose          # enumerate platforms/devices (Level Zero, OpenCL, CUDA/HIP backends)
-```
+- **Xe generation** (Xe-HPG, Xe-HPC, …) and Xe-core/EU count.
+- **Sub-group sizes** available (typically 8/16/32) and max work-group size.
+- **Local (shared) memory per work-group** and max USM allocation size.
+- **fp16 / bf16 support** and whether XMX is usable via
+  `sycl::ext::oneapi::experimental::matrix::joint_matrix`.
+- **oneMKL / oneDNN availability** — prefer library GEMMs over hand-written ones unless
+  the task explicitly requires custom kernels.
 
-Then, from a small SYCL probe program (or `clinfo` / vendor tools if available), record
-for the target device:
-
-- **Backend and architecture**: Level Zero vs OpenCL vs CUDA/HIP backend; vendor
-  architecture (e.g., Intel Xe-HPG/Xe-HPC, NVIDIA SM version). This decides which
-  extensions you may use.
-- **Compute geometry**: max work-group size, sub-group sizes supported
-  (`info::device::sub_group_sizes` — Intel devices typically expose 8/16/32), number of
-  compute units (EUs/Xe-cores/SMs).
-- **Memory**: global memory size, local (shared) memory per work-group, max allocation
-  size, USM support (`usm_device_allocations`, `usm_shared_allocations`,
-  `usm_host_allocations`).
-- **Data types**: `fp16` support (`aspect::fp16`), `fp64` support, and whether
-  matrix/joint-matrix extensions are available
-  (`sycl::ext::oneapi::experimental::matrix` — XMX on Intel, tensor cores via the CUDA
-  backend).
-- **Runtime libraries present**: oneMKL / oneDNN availability. Prefer library GEMMs over
-  hand-written ones unless the task explicitly requires custom kernels.
-
-Write these findings into a short `hardware_report.md` in the project. Kernel choices
-later (tile sizes, sub-group size, whether to use joint_matrix, whether activations fit
-in local memory) must reference this report rather than assumed values.
-
-If no GPU is present, note it and target the SYCL CPU device — the correctness workflow
-is identical, and it is often the best environment to validate numerics before touching
-device-specific tuning.
+If the hardware report is missing, run `check-available-hardware` first rather than
+probing manually. Kernel choices later (tile sizes, sub-group size, whether to use
+joint_matrix, whether activations fit in local memory) must reference the reported
+values rather than assumed ones.
 
 ## Phase 2 — Analyze the model from its files
 
@@ -175,9 +171,10 @@ Correctness is defined as matching the Hugging Face implementation, layer by lay
 
 ## Working style
 
-- Keep the three artifacts current as understanding evolves: `hardware_report.md`,
-  `architecture.md`, and the tensor-mapping table. They are the contract between
-  analysis and implementation.
+- Keep the two artifacts this skill owns current as understanding evolves:
+  `architecture.md` and the tensor-mapping table. Together with the hardware report
+  from `check-available-hardware`, they are the contract between analysis and
+  implementation.
 - When the transformers code and your expectation disagree, the code wins; when the
   checkpoint files and the docs disagree, the files win.
 - Surface every assumption you were forced to make (unsupported extension, missing
