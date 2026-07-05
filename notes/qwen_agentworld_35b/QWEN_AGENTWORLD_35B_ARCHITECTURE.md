@@ -358,20 +358,39 @@ form all match. The `input_global_scale` factor is correctly applied in the acti
 (`nvfp4.hpp:754,765,774`). **No kernel dequant changes required.** The remaining work is
 loader-only (§10.4).
 
-### 10.4 Loader action items (Phase 5, item 1) — NVFP4 integration
+### 10.4 NVFP4 integration status — ALREADY IMPLEMENTED by existing diffusion_gemma loader
 
-The kernel is correct; the loader must adapt the checkpoint layout to the kernel's expected layout:
+**Phase 4 conclusion (revised): the NVFP4 loader mechanics are fully solved and reusable.**
+The existing `diffusion_gemma` (26B) model uses the **identical** compressed-tensors
+`nvfp4-pack-quantized` scheme, and its loader + struct + dispatch already implement every
+action item. The new Qwen3.5 model reuses them with different key prefixes — **no kernel or
+struct changes required.**
 
-1. **Strip key prefix.** Checkpoint keys are prefixed `model.language_model.`; `lm_head.weight`
-   is top-level (unprefixed). Strip the prefix and handle `lm_head` separately.
-2. **Repack `weight_scale`** from checkpoint `[N, K/16]` → kernel layout `[K/16, N]`
-   (`nvfp4_xe2v3_isolate.cpp:85` reads `W_sc[(k/16)*N + n]`).
-3. **Fold globals → `dst_scale`.** `dst_scale = input_global_scale · weight_global_scale`
-   (both F32[1] per quant Linear). Feed the stored `input_global_scale` into the activation
-   packer's `input_global_scale[]` array param (plumbing exists at `expert_parallel.cpp:393,399,726,730`;
-   bench `nvfp4_roofline_bench.cpp:253` forces it to 1.0 — the **real loader must read the
-   stored F32[1] value**, not hardcode 1.0).
-4. **`weight_packed`** needs **no repack** — nibble order already matches (low=lower-K).
+Existing infrastructure (verified by code read):
+- `Nvfp4Linear` struct — `src/common/gpu/nvfp4.hpp:35-52`: already has `input_global_scale`,
+  `weight_global_scale`, `weight_packed`, `weight_scale` (transposed `[K/16,N]`), `dst_scale`
+  (1-elem F32). Exactly the 4-tensor checkpoint scheme + folded `dst_scale`.
+- `upload_nvfp4_scales_transposed` — `src/modeling/diffusion_gemma/loader.cpp:277-294`:
+  already transposes `weight_scale` from checkpoint `[N, K/16]` → kernel `[K/16, N]`
+  (comment: "model layout: (N, K/16)").
+- `upload_nvfp4_linear` — `loader.cpp:296-321`: already reads both globals (F32[1]) and folds
+  `dst_scale = input_global_scale * weight_global_scale` (line 317).
+- `upload_nvfp4_linear_pair` — `loader.cpp:323-388`: fused gate+up (concat separate
+  checkpoint gate/up into one `Nvfp4Linear` with `out=2*half`), folds + transposes.
+- Expert dispatch — `src/common/gpu/expert_parallel.cpp`: per-expert `gate_up_proj_fp4` /
+  `down_proj_fp4` (Nvfp4Linear), `input_global_scale` plumbed (lines 393,399,726,730),
+  kernels parametric in expert count `E`.
+
+What the new Qwen3.5 model module must do (wiring, not mechanics):
+1. **Key prefixes**: call `upload_nvfp4_linear(sf, "model.language_model.layers.<i>.mlp.experts.<e>.<proj>", q)` for each quantized Linear. `lm_head` is top-level (prefix `"lm_head"`). No prefix-strip function needed — the prefix is just the string passed to `sf.get()`.
+2. **Routed experts (256)**: fuse gate+up via `upload_nvfp4_linear_pair` → `gate_up_proj_fp4`; load down via `upload_nvfp4_linear` → `down_proj_fp4`. ~512 Nvfp4Linears. Dispatch is parametric in `E` (verify E=256 path; 26B used 128).
+3. **Shared expert**: same 2 calls (gate+up fused + down) → 2 Nvfp4Linears per layer.
+4. **Full-attn q/k/v/o (10 layers)**: 4× `upload_nvfp4_linear` each.
+5. **Linear-attn `out_proj` (30 layers)**: 1× `upload_nvfp4_linear` each.
+6. **BF16 (unquantized)**: `in_proj_qkv/z/a/b`, `conv1d`, `A_log`, `dt_bias`, `norm`, `q_norm`/`k_norm`, router `mlp.gate`, `shared_expert_gate`, embeddings, `lm_head` — plain BF16 uploads.
+
+Net: the NVFP4 path is **de-risked and free**. The real Phase 5 work is the greenfield
+Gated DeltaNet kernels, the full-attn output gate, and the shared-expert per-token gate.
 
 ## 11. Phase 5 — Kernel Porting Plan
 

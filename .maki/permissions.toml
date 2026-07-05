@@ -9,4 +9,6 @@ allow = [
     "head *",
     "find *",
     "docker *",
+    "grep *",
+    "awk *",
 ]

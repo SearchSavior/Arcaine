@@ -47,6 +47,7 @@ set_target_properties(onnxruntime PROPERTIES
 set(COMMON_SRCS
     src/register_builtins.cpp
     src/common/registry.cpp
+    src/common/io/quant_loader.cpp
     src/common/preprocess/tokenizer.cpp
     src/common/preprocess/chat_template.cpp
     src/common/preprocess/image_proc.cpp
@@ -63,8 +64,14 @@ set(GEMMA4_SRCS
     src/modeling/gemma4_unified/register.cpp
 )
 
+set(QWEN_SRCS
+    src/modeling/qwen3_5_moe/loader.cpp
+    src/modeling/qwen3_5_moe/model.cpp
+    src/modeling/qwen3_5_moe/register.cpp
+)
+
 # All built-in architectures linked into the inference/bench binaries.
-set(ARCH_SRCS ${GEMMA4_SRCS})
+set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS})
 
 # ---------------------------------------------------------------------------
 add_executable(get_device_props src/utils/gpu_check.cpp)
@@ -78,6 +85,9 @@ set_target_properties(get_device_props PROPERTIES
 add_executable(gemma4 src/main.cpp ${COMMON_SRCS} ${ARCH_SRCS})
 target_compile_options(gemma4 PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(gemma4   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+# ARCH_SRCS now pulls qwen3_5_moe (NVFP4 loader) + common/quant_loader.cpp, both
+# of which include nvfp4.hpp -> __spirv_SubgroupMatrixMultiplyAccumulateINTEL.
+target_link_options(gemma4 PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(gemma4 PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(gemma4 PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
@@ -107,6 +117,8 @@ target_link_libraries(test_chat_template_kwargs  PRIVATE DNNL::dnnl)
 add_executable(bench src/bench.cpp ${COMMON_SRCS} ${ARCH_SRCS})
 target_compile_options(bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(bench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+# See gemma4: ARCH_SRCS / COMMON_SRCS include nvfp4.hpp-bearing loader TUs.
+target_link_options(bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(bench PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(bench PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
@@ -118,6 +130,7 @@ set_target_properties(bench PROPERTIES
 set(DIFFUSION_SRCS
     src/common/preprocess/tokenizer.cpp
     src/common/preprocess/chat_template.cpp
+    src/common/io/quant_loader.cpp
     src/modeling/diffusion_gemma/loader.cpp
     src/modeling/diffusion_gemma/moe.cpp
     src/common/gpu/expert_parallel.cpp
@@ -153,6 +166,104 @@ target_link_options(diffusion_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_I
 target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_server PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Qwen3.5-MoE NVFP4 loader smoke test. Loads real checkpoint weights
+# (no kernels) and verifies tensor-name resolution, scale transpose
+# [N,K/16]->[K/16,N], dst_scale folding, and per-layer struct population.
+# Usage: qwen_load_smoke [model_dir] [max_layers]
+# NOTE: the loader harness only needs loader.cpp + quant_loader.cpp; it does
+# not construct QwenModel or register the arch, so model.cpp/register.cpp are
+# deliberately excluded (they would otherwise pull build_chat_prompt/register_arch
+# into the link line).
+add_executable(qwen_load_smoke
+    src/qwen_load_smoke.cpp
+    src/common/io/quant_loader.cpp
+    src/modeling/qwen3_5_moe/loader.cpp)
+target_compile_options(qwen_load_smoke PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_load_smoke PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+# nvfp4.hpp (included transitively) pulls __spirv_SubgroupMatrixMultiplyAccumulateINTEL;
+# the translator needs the extension even though this binary runs no DPAS kernel.
+target_link_options(qwen_load_smoke PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen_load_smoke PRIVATE DNNL::dnnl)
+
+# qwen_kernels_selfcheck: build-verify + GPU smoke for qwen3_5_moe/kernels.hpp.
+# An unused inline SYCL lambda is not device-codegen'd, so calling each kernel
+# once (this TU) is what forces SPIR-V codegen and validates the device bodies.
+# Compile in arcaine-dev-1 (SPIR-V codegen needs no physical GPU); run in
+# arcaine-dev-run-* to exercise on the BMG G31. Numerical validation vs the HF
+# reference is Phase 6; this is the milestone-2 build/run smoke.
+add_executable(qwen_kernels_selfcheck src/qwen_kernels_selfcheck.cpp)
+target_compile_options(qwen_kernels_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_kernels_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_kernels_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen_kernels_selfcheck PRIVATE DNNL::dnnl)
+
+# qwen_attn_selfcheck: milestone-3 build/run smoke for the Qwen full-attention
+# forward (modeling/qwen3_5_moe/attention.hpp). Loads one full-attn layer's real
+# NVFP4 + BF16(+1) weights straight from the checkpoint (no MoE / no QwenWeights)
+# and runs qwen_full_attention_forward on a synthetic hidden, checking finiteness,
+# determinism, and zero-input->zero-output; exercises both prefill and decode
+# paths. Build in arcaine-dev-1 (SPIR-V codegen needs no GPU); run in
+# arcaine-dev-run-* with ARCAINE_QWEN_MODEL_DIR=<qwen checkpoint dir> (and
+# optional ARCAINE_QWEN_ATTN_LAYER=<full-attn idx, default 3>). Numerical
+# validation vs HF is Phase 6 (deferred).
+add_executable(qwen_attn_selfcheck
+    src/qwen_attn_selfcheck.cpp
+    src/common/io/quant_loader.cpp)
+target_compile_options(qwen_attn_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_attn_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_attn_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen_attn_selfcheck PRIVATE DNNL::dnnl)
+
+# qwen_moe_selfcheck: milestone-4 build/run smoke for the Qwen MoE block forward
+# (modeling/qwen3_5_moe/moe.hpp). Loads one layer's full MoE block (router BF16,
+# 256 routed NVFP4 experts, shared NVFP4 expert, shared_expert_gate BF16) from the
+# checkpoint and runs qwen_moe_forward on a synthetic hidden, checking finiteness,
+# determinism, nonzeroness, and zero-input->zero-output; exercises prefill + decode.
+# Build in arcaine-dev-1; run in arcaine-dev-run-* with
+# ARCAINE_QWEN_MODEL_DIR=<qwen checkpoint dir> (optional ARCAINE_QWEN_MOE_LAYER=<idx>).
+add_executable(qwen_moe_selfcheck
+    src/qwen_moe_selfcheck.cpp
+    src/common/io/quant_loader.cpp)
+target_compile_options(qwen_moe_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_moe_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_moe_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen_moe_selfcheck PRIVATE DNNL::dnnl)
+
+# qwen_deltanet_selfcheck: milestone-5 build/run smoke for the Qwen Gated DeltaNet
+# (modeling/qwen3_5_moe/gated_deltanet.hpp). Loads one linear-attn layer's real
+# BF16 (in_proj_qkv/z/a/b, conv1d, A_log, dt_bias, norm) + NVFP4 (out_proj)
+# weights from the checkpoint and runs qwen_linear_attn_forward on a synthetic
+# hidden, checking prefill finite/deterministic/nonzero/zero-in->zero-out, decode
+# finite/deterministic, AND prefill(N)[last] == prefill(N-1)+decode equivalence
+# (cross-validates host chunked vs device recurrent core). Build in arcaine-dev-1;
+# run in arcaine-dev-run-* with ARCAINE_QWEN_MODEL_DIR=<qwen checkpoint dir>
+# (optional ARCAINE_QWEN_DELTANET_LAYER=<linear-attn idx, default 0>).
+add_executable(qwen_deltanet_selfcheck
+    src/qwen_deltanet_selfcheck.cpp
+    src/common/io/quant_loader.cpp)
+target_compile_options(qwen_deltanet_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_deltanet_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_deltanet_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen_deltanet_selfcheck PRIVATE DNNL::dnnl)
+
+# qwen_forward_selfcheck: milestone-6 end-to-end forward-loop smoke. Constructs a
+# layer-capped QwenModel (ARCAINE_QWEN_MAX_LAYERS, default 4 here) and drives
+# forward_tokens directly with synthetic token ids (bypassing the BPE tokenizer,
+# which still has the null-bos_token bug). Checks logits size/finite/nonzero/
+# not-degenerate/deterministic, decode finite, and reset_cache reproducibility.
+# Links the full COMMON+ARCH sources (same as gemma4 minus main.cpp) so all
+# transitive deps (chat_template/tokenizer/image_proc/audio_proc + registrars)
+# resolve; needs the spirv-ext option (nvfp4.hpp) and onnxruntime/soxr (audio deps).
+add_executable(qwen_forward_selfcheck src/qwen_forward_selfcheck.cpp ${COMMON_SRCS} ${ARCH_SRCS})
+target_compile_options(qwen_forward_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_forward_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen_forward_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen_forward_selfcheck PRIVATE DNNL::dnnl soxr onnxruntime)
+set_target_properties(qwen_forward_selfcheck PROPERTIES
+    BUILD_RPATH "${ORT_DIR}/lib"
+    INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
 # NVFP4 expert-kernel roofline benchmark (random weights, no model). Header-only
