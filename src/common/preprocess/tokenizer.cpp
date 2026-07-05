@@ -1,4 +1,5 @@
 #include "tokenizer.hpp"
+#include "unicode.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <stdexcept>
@@ -62,6 +63,13 @@ Tokenizer Tokenizer::from_json(const std::string& path) {
         tok.merge_rank_[a + " " + b] = i;
     }
 
+    // Detect GPT-2 / Qwen2 byte-level BPE via a ByteLevel decoder. Gemma's
+    // SentencePiece tokenizer has no ByteLevel decoder, so this discriminates
+    // the two families and selects the encode/decode path below.
+    if (j.contains("decoder") && j["decoder"].value("type", std::string{}) == "ByteLevel") {
+        tok.byte_level_ = true;
+    }
+
     return tok;
 }
 
@@ -79,8 +87,16 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
     auto encode_span = [&](const std::string& span, std::vector<int>& out) {
         if (span.empty()) return;
 
-        // Byte-level pre-tokenization: map each UTF-8 byte to its piece.
-        // Gemma tokenizer uses a sentinel "▁" (U+2581) for text-start / spaces.
+        if (byte_level_) {
+            // Qwen2 / GPT-2: regex pre-tokenize (custom Qwen2 scanner ported
+            // from llama.cpp), then byte-encode each word and run BPE merges.
+            for (const auto& word : byte_level_pretokenize(span)) {
+                byte_level_encode(word, out);
+            }
+            return;
+        }
+
+        // Gemma: ▁ (U+2581) sentinel marks text-start / word boundaries.
         std::string t = at_text_start ? ("▁" + span) : span;
         at_text_start = false;
         std::string processed;
@@ -180,10 +196,35 @@ std::string Tokenizer::decode(const std::vector<int>& ids, bool skip_special,
         if (id < 0 || id >= (int)id_to_piece_.size()) continue;
         if (skip_special && special_token_ids_.count(id)) continue;
         const std::string& piece = id_to_piece_[id];
-        // Replace leading "▁" with space (except very first)
-        if (!piece.empty()) {
+        if (piece.empty()) continue;
+
+        if (byte_level_) {
+            // Special tokens (when kept) are emitted verbatim; normal BPE
+            // pieces are mapped char-by-char back to their original bytes via
+            // the reverse GPT-2 byte map.
+            if (special_token_ids_.count(id)) {
+                out += piece;
+            } else {
+                size_t i = 0;
+                while (i < piece.size()) {
+                    int len = (int)unicode_len_utf8(piece[i]);
+                    if (len < 1 || i + (size_t)len > piece.size()) {
+                        out += piece[i];
+                        ++i;
+                        continue;
+                    }
+                    std::string ch = piece.substr(i, (size_t)len);
+                    try {
+                        out.push_back((char)unicode_utf8_to_byte(ch));
+                    } catch (...) {
+                        out += ch;  // unknown char: emit raw bytes
+                    }
+                    i += (size_t)len;
+                }
+            }
+        } else {
+            // Gemma: replace ▁ (U+2581, 3 bytes E2 96 81) with space.
             std::string p = piece;
-            // "▁" is 3 bytes: E2 96 81
             size_t pos = 0;
             while ((pos = p.find("\xe2\x96\x81", pos)) != std::string::npos) {
                 p.replace(pos, 3, " ");
@@ -192,8 +233,10 @@ std::string Tokenizer::decode(const std::vector<int>& ids, bool skip_special,
             out += p;
         }
     }
-    // Strip leading space artifact
-    if (strip_leading_space && !out.empty() && out[0] == ' ') out = out.substr(1);
+    // Strip leading space artifact (Gemma ▁ sentinel). Never meaningful for
+    // byte-level BPE: a leading space is a real token (Ġ), not an artifact.
+    if (strip_leading_space && !byte_level_ && !out.empty() && out[0] == ' ')
+        out = out.substr(1);
     return out;
 }
 
@@ -208,4 +251,70 @@ int Tokenizer::token_id(const std::string& token) const {
     auto vit = vocab_.find(token);
     if (vit != vocab_.end()) return vit->second;
     throw std::runtime_error("Tokenizer token not found: " + token);
+}
+
+// ---- GPT-2 / Qwen2 byte-level BPE ----
+
+std::vector<std::string> Tokenizer::byte_level_pretokenize(const std::string& span) const {
+    std::vector<std::string> words;
+    if (span.empty()) return words;
+    const auto cpts = unicode_cpts_from_utf8(span);
+    std::vector<size_t> offsets = { cpts.size() };
+    const auto bpe_offsets = unicode_regex_split_custom_qwen2(span, offsets);
+    words.reserve(bpe_offsets.size());
+    size_t start = 0;
+    for (size_t len : bpe_offsets) {
+        std::string w;
+        for (size_t i = start; i < start + len; ++i) {
+            w += unicode_cpt_to_utf8(cpts[i]);
+        }
+        words.push_back(std::move(w));
+        start += len;
+    }
+    return words;
+}
+
+void Tokenizer::byte_level_encode(const std::string& word, std::vector<int>& out) const {
+    if (word.empty()) return;
+    // Byte-encode: one GPT-2 unicode char per original byte.
+    std::vector<std::string> symbols;
+    symbols.reserve(word.size());
+    for (unsigned char c : word) {
+        symbols.push_back(unicode_byte_to_utf8(c));
+    }
+    // BPE merges: scan for the global minimum-rank pair (leftmost wins on
+    // ties), merge, repeat. Equivalent to HF tokenizers' heap-based merge_all
+    // and to llama.cpp's bigram queue.
+    bool changed = true;
+    while (changed && symbols.size() > 1) {
+        changed = false;
+        int best_rank = std::numeric_limits<int>::max();
+        int best_pos  = -1;
+        for (int j = 0; j + 1 < (int)symbols.size(); ++j) {
+            std::string pair = symbols[j] + " " + symbols[j + 1];
+            auto it = merge_rank_.find(pair);
+            if (it != merge_rank_.end() && it->second < best_rank) {
+                best_rank = it->second;
+                best_pos  = j;
+            }
+        }
+        if (best_pos < 0) break;
+        symbols[best_pos] = symbols[best_pos] + symbols[best_pos + 1];
+        symbols.erase(symbols.begin() + best_pos + 1);
+        changed = true;
+    }
+    // Emit token ids. Every final symbol should be in vocab (all 256 byte-chars
+    // and their learned merges are present); fall back to byte-chars otherwise.
+    for (const auto& sym : symbols) {
+        auto it = vocab_.find(sym);
+        if (it != vocab_.end()) {
+            out.push_back(it->second);
+        } else {
+            for (unsigned char b : sym) {
+                std::string bc = unicode_byte_to_utf8(b);
+                auto bit = vocab_.find(bc);
+                if (bit != vocab_.end()) out.push_back(bit->second);
+            }
+        }
+    }
 }

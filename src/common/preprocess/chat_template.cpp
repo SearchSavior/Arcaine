@@ -32,22 +32,32 @@ std::string read_file(const std::string& path) {
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
+// Read a string field from tokenizer_config.json, returning "" when the key
+// is absent or null. Qwen3.5 ships bos_token=null / unk_token=null; the raw
+// .at(k).get<std::string>() throws a type_error on JSON null, and .value(k,"")
+// also throws when the key is present-but-null, so guard explicitly.
+std::string string_or_empty(const json& t, const char* key) {
+    if (!t.contains(key)) return std::string();
+    const auto& v = t.at(key);
+    return v.is_string() ? v.get<std::string>() : std::string();
+}
+
 TokenizerMetadata load_tokenizer_metadata(const std::string& model_dir) {
     std::ifstream f(model_dir + "/tokenizer_config.json");
     if (!f) throw std::runtime_error("Cannot open " + model_dir + "/tokenizer_config.json");
     auto t = json::parse(f);
 
     TokenizerMetadata meta;
-    meta.bos_token   = t.at("bos_token").get<std::string>();
-    meta.eos_token   = t.at("eos_token").get<std::string>();
-    meta.boi_token   = t.value("boi_token", std::string());
-    meta.eoi_token   = t.value("eoi_token", std::string());
-    meta.image_token = t.value("image_token", std::string());
-    meta.boa_token   = t.value("boa_token", std::string());
-    meta.eoa_token   = t.value("eoa_token", std::string());
-    meta.audio_token = t.value("audio_token", std::string());
+    meta.bos_token   = string_or_empty(t, "bos_token");
+    meta.eos_token   = string_or_empty(t, "eos_token");
+    meta.boi_token   = string_or_empty(t, "boi_token");
+    meta.eoi_token   = string_or_empty(t, "eoi_token");
+    meta.image_token = string_or_empty(t, "image_token");
+    meta.boa_token   = string_or_empty(t, "boa_token");
+    meta.eoa_token   = string_or_empty(t, "eoa_token");
+    meta.audio_token = string_or_empty(t, "audio_token");
     if (t.contains("video_token")) {
-        meta.video_token = t.at("video_token").get<std::string>();
+        meta.video_token = string_or_empty(t, "video_token");
     } else if (t.contains("extra_special_tokens") && !t.at("extra_special_tokens").empty()) {
         meta.video_token = t.at("extra_special_tokens").at(0).get<std::string>();
     }

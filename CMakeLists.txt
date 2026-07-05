@@ -44,6 +44,14 @@ set_target_properties(onnxruntime PROPERTIES
 #   common/         — architecture-independent engine (registry, preprocessing, ...)
 #   modeling/<arch> — one directory per model architecture; add a sibling to extend.
 # ---------------------------------------------------------------------------
+# Plain-C++ Unicode tables + helpers (ported from llama.cpp, MIT) used by
+# tokenizer.cpp for Qwen2/GPT-2 byte-level BPE. Linked into every target that
+# compiles tokenizer.cpp.
+set(UNICODE_SRCS
+    src/common/preprocess/unicode.cpp
+    src/common/preprocess/unicode-data.cpp
+)
+
 set(COMMON_SRCS
     src/register_builtins.cpp
     src/common/registry.cpp
@@ -52,6 +60,7 @@ set(COMMON_SRCS
     src/common/preprocess/chat_template.cpp
     src/common/preprocess/image_proc.cpp
     src/common/preprocess/audio_proc.cpp
+    ${UNICODE_SRCS}
 )
 
 set(GEMMA4_SRCS
@@ -94,7 +103,7 @@ set_target_properties(gemma4 PROPERTIES
     INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
-add_executable(test_tokenizer src/common/test_tokenizer.cpp src/common/preprocess/tokenizer.cpp)
+add_executable(test_tokenizer src/common/test_tokenizer.cpp src/common/preprocess/tokenizer.cpp ${UNICODE_SRCS})
 target_compile_options(test_tokenizer PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(test_tokenizer   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_libraries(test_tokenizer PRIVATE DNNL::dnnl)
@@ -106,7 +115,8 @@ target_link_libraries(test_tokenizer PRIVATE DNNL::dnnl)
 add_executable(test_chat_template_kwargs
     src/utils/test_chat_template_kwargs.cpp
     src/common/preprocess/chat_template.cpp
-    src/common/preprocess/tokenizer.cpp)
+    src/common/preprocess/tokenizer.cpp
+    ${UNICODE_SRCS})
 target_compile_options(test_chat_template_kwargs PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(test_chat_template_kwargs    PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_libraries(test_chat_template_kwargs  PRIVATE DNNL::dnnl)
@@ -131,6 +141,7 @@ set(DIFFUSION_SRCS
     src/common/preprocess/tokenizer.cpp
     src/common/preprocess/chat_template.cpp
     src/common/io/quant_loader.cpp
+    ${UNICODE_SRCS}
     src/modeling/diffusion_gemma/loader.cpp
     src/modeling/diffusion_gemma/moe.cpp
     src/common/gpu/expert_parallel.cpp
