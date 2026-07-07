@@ -5,8 +5,8 @@
 // Measures the production NVFP4 expert GEMM kernels against a device roofline
 // across the expert M regime, using random NVFP4 weights (no model file, no
 // loader, no diffusion forward pass). Default kernel = onednn-loop, the hybrid
-// baseline (E separate matmul_nvfp4_packed calls). The hand-rolled xe2 / xe2v2 /
-// custom grouped kernels and a dense oneDNN reference are wired behind --kernels
+// baseline (E separate matmul_nvfp4_packed calls). The hand-rolled xe2 / custom
+// grouped kernels and a dense oneDNN reference are wired behind --kernels
 // so they can be A/B'd later with no code change.
 //
 // Kernels are called DIRECTLY (not via run_shard), so the production dispatch
@@ -26,11 +26,11 @@
 //
 // A/B the hand-rolled kernels against the reference:
 //   ZE_AFFINITY_MASK=0 ./build/nvfp4_roofline_bench \
-//       --kernels onednn-loop,xe2v2,xe2,custom -p 512,1024,2048,8192
+//       --kernels onednn-loop,xe2,custom -p 512,1024,2048,8192
 //
 // Correctness wiring check (loose; random weights — catches pointer/stride bugs):
 //   ZE_AFFINITY_MASK=0 ./build/nvfp4_roofline_bench \
-//       --kernels onednn-loop,xe2v2,custom --check -p 512 --experts 4 --shapes gateup
+//       --kernels onednn-loop,xe2,custom --check -p 512 --experts 4 --shapes gateup
 
 #include <algorithm>
 #include <cctype>
@@ -54,22 +54,16 @@ namespace {
 
 using bf16 = uint16_t;  // mirrors buffer.hpp
 
-enum class Kernel { OnednnLoop, OnednnBatched, OnednnDense, Xe2, Xe2v2, Xe2v3, Xe2v4, Xe2v5, Xe2v6, Xe2v7, Custom };
+enum class Kernel { OnednnLoop, OnednnBatched, OnednnDense, Xe2, Custom };
 
 Kernel parse_kernel(const std::string& s) {
     if (s == "onednn-loop")    return Kernel::OnednnLoop;
     if (s == "onednn-batched") return Kernel::OnednnBatched;
     if (s == "onednn-dense")   return Kernel::OnednnDense;
     if (s == "xe2")            return Kernel::Xe2;
-    if (s == "xe2v2")          return Kernel::Xe2v2;
-    if (s == "xe2v3")          return Kernel::Xe2v3;
-    if (s == "xe2v4")          return Kernel::Xe2v4;
-    if (s == "xe2v5")          return Kernel::Xe2v5;
-    if (s == "xe2v6")          return Kernel::Xe2v6;
-    if (s == "xe2v7")          return Kernel::Xe2v7;
     if (s == "custom")         return Kernel::Custom;
     throw std::runtime_error("unknown kernel '" + s +
-        "' (use: onednn-loop, onednn-batched, onednn-dense, xe2, xe2v2, xe2v3, xe2v4, xe2v5, xe2v6, xe2v7, custom)");
+        "' (use: onednn-loop, onednn-batched, onednn-dense, xe2, custom)");
 }
 const char* kernel_name(Kernel k) {
     switch (k) {
@@ -77,12 +71,6 @@ const char* kernel_name(Kernel k) {
         case Kernel::OnednnBatched: return "onednn-batched";
         case Kernel::OnednnDense:   return "onednn-dense";
         case Kernel::Xe2:           return "xe2";
-        case Kernel::Xe2v2:         return "xe2v2";
-        case Kernel::Xe2v3:         return "xe2v3";
-        case Kernel::Xe2v4:         return "xe2v4";
-        case Kernel::Xe2v5:         return "xe2v5";
-        case Kernel::Xe2v6:         return "xe2v6";
-        case Kernel::Xe2v7:         return "xe2v7";
         case Kernel::Custom:         return "custom";
     }
     return "?";
@@ -122,7 +110,7 @@ void usage(const char* p) {
     std::fprintf(stderr,
         "Usage: %s [options]\n"
         "  -p <csv>          total rows across experts (default 512,1024,2048,8192)\n"
-        "  --kernels <csv>   onednn-loop|onednn-dense|xe2|xe2v2|custom (default onednn-loop,\n"
+        "  --kernels <csv>   onednn-loop|onednn-dense|xe2|custom (default onednn-loop,\n"
         "                    or $DIFF_NVFP4_ROOFLINE_KERNELS if set)\n"
         "  --shapes <csv>    gateup|down|K:N (default gateup,down)\n"
         "  --experts <E>     expert count (default 128)\n"
@@ -227,8 +215,8 @@ int main(int argc, char** argv) {
 
     bool need_grouped = false, need_coal = false, need_batched = false;
     for (auto k : selected) {
-        if (k == Kernel::Xe2 || k == Kernel::Xe2v2 || k == Kernel::Xe2v3 || k == Kernel::Xe2v4 || k == Kernel::Xe2v5 || k == Kernel::Xe2v6 || k == Kernel::Xe2v7 || k == Kernel::Custom) need_grouped = true;
-        if (k == Kernel::Xe2 || k == Kernel::Xe2v3 || k == Kernel::Xe2v4 || k == Kernel::Xe2v5 || k == Kernel::Xe2v6 || k == Kernel::Xe2v7) need_coal = true;
+        if (k == Kernel::Xe2 || k == Kernel::Custom) need_grouped = true;
+        if (k == Kernel::Xe2) need_coal = true;
         if (k == Kernel::OnednnBatched) need_batched = true;
     }
 
@@ -284,18 +272,27 @@ int main(int argc, char** argv) {
         }
 
         // ---- batched weight buffers [E,K,N] f4 (tag::acb, K-contiguous per
-        // batch, matching the single kernel's tag::ba on {K,N}) + [E,G,N] f8
-        // (tag::abc, N-contiguous). Built by concatenating the per-expert packed
-        // weights (each [N,K] f4, K-contiguous) end-to-end. Shared dst_scale =
-        // W[0].dst_scale. ----
+        // batch) + [E,G,N] f8 (tag::abc, N-contiguous). The per-expert packed
+        // weight is stored [N,K] (tag::ba, K-contiguous); the batched primitive
+        // expects {B,K,N} tag::acb (K-outer, N-inner), so each expert's slab is
+        // transposed [N,K] -> [K,N] on the host during the concat. Scales are
+        // already [G,N] per expert so concatenating gives {B,G,N} directly.
+        // Shared dst_scale = W[0].dst_scale. ----
         GpuBuffer<uint8_t> W_batch, W_scale_batch;
         if (need_batched) {
             W_batch = GpuBuffer<uint8_t>((size_t)E * wp, q);
             W_scale_batch = GpuBuffer<uint8_t>((size_t)E * ws, q);
+            std::vector<uint8_t> hwp_t(wp);  // [K,N] transpose workspace
             for (int e = 0; e < E; ++e) {
                 W[e].weight_packed.download(hwp.data(), wp);
                 W[e].weight_scale.download(hws.data(), ws);
-                q.memcpy(W_batch.data() + (size_t)e * wp, hwp.data(), wp);
+                // transpose [N,K] (K-contiguous) -> [K,N] (N-contiguous),
+                // operating on packed nibble-pairs (bytes) indexed by [n, k/2].
+                const int halfK = K / 2;
+                for (int n = 0; n < N; ++n)
+                    for (int kk = 0; kk < halfK; ++kk)
+                        hwp_t[(size_t)kk * N + n] = hwp[(size_t)n * halfK + kk];
+                q.memcpy(W_batch.data() + (size_t)e * wp, hwp_t.data(), wp);
                 q.memcpy(W_scale_batch.data() + (size_t)e * ws, hws.data(), ws);
             }
             q.wait();
@@ -348,12 +345,6 @@ int main(int argc, char** argv) {
 
             GpuBuffer<bf16> C((size_t)total_rows * N, q);
 
-            int max_mt = 1;
-            for (int e = 0; e < E; ++e) {
-                int mt = (rows_per_expert[e] + 7) / 8;
-                if (mt > max_mt) max_mt = mt;
-            }
-
             auto launch = [&](Kernel k) {
                 switch (k) {
                     case Kernel::OnednnLoop:
@@ -391,49 +382,6 @@ int main(int argc, char** argv) {
                                                       row_expert_dev.data(), total_rows,
                                                       W_coal_dev.data(), W_scale_dev.data(),
                                                       dst_scale_dev.data(), N, C.data());
-                        break;
-                    case Kernel::Xe2v2:
-                        matmul_nvfp4_grouped_rows_xe2_v2(ctx, A_packed.data(), A_scale.data(), K,
-                                                         expert_offsets_dev.data(),
-                                                         rows_per_expert_dev.data(), E,
-                                                         W_packed_dev.data(), W_scale_dev.data(),
-                                                         dst_scale_dev.data(), N, C.data());
-                        break;
-                    case Kernel::Xe2v3:
-                        matmul_nvfp4_grouped_rows_xe2_v3(ctx, A_packed.data(), A_scale.data(), K,
-                                                         expert_offsets_dev.data(),
-                                                         rows_per_expert_dev.data(), E,
-                                                         W_coal_dev.data(), W_scale_dev.data(),
-                                                         dst_scale_dev.data(), N, C.data());
-                        break;
-                    case Kernel::Xe2v4:
-                        matmul_nvfp4_grouped_rows_xe2_v4(ctx, A_packed.data(), A_scale.data(), K,
-                                                         expert_offsets_dev.data(),
-                                                         rows_per_expert_dev.data(), E,
-                                                         W_coal_dev.data(), W_scale_dev.data(),
-                                                         dst_scale_dev.data(), N, C.data());
-                        break;
-                    case Kernel::Xe2v5:
-                        matmul_nvfp4_grouped_rows_xe2_v5(ctx, A_packed.data(), A_scale.data(), K,
-                                                         expert_offsets_dev.data(),
-                                                         rows_per_expert_dev.data(), E,
-                                                         W_coal_dev.data(), W_scale_dev.data(),
-                                                         dst_scale_dev.data(), N, C.data());
-                        break;
-                    case Kernel::Xe2v6:
-                        matmul_nvfp4_grouped_rows_xe2_v6(ctx, A_packed.data(), A_scale.data(), K,
-                                                         expert_offsets_dev.data(),
-                                                         rows_per_expert_dev.data(), E,
-                                                         max_mt,
-                                                         W_coal_dev.data(), W_scale_dev.data(),
-                                                         dst_scale_dev.data(), N, C.data());
-                        break;
-                    case Kernel::Xe2v7:
-                        matmul_nvfp4_grouped_rows_xe2_v7(ctx, A_packed.data(), A_scale.data(), K,
-                                                         expert_offsets_dev.data(),
-                                                         rows_per_expert_dev.data(), E,
-                                                         W_coal_dev.data(), W_scale_dev.data(),
-                                                         dst_scale_dev.data(), N, C.data());
                         break;
                     case Kernel::Custom:
                         matmul_nvfp4_grouped_rows_custom(q, A_packed.data(), A_scale.data(), K,
