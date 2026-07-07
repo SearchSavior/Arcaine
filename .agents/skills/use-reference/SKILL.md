@@ -4,6 +4,7 @@ description: >
   explore repositories under /reference/{repository_name}
 ---
 
+check available reference 
 ```
 cd workspace && ls reference 
 ```

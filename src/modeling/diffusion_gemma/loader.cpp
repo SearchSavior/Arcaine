@@ -271,17 +271,6 @@ static Int4Linear upload_int4_linear(const TensorSource& sf,
     return lin;
 }
 
-static bool fused_int4_attn_proj_enabled() {
-    static bool enabled = [] {
-        const char* e = std::getenv("DIFF_FUSED_INT4_ATTN_PROJ");
-        return e && std::strcmp(e, "0") != 0 && std::strcmp(e, "false") != 0 &&
-               std::strcmp(e, "FALSE") != 0 && std::strcmp(e, "off") != 0 &&
-               std::strcmp(e, "OFF") != 0 && std::strcmp(e, "no") != 0 &&
-               std::strcmp(e, "NO") != 0;
-    }();
-    return enabled;
-}
-
 // Fuse attention projection weights along the output dimension. The packed
 // bytes stay in oneDNN's raw s4 tag::ba layout: rows are output channels, so a
 // plain concatenation of q/k/v rows produces one larger (N_total, K) matrix.
@@ -754,8 +743,7 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
             s.q_proj = upload_linear_weight(sf, a + "q_proj", ql);
             s.k_proj = upload_linear_weight(sf, a + "k_proj", ql);
             s.v_proj = upload_linear_weight(sf, a + "v_proj", ql);
-            if (fused_int4_attn_proj_enabled() &&
-                s.q_proj.is_int4() && s.k_proj.is_int4() && s.v_proj.is_int4()) {
+            if (s.q_proj.is_int4() && s.k_proj.is_int4() && s.v_proj.is_int4()) {
                 s.qkv_proj_int4 = upload_int4_linear_concat(
                     sf, {a + "q_proj", a + "k_proj", a + "v_proj"}, ql,
                     (a + "{q,k,v}_proj").c_str());
@@ -768,8 +756,7 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
             DiffFullAttn fa;
             fa.q_proj = upload_linear_weight(sf, a + "q_proj", ql);
             fa.k_proj = upload_linear_weight(sf, a + "k_proj", ql);
-            if (fused_int4_attn_proj_enabled() &&
-                fa.q_proj.is_int4() && fa.k_proj.is_int4()) {
+            if (fa.q_proj.is_int4() && fa.k_proj.is_int4()) {
                 fa.qk_proj_int4 = upload_int4_linear_concat(
                     sf, {a + "q_proj", a + "k_proj"}, ql,
                     (a + "{q,k}_proj").c_str());

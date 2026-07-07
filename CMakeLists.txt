@@ -210,6 +210,16 @@ target_link_options(qwen_kernels_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_
 target_link_options(qwen_kernels_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(qwen_kernels_selfcheck PRIVATE DNNL::dnnl)
 
+# diffusion_attn_selfcheck: numerical self-check for the DiffusionGemma attention
+# leaf kernels (fused RMSNorm+RoPE pow/table/fused, masked softmax span/branchy)
+# in attention_kernels.hpp. Header-only deps (engine/buffer/arena); links only
+# oneDNN. Build in arcaine-dev-1 (SPIR-V codegen needs no GPU); run in
+# arcaine-dev-run-* to exercise on the BMG G31.
+add_executable(diffusion_attn_selfcheck src/diffusion_attn_selfcheck.cpp)
+target_compile_options(diffusion_attn_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(diffusion_attn_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_libraries(diffusion_attn_selfcheck PRIVATE DNNL::dnnl)
+
 # qwen_attn_selfcheck: milestone-3 build/run smoke for the Qwen full-attention
 # forward (modeling/qwen3_5_moe/attention.hpp). Loads one full-attn layer's real
 # NVFP4 + BF16(+1) weights straight from the checkpoint (no MoE / no QwenWeights)
