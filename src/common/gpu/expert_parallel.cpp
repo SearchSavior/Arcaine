@@ -58,6 +58,8 @@ static Nvfp4Kernel& g_kernel() {
             !std::strcmp(env, "pack")) return Nvfp4Kernel::Hybrid;
         if (!std::strcmp(env, "custom") || !std::strcmp(env, "grouped") ||
             !std::strcmp(env, "1")) return Nvfp4Kernel::Custom;
+        if (!std::strcmp(env, "grouped-dpas") || !std::strcmp(env, "dpas") ||
+            !std::strcmp(env, "geglu-pack")) return Nvfp4Kernel::GroupedDpas;
         return Nvfp4Kernel::Default;
     }();
     return k;
@@ -65,6 +67,29 @@ static Nvfp4Kernel& g_kernel() {
 
 static bool nvfp4_use_custom_expert_kernel() { return g_kernel() == Nvfp4Kernel::Custom; }
 static bool nvfp4_use_hybrid_expert_kernel() { return g_kernel() == Nvfp4Kernel::Hybrid; }
+static bool nvfp4_use_grouped_dpas_kernel() { return g_kernel() == Nvfp4Kernel::GroupedDpas; }
+
+// Fusion knobs for the hybrid (grouped-pack + per-expert oneDNN) path.
+// Each merges two adjacent kernels, eliminating a bf16 intermediate + a launch.
+// Bit-exact with the unfused sequence; AB-testable via env var.
+static bool nvfp4_fuse_geglu_pack() {
+    static bool v = [] {
+        const char* env = std::getenv("DIFF_NVFP4_FUSE_GEGLU_PACK");
+        if (!env) return true;          // on by default (bit-exact, pure win)
+        return std::strcmp(env, "0") && std::strcmp(env, "off") &&
+               std::strcmp(env, "false") && std::strcmp(env, "no");
+    }();
+    return v;
+}
+static bool nvfp4_fuse_scatter_pack() {
+    static bool v = [] {
+        const char* env = std::getenv("DIFF_NVFP4_FUSE_SCATTER_PACK");
+        if (!env) return true;          // on by default (device-routes mode only)
+        return std::strcmp(env, "0") && std::strcmp(env, "off") &&
+               std::strcmp(env, "false") && std::strcmp(env, "no");
+    }();
+    return v;
+}
 
 static bool nvfp4_gpu_layout_enabled() {
     static bool enabled = [] {
@@ -150,6 +175,7 @@ const char* nvfp4_kernel_name(Nvfp4Kernel kernel) {
     switch (kernel) {
         case Nvfp4Kernel::Hybrid: return "hybrid";
         case Nvfp4Kernel::Custom: return "custom";
+        case Nvfp4Kernel::GroupedDpas: return "grouped-dpas";
         default:                  return "default";
     }
 }
@@ -552,8 +578,13 @@ static void run_shard(
 
 	    auto slot_dev = ar.alloc<int32_t>(A_all);
 	    auto w_dev = ar.alloc<float>(A_all);
+	    // scatter+pack fusion (hybrid NVFP4, device-routes): skip the bf16 Xe
+	    // intermediate entirely -- the hybrid branch gathers hidden -> nvfp4.
+	    bool fuse_sp = shard.nvfp4 && nvfp4_use_hybrid_expert_kernel() &&
+	                   nvfp4_fuse_scatter_pack() && device_routes;
 	    auto Xe = ar.alloc<bf16>((size_t)total_rows * H);
-	    q.memset(Xe.data(), 0, (size_t)total_rows * H * sizeof(bf16));
+	    if (!fuse_sp)
+	        q.memset(Xe.data(), 0, (size_t)total_rows * H * sizeof(bf16));
 	    if (device_routes) {
 	        auto base_dev = ar.alloc<int32_t>(localE);
 	        auto cursor_dev = ar.alloc<int32_t>(localE);
@@ -585,14 +616,16 @@ static void run_shard(
 	        });
 	        const int32_t* slot = slot_dev.data();
 	        bf16* xe = Xe.data();
-	        q.submit([&](sycl::handler& h) {
-	            h.parallel_for(sycl::range<2>(A_all, H), [=](sycl::id<2> id) {
-	                int a = (int)id[0], d = (int)id[1];
-	                int s = slot[a];
-	                if (s >= 0)
-	                    xe[(size_t)s * H + d] = expert_in[(size_t)(a / top_k) * H + d];
+	        if (!fuse_sp) {
+	            q.submit([&](sycl::handler& h) {
+	                h.parallel_for(sycl::range<2>(A_all, H), [=](sycl::id<2> id) {
+	                    int a = (int)id[0], d = (int)id[1];
+	                    int s = slot[a];
+	                    if (s >= 0)
+	                        xe[(size_t)s * H + d] = expert_in[(size_t)(a / top_k) * H + d];
+	                });
 	            });
-	        });
+	        }
 	    } else {
 	        std::vector<int32_t> assign_token;
 	        std::vector<int32_t> assign_slot;
@@ -762,9 +795,21 @@ static void run_shard(
             auto xe_packed = ar.alloc<uint8_t>((size_t)total_rows * H / 2);
             auto xe_scale = ar.alloc<uint8_t>((size_t)total_rows * HG);
             { DIFF_PROF(q, prof.pack);
-              pack_bf16_to_nvfp4_grouped(q, Xe.data(), H,
+              if (fuse_sp) {
+                  // Scatter+pack fused: gather hidden -> nvfp4 directly, no Xe.
+                  // Padding bucket rows (beyond count[e]) stay zero from memset,
+                  // matching the unfused path where Xe=0 -> pack produces zeros.
+                  q.memset(xe_packed.data(), 0, (size_t)total_rows * H / 2);
+                  q.memset(xe_scale.data(), 0, (size_t)total_rows * HG);
+                  scatter_pack_nvfp4_grouped(q, expert_in, H,
+                                             slot_dev.data(), idx_dev, shard.first_expert,
+                                             gate_input_dev.data(), A_all, top_k,
+                                             xe_packed.data(), xe_scale.data());
+              } else {
+                  pack_bf16_to_nvfp4_grouped(q, Xe.data(), H,
                                        compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
-                                       gate_input_dev.data(), xe_packed.data(), xe_scale.data()); }
+                                       gate_input_dev.data(), xe_packed.data(), xe_scale.data());
+              } }
             Xe.reset();
             gate_input_dev.reset();
 
@@ -781,20 +826,128 @@ static void run_shard(
             } }
             xe_packed.reset(); xe_scale.reset();
 
-            auto act = ar.alloc<bf16>((size_t)total_rows * moe_inter);
             auto act_packed = ar.alloc<uint8_t>((size_t)total_rows * moe_inter / 2);
             auto act_scale = ar.alloc<uint8_t>((size_t)total_rows * IG);
             { DIFF_PROF(q, prof.geglu_pack);
-              geglu_strided_grouped(q, gu.data(), act.data(), compute_slot_dev.data(),
-                                  compute_rows, moe_inter);
-              pack_bf16_to_nvfp4_grouped(q, act.data(), moe_inter,
-                                       compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
-                                       down_input_dev.data(), act_packed.data(), act_scale.data()); }
+              if (nvfp4_fuse_geglu_pack()) {
+                  // GeGLU + down-pack fused: no bf16 `act` intermediate.
+                  geglu_pack_nvfp4_grouped(q, gu.data(), moe_inter,
+                                          compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
+                                          down_input_dev.data(), act_packed.data(), act_scale.data());
+              } else {
+                  auto act = ar.alloc<bf16>((size_t)total_rows * moe_inter);
+                  geglu_strided_grouped(q, gu.data(), act.data(), compute_slot_dev.data(),
+                                      compute_rows, moe_inter);
+                  pack_bf16_to_nvfp4_grouped(q, act.data(), moe_inter,
+                                           compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
+                                           down_input_dev.data(), act_packed.data(), act_scale.data());
+                  act.reset();
+              } }
             gu.reset();
-            act.reset();
             compute_slot_dev.reset(); compute_expert_dev.reset();
             down_input_dev.reset();
 
+            Ye = ar.alloc<bf16>((size_t)total_rows * H);
+            { DIFF_PROF(q, prof.down_mm);
+            for (int e = 0; e < localE; ++e) {
+                if (count[e] == 0) continue;
+                int m = std::min(bucket_cap[e], round_up(count[e], round_m));
+                int off = base[e];
+                matmul_nvfp4_packed(act_packed.data() + (size_t)off * moe_inter / 2,
+                                    act_scale.data() + (size_t)off * IG,
+                                    m, moe_inter, shard.down_proj_fp4[e],
+                                    Ye.data() + (size_t)off * H, ctx);
+            } }
+            act_packed.reset(); act_scale.reset();
+        } else if (nvfp4_use_grouped_dpas_kernel()) {
+            // New codepath: grouped DPAS gate/up + GeGLU + down-pack fused into
+            // one custom kernel (eliminates gu/act bf16 intermediates + 2 launches),
+            // then the existing per-expert oneDNN loop for the down projection.
+            // The down GEMM has no clean epilogue fusion (the combine kernel's
+            // expert-sum is inherently separate), so it stays on oneDNN.
+            // Select via DIFF_NVFP4_EXPERT_KERNEL=grouped-dpas. Hybrid (oneDNN
+            // loop) remains the default.
+            std::vector<int32_t> compute_slot;
+            std::vector<int32_t> compute_expert;
+            compute_slot.reserve((size_t)A + localE * round_m);
+            compute_expert.reserve((size_t)A + localE * round_m);
+            for (int e = 0; e < localE; ++e) {
+                if (count[e] == 0) continue;
+                int m = std::min(bucket_cap[e], round_up(count[e], round_m));
+                int off = base[e];
+                for (int r = 0; r < m; ++r) {
+                    compute_slot.push_back(off + r);
+                    compute_expert.push_back(e);
+                }
+            }
+            int compute_rows = (int)compute_slot.size();
+            auto compute_slot_dev = ar.alloc<int32_t>(compute_rows);
+            auto compute_expert_dev = ar.alloc<int32_t>(compute_rows);
+            upload_alloc(q, compute_slot_dev, compute_slot);
+            upload_alloc(q, compute_expert_dev, compute_expert);
+
+            std::vector<float> gate_input(localE), down_input(localE);
+            for (int e = 0; e < localE; ++e) {
+                gate_input[e] = shard.gate_up_proj_fp4[e].input_global_scale;
+                down_input[e] = shard.down_proj_fp4[e].input_global_scale;
+            }
+            auto gate_input_dev = ar.alloc<float>(localE);
+            auto down_input_dev = ar.alloc<float>(localE);
+            upload_alloc(q, gate_input_dev, gate_input);
+            upload_alloc(q, down_input_dev, down_input);
+
+            // Scatter+pack hidden -> xe_packed/xe_scale (same fused path as hybrid).
+            auto xe_packed = ar.alloc<uint8_t>((size_t)total_rows * H / 2);
+            auto xe_scale = ar.alloc<uint8_t>((size_t)total_rows * HG);
+            { DIFF_PROF(q, prof.pack);
+              if (fuse_sp) {
+                  q.memset(xe_packed.data(), 0, (size_t)total_rows * H / 2);
+                  q.memset(xe_scale.data(), 0, (size_t)total_rows * HG);
+                  scatter_pack_nvfp4_grouped(q, expert_in, H,
+                                             slot_dev.data(), idx_dev, shard.first_expert,
+                                             gate_input_dev.data(), A_all, top_k,
+                                             xe_packed.data(), xe_scale.data());
+              } else {
+                  pack_bf16_to_nvfp4_grouped(q, Xe.data(), H,
+                                       compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
+                                       gate_input_dev.data(), xe_packed.data(), xe_scale.data());
+              } }
+            Xe.reset();
+            gate_input_dev.reset();
+
+            // Build per-expert device-pointer arrays for the fused kernel.
+            // Coalesced weight is cached on the Nvfp4Linear (one-time per expert).
+            std::vector<const uint8_t*> gate_w(localE), gate_s(localE);
+            std::vector<const float*> gate_dst(localE);
+            for (int e = 0; e < localE; ++e) {
+                gate_w[e] = nvfp4_coalesced_weight(shard.gate_up_proj_fp4[e], H, 2 * moe_inter, ctx);
+                gate_s[e] = shard.gate_up_proj_fp4[e].weight_scale.data();
+                gate_dst[e] = shard.gate_up_proj_fp4[e].dst_scale.data();
+            }
+            auto gate_w_dev = ar.alloc<const uint8_t*>(localE);
+            auto gate_s_dev = ar.alloc<const uint8_t*>(localE);
+            auto gate_dst_dev = ar.alloc<const float*>(localE);
+            upload_alloc(q, gate_w_dev, gate_w);
+            upload_alloc(q, gate_s_dev, gate_s);
+            upload_alloc(q, gate_dst_dev, gate_dst);
+
+            // Fused gate/up DPAS + GeGLU + down-pack -> act_packed/act_scale.
+            auto act_packed = ar.alloc<uint8_t>((size_t)total_rows * moe_inter / 2);
+            auto act_scale = ar.alloc<uint8_t>((size_t)total_rows * IG);
+            { DIFF_PROF(q, prof.gateup_mm);
+              matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
+                  ctx, xe_packed.data(), xe_scale.data(), H,
+                  compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
+                  gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
+                  moe_inter, down_input_dev.data(),
+                  act_packed.data(), act_scale.data()); }
+            // pack+geglu_profile combined into gateup_mm here (no separate geglu_pack).
+            xe_packed.reset(); xe_scale.reset();
+            gate_w_dev.reset(); gate_s_dev.reset(); gate_dst_dev.reset();
+            compute_slot_dev.reset(); compute_expert_dev.reset();
+            down_input_dev.reset();
+
+            // Down projection: per-expert oneDNN loop (unchanged from hybrid).
             Ye = ar.alloc<bf16>((size_t)total_rows * H);
             { DIFF_PROF(q, prof.down_mm);
             for (int e = 0; e < localE; ++e) {

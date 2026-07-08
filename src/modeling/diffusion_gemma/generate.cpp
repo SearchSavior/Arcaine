@@ -80,7 +80,8 @@ std::vector<int> DiffusionGemmaModel::generate(
                 bool want_soft_next = !(skip_last_soft_next && step == 1);
                 auto td0 = Clk::now();
                 decode_step(current, soft ? soft->data() : nullptr, enc_len, temp,
-                            argmax, entropy, denoiser, soft_next, rng, want_soft_next);
+                            argmax, entropy, denoiser, soft_next, rng, want_soft_next,
+                            (uint64_t)seed, (uint32_t)blk, (uint32_t)step);
                 stats_.decode_s += secs(td0, Clk::now());
                 stats_.decode_passes += 1;
 
@@ -123,23 +124,34 @@ std::vector<int> DiffusionGemmaModel::generate(
                 bool want_soft_next = !(skip_last_soft_next && step == 1);
                 auto td0 = Clk::now();
 
-                diffsamp::fill_uniform(q0, u_dev_.data(), (uint64_t)seed,
-                                       (uint32_t)blk, (uint32_t)step, C);
+                if (!diff_use_gumbel_sample())
+                    diffsamp::fill_uniform(q0, u_dev_.data(), (uint64_t)seed,
+                                           (uint32_t)blk, (uint32_t)step, C);
                 decode_forward(canvas_dev_.data(), soft ? soft->data() : nullptr,
                                enc_len, C, temp, u_dev_.data(),
                                argmax_dev_.data(), entropy_dev_.data(),
-                               denoiser_dev_.data(), soft_next_buf, want_soft_next);
+                               denoiser_dev_.data(), soft_next_buf, want_soft_next,
+                               (uint64_t)seed, (uint32_t)blk, (uint32_t)step);
                 diffsamp::entropy_bound_renoise(q0, canvas_dev_.data(),
                                                 denoiser_dev_.data(),
                                                 entropy_dev_.data(), accepted_dev_.data(),
                                                 (uint64_t)seed, (uint32_t)blk, (uint32_t)step,
                                                 C, cfg_.gen.entropy_bound, V);
-                diffsamp::stopping_check(q0, argmax_dev_.data(), argmax_history_dev_.data(),
-                                         entropy_dev_.data(), mean_dev_.data(),
-                                         stop_dev_.data(),
-                                         cfg_.gen.confidence_threshold,
-                                         cfg_.gen.stability_threshold,
-                                         history_slot, C);
+                if (diff_use_stop_fix())
+                    diffsamp::stopping_check_fixed(q0, argmax_dev_.data(),
+                                                    argmax_history_dev_.data(),
+                                                    entropy_dev_.data(), mean_dev_.data(),
+                                                    stop_dev_.data(),
+                                                    cfg_.gen.confidence_threshold,
+                                                    cfg_.gen.stability_threshold,
+                                                    history_slot, C);
+                else
+                    diffsamp::stopping_check(q0, argmax_dev_.data(), argmax_history_dev_.data(),
+                                             entropy_dev_.data(), mean_dev_.data(),
+                                             stop_dev_.data(),
+                                             cfg_.gen.confidence_threshold,
+                                             cfg_.gen.stability_threshold,
+                                             history_slot, C);
                 if (cfg_.gen.stability_threshold > 0)
                     history_slot = (history_slot + 1) % cfg_.gen.stability_threshold;
                 if (want_soft_next) soft.emplace(std::move(soft_next_buf));

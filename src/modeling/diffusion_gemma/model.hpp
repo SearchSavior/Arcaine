@@ -38,6 +38,12 @@ struct DiffPerfStats {
     double tokens_per_forward() const { return decode_passes > 0 ? (double)output_tokens / decode_passes : 0; }
 };
 
+// Hot-path sampler-kernel AB knobs (defined in model.cpp; default off -> the
+// original device kernels).  See device_sampler.hpp / fusions/logits.hpp.
+bool diff_use_online_softmax();  // DIFF_ONLINE_SOFTMAX
+bool diff_use_gumbel_sample();   // DIFF_GUMBEL_MAX (implies online softmax)
+bool diff_use_stop_fix();        // DIFF_STOP_FIX
+
 class DiffusionGemmaModel {
 public:
     DiffusionGemmaModel(const std::string& model_dir, int max_seq_len, DiffPlacementOptions placement = {}, bool print_placement = true);
@@ -80,7 +86,8 @@ private:
                      std::vector<int>& denoiser,
                      GpuBuffer<bf16>& soft_next,
                      std::mt19937& rng,
-                     bool want_soft_next = true);
+                     bool want_soft_next = true,
+                     uint64_t rng_seed = 0, uint32_t rng_block = 0, uint32_t rng_step = 0);
 
     // Device-only denoiser forward (no host round-trip): embed+selfcond,
     // decoder layers, final norm, LM head, fused_logits_head, and the
@@ -95,7 +102,8 @@ private:
                         int enc_len, int seq, float temp, const float* u_dev,
                         int32_t* argmax_dev, float* entropy_dev,
                         int32_t* denoiser_dev, GpuBuffer<bf16>& soft_next,
-                        bool want_soft_next);
+                        bool want_soft_next,
+                        uint64_t rng_seed = 0, uint32_t rng_block = 0, uint32_t rng_step = 0);
 
     // Allocate (or grow) the persistent device buffers backing the
     // device-resident denoising loop, sized for one canvas of `seq` tokens.

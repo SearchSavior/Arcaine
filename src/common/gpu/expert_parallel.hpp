@@ -8,7 +8,7 @@
 // but the benchmark tool overrides it at runtime via set_nvfp4_kernel() so it
 // can sweep kernels in one process (no model reload). (A DPAS/XMX kernel was
 // also explored and removed; see docs/artifacts/.)
-enum class Nvfp4Kernel { Default, Hybrid, Custom };
+enum class Nvfp4Kernel { Default, Hybrid, Custom, GroupedDpas };
 void set_nvfp4_kernel(Nvfp4Kernel kernel);
 const char* nvfp4_kernel_name(Nvfp4Kernel kernel);
 

@@ -43,8 +43,9 @@ namespace {
 Nvfp4Kernel parse_kernel(const std::string& s) {
     if (s == "default") return Nvfp4Kernel::Default;
     if (s == "hybrid")  return Nvfp4Kernel::Hybrid;
-    if (s == "custom")  return Nvfp4Kernel::Custom;
-    throw std::runtime_error("unknown kernel '" + s + "' (use: default, hybrid, custom)");
+    if (s == "custom") return Nvfp4Kernel::Custom;
+    if (s == "grouped-dpas" || s == "dpas" || s == "geglu-pack") return Nvfp4Kernel::GroupedDpas;
+    throw std::runtime_error("unknown kernel '" + s + "' (use: default, hybrid, custom, grouped-dpas)");
 }
 
 std::vector<std::string> split_csv(const std::string& s) {

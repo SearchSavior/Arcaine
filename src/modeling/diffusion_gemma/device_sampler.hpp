@@ -159,4 +159,79 @@ inline void stopping_check(sycl::queue& q,
     });
 }
 
+// F5 + race fix.  Parallel mean (WG reduce) + parallel stability (each thread
+// checks its canvas position across all history rows, AND-reduce) — replaces
+// the original stopping_check's serial-on-thread-0 mean and stability loops.
+//
+// Correctness: the original stopping_check reads `history` (GLOBAL) in the
+// i==0 block while every other thread concurrently rotates the CURRENT canvas
+// into the SAME global `history` row (default stability_threshold=1 ->
+// hstep==slot every step), with only a local fence between them -> RAW race
+// that can make the stability check read the just-overwritten current canvas
+// and trivially report "stable", biasing toward premature stop.  This version
+// snapshots the history rows into SLM up front (global read, fenced + barrier-
+// separated from the later global rotate-write) and runs the check from the
+// SLM copy, eliminating the race.
+// Enable: DIFF_STOP_FIX (default off -> original stopping_check).  Recommended
+// for default-on after validating canvas-by-canvas stop parity vs DIFF_HOST_SAMPLER.
+inline void stopping_check_fixed(sycl::queue& q,
+                            const int32_t* argmax, int32_t* history,
+                            const float* entropy,
+                            float* mean_out, int32_t* stop_out,
+                            float confidence_threshold, int stability_threshold,
+                            int slot, int seq) {
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sent(sycl::range<1>(kMaxCanvas), h);
+        sycl::local_accessor<int, 1>   sarg(sycl::range<1>(kMaxCanvas), h);
+        int hist_rows = stability_threshold > 0 ? stability_threshold : 1;
+        sycl::local_accessor<int, 1>   shist(sycl::range<1>((size_t)hist_rows * kMaxCanvas), h);
+        sycl::local_accessor<float, 1> spart(sycl::range<1>(kMaxCanvas), h);
+        sycl::local_accessor<int, 1>   sstop(sycl::range<1>(kMaxCanvas), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(kMaxCanvas), sycl::range<1>(kMaxCanvas)),
+            [=](sycl::nd_item<1> it) {
+                int i = (int)it.get_local_id(0);
+                if (i < seq) { sent[i] = entropy[i]; sarg[i] = argmax[i]; }
+                else { sent[i] = 0.0f; sarg[i] = 0; }
+                // Snapshot history rows (GLOBAL read) before any rotate-write below.
+                if (stability_threshold > 0)
+                    for (int r = 0; r < stability_threshold; ++r)
+                        if (i < seq) shist[(size_t)r * kMaxCanvas + i] = history[(size_t)r * seq + i];
+                // global_and_local fence: orders these global reads before the
+                // global rotate-write at the bottom (prevents the RAW race).
+                it.barrier(sycl::access::fence_space::global_and_local);
+
+                // Per-thread partial mean + per-position stable flag (from SLM snapshot).
+                spart[i] = (i < seq) ? sent[i] : 0.0f;
+                bool my_stable = true;
+                if (stability_threshold > 0 && i < seq)
+                    for (int r = 0; r < stability_threshold && my_stable; ++r)
+                        if (shist[(size_t)r * kMaxCanvas + i] != sarg[i]) my_stable = false;
+                sstop[i] = my_stable ? 1 : 0;
+                it.barrier(sycl::access::fence_space::local_space);
+
+                // One tree: sum spart (mean) AND sstop (stability).
+                for (int o = kMaxCanvas / 2; o > 0; o >>= 1) {
+                    if (i < o) {
+                        spart[i] += spart[i + o];
+                        if (sstop[i + o] == 0) sstop[i] = 0;
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                if (i == 0) {
+                    float mean = spart[0] / (float)seq;
+                    bool stable = (stability_threshold == 0) || (sstop[0] != 0);
+                    bool confident = mean < confidence_threshold;
+                    *mean_out = mean;
+                    *stop_out = (stable && confident) ? 1 : 0;
+                }
+                // Rotate current argmax into the history ring (GLOBAL write).  Safe:
+                // the check read the SLM snapshot above; the global_and_local barrier
+                // separates those reads from this write.
+                if (stability_threshold > 0 && i < seq)
+                    history[slot * seq + i] = sarg[i];
+            });
+    });
+}
+
 }  // namespace diffsamp

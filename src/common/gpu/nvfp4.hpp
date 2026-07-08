@@ -688,6 +688,143 @@ inline void pack_bf16_to_nvfp4_grouped(
     });
 }
 
+// Fuse GeGLU (gate_up -> act) with the down-projection input pack (act -> nvfp4).
+// Eliminates the bf16 `act` intermediate and one kernel launch. Bit-exact with
+// the unfused sequence (geglu_strided_grouped + pack_bf16_to_nvfp4_grouped):
+// the geglu float result is rounded through bf16 (write->read round-trip)
+// before the identical per-16-group quant math.
+inline void geglu_pack_nvfp4_grouped(
+    sycl::queue& q,
+    const bf16* gate_up,          // [total_rows, 2*inter]  (gate | up), indexed by row_slot
+    int inter,
+    const int32_t* row_slot,      // [rows] -> slot offset in [0, total_rows)
+    const int32_t* row_expert,    // [rows] -> expert id (for input_global_scale)
+    int rows,
+    const float* input_global_scale,  // [num_experts] (down proj's per-expert input scale)
+    uint8_t* packed,              // [total_rows, inter/2]
+    uint8_t* scales)              // [total_rows, inter/16]
+{
+    if (inter % 16 != 0)
+        throw std::runtime_error("geglu_pack_nvfp4_grouped: inter must be divisible by 16");
+    constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
+    constexpr float COEF = 0.044715f;
+    int G = inter / 16;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t)rows, (size_t)G), [=](sycl::id<2> id) {
+            int r = (int)id[0];
+            int g = (int)id[1];
+            int slot = row_slot[r];
+            int expert = row_expert[r];
+            int k0 = g * 16;
+            const bf16* row = gate_up + (size_t)slot * 2 * inter;
+            uint8_t* packed_row = packed + (size_t)slot * (inter / 2);
+            uint8_t* scale_row = scales + (size_t)slot * G;
+            float input_scale = input_global_scale[expert];
+
+            float vals[16];
+            float max_abs = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                float gg = bf16_to_float(row[k0 + i]);
+                float uu = bf16_to_float(row[inter + k0 + i]);
+                float inner = SQRT_2_OVER_PI * (gg + COEF * gg * gg * gg);
+                // Round-trip through bf16 matches the unfused write->read exactly.
+                float v = bf16_to_float(float_to_bf16(0.5f * gg * (1.0f + sycl::tanh(inner)) * uu));
+                vals[i] = v;
+                max_abs = sycl::fmax(max_abs, sycl::fabs(v));
+            }
+
+            uint8_t scale_bits = 0;
+            float scale = 0.0f;
+            if (max_abs > 0.0f) {
+                float raw_scale = max_abs * input_scale / 6.0f;
+                scale_bits = nvfp4_encode_e4m3_positive(raw_scale);
+                scale = nvfp4_e4m3_to_float(scale_bits);
+            }
+            scale_row[g] = scale_bits;
+
+            for (int i = 0; i < 16; i += 2) {
+                uint8_t lo = 0, hi = 0;
+                if (scale > 0.0f) {
+                    float v0 = vals[i] * input_scale / scale;
+                    float v1 = vals[i + 1] * input_scale / scale;
+                    lo = nvfp4_encode_e2m1(v0);
+                    hi = nvfp4_encode_e2m1(v1);
+                }
+                packed_row[(k0 + i) / 2] = lo | (hi << 4);
+            }
+        });
+    });
+}
+
+// Fuse the hidden-state scatter with the gate/up-projection input pack.
+// Replaces: scatter hidden->Xe (bf16) + pack_bf16_to_nvfp4_grouped(Xe,...).
+// Iterates source assignments a in [0, A_all); for each valid a (slot >= 0),
+// gathers 16 bf16 hidden values for token (a / top_k) and packs them straight
+// to nvfp4 at slot[a]. Padding bucket rows (rounded rows beyond count[e],
+// which no valid a maps to) are NOT written here -- caller must memset
+// `packed`/`scales` to 0 first, which matches the unfused behavior (Xe is
+// memset to 0, so pack produces zeros for those rows).
+//
+// Device-routes mode only: relies on `slot` being the atomic-computed dest
+// slot per source assignment (0xFFFFFFFF/-1 for invalid assignments).
+inline void scatter_pack_nvfp4_grouped(
+    sycl::queue& q,
+    const bf16* hidden,          // [seq, H]
+    int H,
+    const int32_t* slot,         // [A_all] dest slot per source assignment
+    const int32_t* idx_dev,      // [A_all] expert id per source assignment
+    int first_expert,
+    const float* input_global_scale,  // [num_experts] (gate/up proj's per-expert input scale)
+    int A_all,
+    int top_k,
+    uint8_t* packed,             // [total_rows, H/2]
+    uint8_t* scales)             // [total_rows, H/16]
+{
+    if (H % 16 != 0)
+        throw std::runtime_error("scatter_pack_nvfp4_grouped: H must be divisible by 16");
+    int G = H / 16;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t)A_all, (size_t)G), [=](sycl::id<2> id) {
+            int a = (int)id[0];
+            int g = (int)id[1];
+            int s = slot[a];
+            if (s < 0) return;                 // invalid assignment (slot init 0xFF)
+            int expert = idx_dev[a] - first_expert;
+            if (expert < 0) return;            // safety (slot<0 check above covers this)
+            int token = a / top_k;
+            int k0 = g * 16;
+            const bf16* src_row = hidden + (size_t)token * H;
+            uint8_t* packed_row = packed + (size_t)s * (H / 2);
+            uint8_t* scale_row = scales + (size_t)s * G;
+            float input_scale = input_global_scale[expert];
+
+            float max_abs = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                float v = bf16_to_float(src_row[k0 + i]);
+                max_abs = sycl::fmax(max_abs, sycl::fabs(v));
+            }
+            uint8_t scale_bits = 0;
+            float scale = 0.0f;
+            if (max_abs > 0.0f) {
+                float raw_scale = max_abs * input_scale / 6.0f;
+                scale_bits = nvfp4_encode_e4m3_positive(raw_scale);
+                scale = nvfp4_e4m3_to_float(scale_bits);
+            }
+            scale_row[g] = scale_bits;
+            for (int i = 0; i < 16; i += 2) {
+                uint8_t lo = 0, hi = 0;
+                if (scale > 0.0f) {
+                    float v0 = bf16_to_float(src_row[k0 + i]) * input_scale / scale;
+                    float v1 = bf16_to_float(src_row[k0 + i + 1]) * input_scale / scale;
+                    lo = nvfp4_encode_e2m1(v0);
+                    hi = nvfp4_encode_e2m1(v1);
+                }
+                packed_row[(k0 + i) / 2] = lo | (hi << 4);
+            }
+        });
+    });
+}
+
 inline void matmul_nvfp4_grouped_custom(
     sycl::queue& q,
     const uint8_t* A_packed,
@@ -790,6 +927,182 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
                 packed_row[(k0 + i) / 2] = lo | (hi << 4);
             }
         });
+    });
+}
+
+// ============================================================================
+// Grouped DPAS gate/up + GeGLU + down-pack fused kernel.
+//
+// One custom grouped-DPAS kernel that replaces, in the hybrid path:
+//   (1) the per-expert oneDNN gate/up GEMM loop  -> `gu` [rows, 2*inter] bf16
+//   (2) geglu_strided_grouped                     -> `act` [rows, inter] bf16
+//   (3) pack_bf16_to_nvfp4_grouped               -> `act_packed`/`act_scale`
+// The `gu` and `act` bf16 intermediates are eliminated entirely; the GeGLU
+// result is packed straight to nvfp4 in the epilogue.
+//
+// Layout (matches the hybrid branch's compute_slot/compute_expert arrays,
+// built per-expert in 8-row-aligned runs so every 8-row m-tile shares one
+// expert):
+//   A_packed/A_scale : xe_packed/xe_scale at slot = row_slot[r]  (the scattered
+//                      hidden state, already nvfp4-packed by scatter+pack).
+//   W_coal_by_expert : nvfp4_coalesced_weight(gate_up_proj_fp4[e], H, 2*inter)
+//                      -- coalesced [2*inter, K] per expert (cached on the linear).
+//   W_scale_by_expert: gate_up_proj_fp4[e].weight_scale  ([G=K/16, 2*inter])
+//   dst_scale        : gate_up_proj_fp4[e].dst_scale ([1] f32)
+//   down_input_global_scale : down_proj_fp4[e].input_global_scale (for the pack)
+//
+// Grid: nd_range<2>({mtiles*KS, inter}, {KS, 16})  -- one WG per (8-row m-tile,
+// gate group g in [0, inter/16)). KS threads split K; 16 lanes own the 16
+// columns of the gate/up tile. Gate (cols ng..ng+15) and up (cols inter+ng..)
+// share the SAME a_tile (one input load, two DPAS -- llm-scaler gate+up fusion).
+// After SLM K-reduce, (s==0, lane==0) does GeGLU+pack for the 8 rows of group g.
+//
+// Selection: DIFF_NVFP4_EXPERT_KERNEL=grouped-dpas (new codepath; the hybrid
+// oneDNN loop remains the default and is untouched).
+// ============================================================================
+inline void matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,          // xe_packed [total_rows, H/2]
+    const uint8_t* A_scale,          // xe_scale  [total_rows, H/16]
+    int H,                            // K (in_features of gate/up)
+    const int32_t* row_slot,         // compute_slot [rows] -> slot offset
+    const int32_t* row_expert,       // compute_expert [rows] -> expert id
+    int rows,
+    const uint8_t* const* W_coal_by_expert,    // [localE] coalesced [2*inter, K]
+    const uint8_t* const* W_scale_by_expert,   // [localE] [G=K/16, 2*inter]
+    const float* const* dst_scale_by_expert,    // [localE] [1]
+    int inter,
+    const float* down_input_global_scale,      // [localE] down proj input scale
+    uint8_t* act_packed,              // [total_rows, inter/2]
+    uint8_t* act_scale)              // [total_rows, inter/16]
+{
+    if (H % 16 != 0 || inter % 16 != 0)
+        throw std::runtime_error("grouped-dpas gateup: H and inter must be divisible by 16");
+    if (rows <= 0) return;
+
+    auto& q = ctx.queue;
+    int halfK = H / 2;
+    int ktiles = H / 16;
+    int mtiles = (rows + 7) / 8;
+    int G_inter = inter / 16;
+    int Ngu = 2 * inter;                 // gate|up out_features
+    int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, G_inter / 16);
+    const uint16_t* lut = nvfp4_dequant_lut(ctx);
+
+    q.submit([&](sycl::handler& h) {
+        // SLM holds two accumulators (gate, up): KS threads * 8 rows * 16 lanes.
+        sycl::local_accessor<float, 1> slm((size_t)2 * KS * 8 * 16, h);
+        float* slm_g = slm.get_pointer();
+        float* slm_u = slm_g + (size_t)KS * 8 * 16;
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)mtiles * KS, (size_t)inter),
+                              sycl::range<2>((size_t)KS, 16)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int m0   = (int)it.get_group(0) * 8;
+                int s    = (int)it.get_local_id(0);
+                int lane = (int)it.get_local_id(1);
+                int g    = (int)it.get_group(1);          // gate group index
+                int ng   = g * 16;
+                int gate_n = ng;                          // gate cols [ng, ng+16)
+                int up_n   = inter + ng;                  // up   cols [inter+ng, ...)
+                int r0    = m0;
+                int expert = (r0 < rows) ? row_expert[r0] : -1;
+
+                diff_dpas_v8f cg = {0,0,0,0,0,0,0,0};
+                diff_dpas_v8f cu = {0,0,0,0,0,0,0,0};
+                if (expert >= 0) {
+                    const uint8_t* wcoal = W_coal_by_expert[expert];
+                    const uint8_t* wscale = W_scale_by_expert[expert];
+                    for (int kt = s; kt < ktiles; kt += KS) {
+                        // Gate and up B-tiles (two coalesced dequants, same K-tile).
+                        diff_dpas_v8i bg = nvfp4_dequant_b_coal(
+                            wcoal, lut, wscale, gate_n, lane, kt, H, Ngu);
+                        diff_dpas_v8i bu = nvfp4_dequant_b_coal(
+                            wcoal, lut, wscale, up_n, lane, kt, H, Ngu);
+                        // A-tile: computed ONCE, shared by gate and up DPAS.
+                        int k0 = kt * 16;
+                        int kk = k0 + lane;
+                        diff_dpas_v8s a;
+                        for (int m = 0; m < 8; ++m) {
+                            int r = r0 + m;
+                            uint16_t av = 0;
+                            if (r < rows && row_expert[r] == expert) {
+                                uint8_t byte = A_packed[(size_t)row_slot[r] * halfK + kk / 2];
+                                uint8_t nib = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
+                                av = float_to_bf16(
+                                    nvfp4_e2m1_fast(nib) *
+                                    nvfp4_e4m3_fast(A_scale[(size_t)row_slot[r] * ktiles + kt]));
+                            }
+                            a[m] = (short)av;
+                        }
+                        cg = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                            16, a, bg, cg, kNvfp4DpasBF16);
+                        cu = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                            16, a, bu, cu, kNvfp4DpasBF16);
+                    }
+                }
+
+                // Stash partials (gate + up) for the K-split reduction.
+                for (int m = 0; m < 8; ++m) {
+                    slm_g[(size_t)(s * 8 + m) * 16 + lane] = cg[m];
+                    slm_u[(size_t)(s * 8 + m) * 16 + lane] = cu[m];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                // Epilogue: one thread (s==0, lane==0) reduces K, GeGLUs, and
+                // packs group g for the 8 rows. Pack needs all 16 GeGLU values
+                // per row (max_abs over the group), so a single thread does it
+                // rather than the 16-lane parallel write used by the plain GEMM.
+                if (s == 0 && lane == 0 && expert >= 0) {
+                    float inv_dst = 1.0f / dst_scale_by_expert[expert][0];
+                    float down_in_scale = down_input_global_scale[expert];
+                    constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
+                    constexpr float COEF = 0.044715f;
+                    for (int m = 0; m < 8; ++m) {
+                        int r = r0 + m;
+                        if (r >= rows || row_expert[r] != expert) continue;
+                        int slot = row_slot[r];
+                        float vals[16];
+                        float max_abs = 0.0f;
+                        for (int i = 0; i < 16; ++i) {
+                            float gg = 0.0f, uu = 0.0f;
+                            for (int ss = 0; ss < KS; ++ss) {
+                                gg += slm_g[(size_t)(ss * 8 + m) * 16 + i];
+                                uu += slm_u[(size_t)(ss * 8 + m) * 16 + i];
+                            }
+                            gg *= inv_dst;
+                            uu *= inv_dst;
+                            float inner = SQRT_2_OVER_PI * (gg + COEF * gg * gg * gg);
+                            // Round-trip through bf16 matches the unfused path
+                            // (gu bf16 -> geglu reads bf16).
+                            float v = bf16_to_float(float_to_bf16(
+                                0.5f * gg * (1.0f + sycl::tanh(inner)) * uu));
+                            vals[i] = v;
+                            max_abs = sycl::fmax(max_abs, sycl::fabs(v));
+                        }
+                        uint8_t scale_bits = 0;
+                        float scale = 0.0f;
+                        if (max_abs > 0.0f) {
+                            float raw_scale = max_abs * down_in_scale / 6.0f;
+                            scale_bits = nvfp4_encode_e4m3_positive(raw_scale);
+                            scale = nvfp4_e4m3_to_float(scale_bits);
+                        }
+                        act_scale[(size_t)slot * G_inter + g] = scale_bits;
+                        uint8_t* packed_row = act_packed + (size_t)slot * (inter / 2);
+                        int k0 = ng;
+                        for (int i = 0; i < 16; i += 2) {
+                            uint8_t lo = 0, hi = 0;
+                            if (scale > 0.0f) {
+                                float v0 = vals[i] * down_in_scale / scale;
+                                float v1 = vals[i + 1] * down_in_scale / scale;
+                                lo = nvfp4_encode_e2m1(v0);
+                                hi = nvfp4_encode_e2m1(v1);
+                            }
+                            packed_row[(k0 + i) / 2] = lo | (hi << 4);
+                        }
+                    }
+                }
+            });
     });
 }
 

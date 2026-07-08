@@ -86,6 +86,17 @@ static SoftNextCfg soft_next_cfg() {
     return cfg;
 }
 
+// Hot-path sampler-kernel AB knobs (default off -> original device kernels).
+bool diff_use_online_softmax() {
+    static bool v = std::getenv("DIFF_ONLINE_SOFTMAX") != nullptr; return v;
+}
+bool diff_use_gumbel_sample() {
+    static bool v = std::getenv("DIFF_GUMBEL_MAX") != nullptr; return v;
+}
+bool diff_use_stop_fix() {
+    static bool v = std::getenv("DIFF_STOP_FIX") != nullptr; return v;
+}
+
 DiffusionGemmaModel::DiffusionGemmaModel(const std::string& model_dir, int max_seq_len, DiffPlacementOptions placement, bool print_placement) {
     cfg_ = DiffConfig::from_dir(model_dir);
     int L = cfg_.text.num_hidden_layers;
@@ -193,7 +204,8 @@ void DiffusionGemmaModel::decode_forward(
     const int32_t* ids, const bf16* soft_or_null, int enc_len, int seq,
     float temp, const float* u_dev,
     int32_t* argmax_dev, float* entropy_dev, int32_t* denoiser_dev,
-    GpuBuffer<bf16>& soft_next, bool want_soft_next)
+    GpuBuffer<bf16>& soft_next, bool want_soft_next,
+    uint64_t rng_seed, uint32_t rng_block, uint32_t rng_step)
 {
     int H = cfg_.text.hidden_size;
     int L = cfg_.text.num_hidden_layers;
@@ -251,10 +263,23 @@ void DiffusionGemmaModel::decode_forward(
     diffarena::Alloc<bf16> probs_bf16;
     if (need_probs) probs_bf16 = ar0.alloc<bf16>((size_t)seq * V);
     { DIFF_PROF(q0, "lm.softmax_sample");
-      fused_logits_head(q0, logits_bf16.data(),
-                        cfg_.text.final_logit_softcapping, 1.0f / temp,
-                        u_dev, need_probs ? probs_bf16.data() : nullptr,
-                        argmax_dev, entropy_dev, denoiser_dev, seq, V); }
+      bf16* probs = need_probs ? probs_bf16.data() : nullptr;
+      // AB knobs (default off -> 3-pass inverse-CDF kernel).
+      //   DIFF_GUMBEL_MAX    : online softmax + Gumbel-max sample (1-2 passes).
+      //   DIFF_ONLINE_SOFTMAX: online softmax Pass1+2 merge (2 passes, inverse-CDF sample).
+      if (diff_use_gumbel_sample())
+          fused_logits_head_gumbel(q0, logits_bf16.data(),
+                  cfg_.text.final_logit_softcapping, 1.0f / temp,
+                  rng_seed, rng_block, rng_step, probs,
+                  argmax_dev, entropy_dev, denoiser_dev, seq, V);
+      else if (diff_use_online_softmax())
+          fused_logits_head_online(q0, logits_bf16.data(),
+                  cfg_.text.final_logit_softcapping, 1.0f / temp, u_dev, probs,
+                  argmax_dev, entropy_dev, denoiser_dev, seq, V);
+      else
+          fused_logits_head(q0, logits_bf16.data(),
+                  cfg_.text.final_logit_softcapping, 1.0f / temp, u_dev, probs,
+                  argmax_dev, entropy_dev, denoiser_dev, seq, V); }
 
     // TopK soft_next reads the same logits for its selection — extract before
     // the logits buffer is released.
@@ -319,7 +344,8 @@ void DiffusionGemmaModel::decode_step(
     const std::vector<int>& canvas_ids, const bf16* soft_or_null, int enc_len,
     float temp, std::vector<int>& argmax, std::vector<float>& entropy,
     std::vector<int>& denoiser, GpuBuffer<bf16>& soft_next, std::mt19937& rng,
-    bool want_soft_next)
+    bool want_soft_next,
+    uint64_t rng_seed, uint32_t rng_block, uint32_t rng_step)
 {
     int seq = (int)canvas_ids.size();
     auto& q0 = GpuEngine::get(0).queue;
@@ -334,7 +360,7 @@ void DiffusionGemmaModel::decode_step(
 
     decode_forward(ids_dev.data(), soft_or_null, enc_len, seq, temp, u_dev.data(),
                    amax_dev.data(), ent_dev.data(), deno_dev.data(),
-                   soft_next, want_soft_next);
+                   soft_next, want_soft_next, rng_seed, rng_block, rng_step);
 
     argmax.resize(seq); entropy.resize(seq); denoiser.resize(seq);
     { DIFF_PROF(q0, "lm.download");
