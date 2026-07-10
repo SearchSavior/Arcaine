@@ -208,5 +208,6 @@ std::vector<int> DiffusionGemmaModel::generate(
     }
     stats_.output_tokens = (int)output.size();
     diffprof::report();
+    nvfp4_sycl_graph_report();
     return output;
 }

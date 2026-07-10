@@ -2,11 +2,16 @@
 #include <dnnl.hpp>
 #include <dnnl_sycl.hpp>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/graph/command_graph.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
+#include <initializer_list>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <cstdlib>
@@ -82,6 +87,148 @@ inline Nvfp4WeightLayout nvfp4_weight_layout() {
 inline bool nvfp4_verbose() {
     static bool enabled = std::getenv("DIFF_NVFP4_VERBOSE") != nullptr;
     return enabled;
+}
+
+inline bool nvfp4_sycl_graph_enabled() {
+    static bool enabled = [] {
+        const char* env = std::getenv("DIFF_NVFP4_SYCL_GRAPH");
+        return env && std::strcmp(env, "0") && std::strcmp(env, "off") &&
+               std::strcmp(env, "false") && std::strcmp(env, "no");
+    }();
+    return enabled;
+}
+
+inline size_t nvfp4_sycl_graph_cache_limit() {
+    static size_t limit = [] {
+        const char* env = std::getenv("DIFF_NVFP4_SYCL_GRAPH_CACHE_LIMIT");
+        if (!env) return size_t{512};
+        char* end = nullptr;
+        unsigned long parsed = std::strtoul(env, &end, 10);
+        return end != env && parsed > 0 ? static_cast<size_t>(parsed) : size_t{512};
+    }();
+    return limit;
+}
+
+struct Nvfp4SyclGraphKey {
+    const sycl::queue* queue = nullptr;
+    int kind = 0;
+    std::vector<uintptr_t> args;
+
+    bool operator==(const Nvfp4SyclGraphKey& other) const {
+        return queue == other.queue && kind == other.kind && args == other.args;
+    }
+};
+
+struct Nvfp4SyclGraphKeyHash {
+    size_t operator()(const Nvfp4SyclGraphKey& key) const {
+        size_t hash = std::hash<const sycl::queue*>{}(key.queue);
+        auto mix = [&](uintptr_t value) {
+            hash ^= std::hash<uintptr_t>{}(value) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        };
+        mix(static_cast<uintptr_t>(key.kind));
+        for (uintptr_t value : key.args) mix(value);
+        return hash;
+    }
+};
+
+struct Nvfp4SyclGraphEntry {
+    using Modifiable = sycl::ext::oneapi::experimental::command_graph<>;
+    using Executable = sycl::ext::oneapi::experimental::command_graph<
+        sycl::ext::oneapi::experimental::graph_state::executable>;
+
+    std::unique_ptr<Modifiable> graph;
+    std::unique_ptr<Executable> executable;
+    bool unavailable = false;
+};
+
+struct Nvfp4SyclGraphCache {
+    std::mutex mutex;
+    std::unordered_map<Nvfp4SyclGraphKey, Nvfp4SyclGraphEntry,
+                       Nvfp4SyclGraphKeyHash> entries;
+    size_t captures = 0;
+    size_t replays = 0;
+    size_t fallbacks = 0;
+    size_t capacity_bypasses = 0;
+};
+
+inline Nvfp4SyclGraphCache& nvfp4_sycl_graph_cache() {
+    static Nvfp4SyclGraphCache cache;
+    return cache;
+}
+
+inline uintptr_t nvfp4_sycl_graph_float_key(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+template <class Submit>
+inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
+                                    std::initializer_list<uintptr_t> args,
+                                    Submit&& submit) {
+    if (!nvfp4_sycl_graph_enabled()) {
+        submit();
+        return;
+    }
+
+    Nvfp4SyclGraphKey key{&q, kind, args};
+    auto& cache = nvfp4_sycl_graph_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto found = cache.entries.find(key);
+    if (found != cache.entries.end()) {
+        if (found->second.executable) {
+            ++cache.replays;
+            q.ext_oneapi_graph(*found->second.executable);
+            return;
+        }
+        ++cache.fallbacks;
+        submit();
+        return;
+    }
+    if (cache.entries.size() >= nvfp4_sycl_graph_cache_limit()) {
+        ++cache.capacity_bypasses;
+        submit();
+        return;
+    }
+
+    auto [it, inserted] = cache.entries.emplace(std::move(key), Nvfp4SyclGraphEntry{});
+    auto& entry = it->second;
+    bool recording = false;
+    try {
+        entry.graph = std::make_unique<Nvfp4SyclGraphEntry::Modifiable>(q);
+        entry.graph->begin_recording(q);
+        recording = true;
+        submit();
+        entry.graph->end_recording(q);
+        recording = false;
+        entry.executable = std::make_unique<Nvfp4SyclGraphEntry::Executable>(entry.graph->finalize());
+        ++cache.captures;
+        q.ext_oneapi_graph(*entry.executable);
+    } catch (const std::exception& error) {
+        if (recording) {
+            try {
+                entry.graph->end_recording(q);
+            } catch (...) {
+            }
+        }
+        entry.graph.reset();
+        entry.executable.reset();
+        entry.unavailable = true;
+        ++cache.fallbacks;
+        if (nvfp4_verbose())
+            std::fprintf(stderr, "[nvfp4-graph] capture disabled: %s\n", error.what());
+        submit();
+    }
+}
+
+inline void nvfp4_sycl_graph_report() {
+    if (!nvfp4_sycl_graph_enabled()) return;
+    auto& cache = nvfp4_sycl_graph_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    std::fprintf(stderr,
+                 "[nvfp4-graph] captures=%zu replays=%zu fallbacks=%zu cache-bypasses=%zu entries=%zu\n",
+                 cache.captures, cache.replays, cache.fallbacks,
+                 cache.capacity_bypasses, cache.entries.size());
 }
 
 struct Nvfp4MatmulKey {
@@ -178,6 +325,11 @@ inline void pack_bf16_to_nvfp4(
 {
     if (K % 16 != 0) throw std::runtime_error("NVFP4 activation K must be divisible by 16");
     int G = K / 16;
+    nvfp4_sycl_graph_submit(q, 1, {
+        reinterpret_cast<uintptr_t>(src), reinterpret_cast<uintptr_t>(packed),
+        reinterpret_cast<uintptr_t>(scales), static_cast<uintptr_t>(M),
+        static_cast<uintptr_t>(K), nvfp4_sycl_graph_float_key(input_global_scale)
+    }, [&] {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<2>(M, G), [=](sycl::id<2> id) {
             int m = (int)id[0];
@@ -212,6 +364,7 @@ inline void pack_bf16_to_nvfp4(
                 packed[(size_t)m * (K / 2) + (k0 + i) / 2] = lo | (hi << 4);
             }
         });
+    });
     });
 }
 
@@ -647,6 +800,12 @@ inline void pack_bf16_to_nvfp4_grouped(
 {
     if (K % 16 != 0) throw std::runtime_error("grouped NVFP4 activation K must be divisible by 16");
     int G = K / 16;
+    nvfp4_sycl_graph_submit(q, 2, {
+        reinterpret_cast<uintptr_t>(src), reinterpret_cast<uintptr_t>(row_slot),
+        reinterpret_cast<uintptr_t>(row_expert), reinterpret_cast<uintptr_t>(input_global_scale),
+        reinterpret_cast<uintptr_t>(packed), reinterpret_cast<uintptr_t>(scales),
+        static_cast<uintptr_t>(K), static_cast<uintptr_t>(rows)
+    }, [&] {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<2>((size_t)rows, (size_t)G), [=](sycl::id<2> id) {
             int r = (int)id[0];
@@ -686,6 +845,7 @@ inline void pack_bf16_to_nvfp4_grouped(
             }
         });
     });
+    });
 }
 
 // Fuse GeGLU (gate_up -> act) with the down-projection input pack (act -> nvfp4).
@@ -709,6 +869,12 @@ inline void geglu_pack_nvfp4_grouped(
     constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
     constexpr float COEF = 0.044715f;
     int G = inter / 16;
+    nvfp4_sycl_graph_submit(q, 3, {
+        reinterpret_cast<uintptr_t>(gate_up), reinterpret_cast<uintptr_t>(row_slot),
+        reinterpret_cast<uintptr_t>(row_expert), reinterpret_cast<uintptr_t>(input_global_scale),
+        reinterpret_cast<uintptr_t>(packed), reinterpret_cast<uintptr_t>(scales),
+        static_cast<uintptr_t>(inter), static_cast<uintptr_t>(rows)
+    }, [&] {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<2>((size_t)rows, (size_t)G), [=](sycl::id<2> id) {
             int r = (int)id[0];
@@ -754,6 +920,7 @@ inline void geglu_pack_nvfp4_grouped(
             }
         });
     });
+    });
 }
 
 // Fuse the hidden-state scatter with the gate/up-projection input pack.
@@ -783,6 +950,13 @@ inline void scatter_pack_nvfp4_grouped(
     if (H % 16 != 0)
         throw std::runtime_error("scatter_pack_nvfp4_grouped: H must be divisible by 16");
     int G = H / 16;
+    nvfp4_sycl_graph_submit(q, 4, {
+        reinterpret_cast<uintptr_t>(hidden), reinterpret_cast<uintptr_t>(slot),
+        reinterpret_cast<uintptr_t>(idx_dev), reinterpret_cast<uintptr_t>(input_global_scale),
+        reinterpret_cast<uintptr_t>(packed), reinterpret_cast<uintptr_t>(scales),
+        static_cast<uintptr_t>(H), static_cast<uintptr_t>(first_expert),
+        static_cast<uintptr_t>(A_all), static_cast<uintptr_t>(top_k)
+    }, [&] {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<2>((size_t)A_all, (size_t)G), [=](sycl::id<2> id) {
             int a = (int)id[0];
@@ -822,6 +996,7 @@ inline void scatter_pack_nvfp4_grouped(
                 packed_row[(k0 + i) / 2] = lo | (hi << 4);
             }
         });
+    });
     });
 }
 
@@ -888,6 +1063,12 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
 {
     if (K % 16 != 0) throw std::runtime_error("counted grouped NVFP4 activation K must be divisible by 16");
     int G = K / 16;
+    nvfp4_sycl_graph_submit(q, 5, {
+        reinterpret_cast<uintptr_t>(src), reinterpret_cast<uintptr_t>(row_expert),
+        reinterpret_cast<uintptr_t>(input_global_scale), reinterpret_cast<uintptr_t>(packed),
+        reinterpret_cast<uintptr_t>(scales), static_cast<uintptr_t>(K),
+        static_cast<uintptr_t>(max_rows)
+    }, [&] {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<2>((size_t)max_rows, (size_t)G), [=](sycl::id<2> id) {
             int row = (int)id[0];
@@ -927,6 +1108,7 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
                 packed_row[(k0 + i) / 2] = lo | (hi << 4);
             }
         });
+    });
     });
 }
 
@@ -1239,4 +1421,3 @@ inline void matmul_nvfp4_grouped_rows_xe2(
             });
     });
 }
-
