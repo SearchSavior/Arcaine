@@ -7,6 +7,7 @@
 #include "weights.hpp"
 #include "linear_dispatch.hpp"
 #include "arena.hpp"
+#include "fusions/int4_awq.hpp"
 
 // inputs_embeds = post_norm(inputs_embeds + selfcond_ffn(pre_norm(soft)))
 // `soft` (seq,H) is the previous step's soft-embedding signal; pass nullptr on
@@ -14,7 +15,7 @@
 inline void self_conditioning_forward(
     GpuEngine& ctx, const DiffSelfCond& sc,
     bf16* inputs_embeds, const bf16* soft,
-    int seq, int H, int inter, float rms_eps)
+    int seq, int H, int inter, float rms_eps, bool int4_awq)
 {
     auto& q = ctx.queue;
     if (soft != nullptr) {
@@ -42,6 +43,11 @@ inline void self_conditioning_forward(
         auto sc_out = ar.alloc<bf16>(N);
         matmul_linear_weight(act.data(), seq, inter, sc.down_proj, H, sc_out.data(), ctx);
         act.reset();
+        if (int4_awq && diff_int4_fuse_selfcond_add_norm_enabled()) {
+            fused_int4_selfcond_add_norm(q, inputs_embeds, sc_out.data(),
+                                         seq, H, rms_eps);
+            return;
+        }
         add_inplace(q, inputs_embeds, sc_out.data(), (int)N);
     }
     // post_norm is scaleless RMSNorm.

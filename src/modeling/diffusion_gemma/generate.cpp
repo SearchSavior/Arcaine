@@ -13,7 +13,8 @@
 
 std::vector<int> DiffusionGemmaModel::generate(
     const std::vector<int>& prompt_ids, int max_new_tokens, int max_denoising_steps,
-    unsigned seed, bool verbose, const DiffStreamCallback& on_step)
+    unsigned seed, bool verbose, const DiffStreamCallback& on_step,
+    bool ignore_eos)
 {
     enc_kv_.reset();
     stats_ = DiffPerfStats{};
@@ -188,10 +189,16 @@ std::vector<int> DiffusionGemmaModel::generate(
         }
 
         // 4. Find the first EOS in the denoised canvas; commit up to it.
+        // Throughput benchmarks may ignore EOS so one-block -n 256 runs always
+        // count the complete finalized pool. This does not mask EOS logits or
+        // alter the 48-step denoising trajectory; it only disables commit-time
+        // truncation/stopping.
         int keep = C;   // tokens of this block to keep
-        for (int i = 0; i < C && keep == C; ++i)
-            for (int e : cfg_.gen.eos_token_ids)
-                if (argmax[i] == e) { keep = i; break; }
+        if (!ignore_eos) {
+            for (int i = 0; i < C && keep == C; ++i)
+                for (int e : cfg_.gen.eos_token_ids)
+                    if (argmax[i] == e) { keep = i; break; }
+        }
         bool hit_eos = (keep < C);
 
         std::vector<int> committed(argmax.begin(), argmax.begin() + keep);

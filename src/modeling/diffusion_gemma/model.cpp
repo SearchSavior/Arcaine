@@ -4,6 +4,7 @@
 #include "loader.hpp"
 #include "self_conditioning.hpp"
 #include "fusions/logits.hpp"
+#include "fusions/int4_awq.hpp"
 #include "../../common/gpu/engine.hpp"
 #include "../../common/gpu/nvfp4.hpp"
 #include "../../common/kernels/embedding.hpp"
@@ -101,6 +102,14 @@ bool diff_use_stop_fix() {
 DiffusionGemmaModel::DiffusionGemmaModel(const std::string& model_dir, int max_seq_len, DiffPlacementOptions placement, bool print_placement) {
     cfg_ = DiffConfig::from_dir(model_dir);
     int L = cfg_.text.num_hidden_layers;
+
+    if (cfg_.is_int4_quantized()) {
+        std::printf("[model] INT4-AWQ fusions: dense-gate-up=%s, "
+                    "expert-postnorm=%s, selfcond-add-norm=%s\n",
+                    diff_int4_fuse_dense_gate_up_enabled() ? "on" : "off",
+                    diff_int4_fuse_expert_postnorm_enabled() ? "on" : "off",
+                    diff_int4_fuse_selfcond_add_norm_enabled() ? "on" : "off");
+    }
 
     DiffPlacementOptions resolved_placement = resolve_diffusion_placement(cfg_, placement);
     split_layer_ = resolve_diffusion_split_layer(cfg_, resolved_placement);
@@ -225,7 +234,8 @@ void DiffusionGemmaModel::decode_forward(
           embedding_lookup(q0, w_.embed_tokens.data(), ids, hidden.data(),
                            seq, H, embed_scale_);
       self_conditioning_forward(ctx0, w_.self_cond, hidden.data(), soft_or_null,
-                                seq, H, cfg_.text.intermediate_size, cfg_.text.rms_norm_eps); }
+                                seq, H, cfg_.text.intermediate_size,
+                                cfg_.text.rms_norm_eps, cfg_.is_int4_quantized()); }
 
     // Decoder layers (bidirectional, read-only encoder KV).
     //

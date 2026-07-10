@@ -6,6 +6,7 @@
 #include "../../common/io/gguf.hpp"
 #include "../../common/gpu/buffer.hpp"
 #include "../../common/gpu/engine.hpp"
+#include "fusions/int4_awq.hpp"
 #include <fstream>
 #include <memory>
 #include <unordered_map>
@@ -676,8 +677,10 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
         lw.enc_layer_scalar = scalar_bf16(
             sf.get("model.encoder.language_model.layers." + std::to_string(l) + ".layer_scalar"));
 
-        // Dense shared MLP. NVFP4 uses a fused gate/up; int4 and BF16 keep gate
-        // and up separate and dispatch each through matmul_linear_weight.
+        // Dense shared MLP. The AWQ checkpoint deliberately leaves this shared
+        // path in F16, but it is still part of every INT4 denoiser layer.  Its
+        // gate/up weights can be concatenated at load so one same-input GEMM
+        // produces both operands (A/B: DIFF_INT4_FUSE_DENSE_GATE_UP).
         bool mlp_nvfp4 = sf.has(p + "mlp.gate_proj.weight_packed") &&
                          sf.get(p + "mlp.gate_proj.weight_packed").dtype != "I32";
         if (mlp_nvfp4) {
@@ -685,8 +688,19 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
                 sf, p + "mlp.gate_proj", p + "mlp.up_proj", ql);
             lw.mlp.down_proj = upload_linear_weight(sf, p + "mlp.down_proj", ql);
         } else {
-            lw.mlp.gate_proj = upload_linear_weight(sf, p + "mlp.gate_proj", ql);
-            lw.mlp.up_proj   = upload_linear_weight(sf, p + "mlp.up_proj", ql);
+            bool fuse_awq_gate_up = cfg.is_int4_quantized() &&
+                                    diff_int4_fuse_dense_gate_up_enabled() &&
+                                    sf.has(p + "mlp.gate_proj.weight") &&
+                                    sf.has(p + "mlp.up_proj.weight");
+            if (fuse_awq_gate_up) {
+                lw.mlp.gate_up_proj_bf16 = upload_bf16_pair(
+                    sf.get(p + "mlp.gate_proj.weight"),
+                    sf.get(p + "mlp.up_proj.weight"), ql,
+                    (p + "mlp.{gate,up}_proj.weight").c_str());
+            } else {
+                lw.mlp.gate_proj = upload_linear_weight(sf, p + "mlp.gate_proj", ql);
+                lw.mlp.up_proj   = upload_linear_weight(sf, p + "mlp.up_proj", ql);
+            }
             lw.mlp.down_proj = upload_linear_weight(sf, p + "mlp.down_proj", ql);
         }
 
@@ -737,6 +751,11 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
                             sf, ep + "gate_proj", ep + "up_proj", eq));
                         shard.down_proj_int4.push_back(upload_int4_linear(sf, ep + "down_proj", eq));
                     }
+                    // Pointer tables are immutable model state.  Build them
+                    // once so DIFF_INT4_GROUPED_DPAS_MOE has no per-step host
+                    // address-vector upload before launching its grouped Xe2
+                    // DPAS kernels.
+                    ensure_int4_expert_pointer_tables(shard, GpuEngine::get(shard_gpu));
                 } else if (experts_nvfp4) {
                     shard.gate_up_proj_fp4.reserve(shard.num_experts);
                     shard.down_proj_fp4.reserve(shard.num_experts);

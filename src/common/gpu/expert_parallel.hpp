@@ -21,6 +21,20 @@ struct ExpertProfileLabels {
     const char* combine;
 };
 
+// Optional terminal fusion for the single-GPU INT4 expert path.  The expert
+// runner owns the expert-sorted output and route-slot map, so it is the only
+// layer that can fold weighted combine directly into DiffusionGemma's dual
+// postnorm without materializing a seq*hidden MoE tensor.
+struct ExpertPostnormFusion {
+    const bf16* mlp_out = nullptr;
+    const bf16* mlp_norm_weight = nullptr;
+    const bf16* moe_norm_weight = nullptr;
+    const bf16* combine_norm_weight = nullptr;
+    bf16* hidden = nullptr;
+    float layer_scalar = 1.0f;
+    float rms_eps = 1e-6f;
+};
+
 inline const ExpertProfileLabels& expert_profile_labels(bool is_encoder, bool is_full) {
     static constexpr ExpertProfileLabels labels[4] = {
         {
@@ -69,6 +83,19 @@ void expert_parallel_forward(
     const std::vector<float>& weight,
     const ExpertProfileLabels& prof);
 
+// Returns true when the terminal combine+postnorm was executed.  It is
+// intentionally restricted to one local INT4 shard covering every expert;
+// multi-GPU/sharded execution retains the ordinary reduction path.
+bool expert_parallel_forward_int4_fused_postnorm(
+    GpuEngine& owner,
+    const DiffMoE& moe,
+    const bf16* expert_in,
+    int seq, int H, int E, int top_k, int moe_intermediate,
+    const int* idx_dev,
+    const float* weight_dev,
+    const ExpertPostnormFusion& fusion,
+    const ExpertProfileLabels& prof);
+
 void expert_parallel_forward(
     GpuEngine& owner,
     const DiffMoE& moe,
@@ -97,3 +124,8 @@ void ensure_expert_pointer_tables_raw(DiffExpertShard& shard, GpuEngine& ctx);
 // non-NVFP4 shards. See DiffExpertShard::pt_*_coal.
 void ensure_expert_pointer_tables_coalesced(DiffExpertShard& shard, GpuEngine& ctx,
                                              int moe_intermediate, int hidden_size);
+
+// Build persistent raw packed-weight / BF16-scale tables for the INT4-AWQ
+// grouped DPAS MoE path.  The tables are load-time state so a decode step does
+// not need to upload a host vector of per-expert addresses.
+void ensure_int4_expert_pointer_tables(DiffExpertShard& shard, GpuEngine& ctx);

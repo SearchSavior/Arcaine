@@ -180,6 +180,15 @@ target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_server PRIVATE DNNL::dnnl)
 
+# Focused INT4-AWQ decode-fusion benchmark.  Uses DiffusionGemma's fixed
+# canvas=256 / hidden=2816 / top-k=8 shapes and compares the actual adjacent
+# kernel sequences; it intentionally does not load a model or run inference.
+add_executable(diffusion_int4_fusion_bench src/diffusion_int4_fusion_bench.cpp)
+target_compile_options(diffusion_int4_fusion_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(diffusion_int4_fusion_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_libraries(diffusion_int4_fusion_bench PRIVATE DNNL::dnnl)
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 — Qwen3.5-MoE NVFP4 loader smoke test. Loads real checkpoint weights
 # (no kernels) and verifies tensor-name resolution, scale transpose

@@ -52,7 +52,8 @@ public:
     std::vector<int> generate(const std::vector<int>& prompt_ids,
                               int max_new_tokens, int max_denoising_steps,
                               unsigned seed, bool verbose,
-                              const DiffStreamCallback& on_step = nullptr);
+                              const DiffStreamCallback& on_step = nullptr,
+                              bool ignore_eos = false);
 
     const DiffConfig& config() const { return cfg_; }
     const DiffPerfStats& stats() const { return stats_; }   // from the last generate()

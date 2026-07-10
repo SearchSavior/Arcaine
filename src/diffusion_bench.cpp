@@ -199,6 +199,11 @@ int main(int argc, char** argv) {
     bool print_result = false;
     bool device_index_set = false;
     DiffPlacementOptions placement;
+    bool force_full_canvas = [] {
+        const char* e = std::getenv("DIFF_BENCH_FORCE_FULL_CANVAS");
+        return e && std::strcmp(e, "0") && std::strcmp(e, "off") &&
+               std::strcmp(e, "false") && std::strcmp(e, "no");
+    }();
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -246,6 +251,8 @@ int main(int argc, char** argv) {
         std::printf("[bench] matrix: kernels={%s} p={%s} n={%s} ds=%d | warmup=%d runs=%d | "
                     "cells=%zu\n", kernels.c_str(), p_csv.c_str(), n_csv.c_str(), ds,
                     warmup, runs, kernel_list.size() * p_list.size() * n_list.size());
+        std::printf("[bench] EOS commit trimming: %s\n",
+                    force_full_canvas ? "disabled (full canvas counted)" : "enabled");
 
         double kv_gb       = model.kv_cache_bytes() / (1024.0 * 1024.0 * 1024.0);
         double kv_mb_per_t = model.kv_cache_bytes_per_token() / (1024.0 * 1024.0);
@@ -273,11 +280,13 @@ int main(int argc, char** argv) {
                     // so the reported stddev is pure timing jitter (not content
                     // variation in EOS / output-token counts).
                     for (int w = 0; w < warmup; ++w)
-                        model.generate(prompt, n, ds, seed, false);
+                        model.generate(prompt, n, ds, seed, false, nullptr,
+                                       force_full_canvas);
 
                     std::vector<double> pre, dec, canvas, fwd; double tpf = 0, pass = 0;
                     for (int r = 0; r < runs; ++r) {
-                        std::vector<int> out = model.generate(prompt, n, ds, seed, false);
+                        std::vector<int> out = model.generate(
+                            prompt, n, ds, seed, false, nullptr, force_full_canvas);
                         const DiffPerfStats& s = model.stats();
                         double output_tps = output_tps_for(s);
                         double tok_per_fwd = tokens_per_forward_for(s);

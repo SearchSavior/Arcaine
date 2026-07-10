@@ -1,5 +1,7 @@
 #include "expert_parallel.hpp"
+#include "int4_grouped_moe.hpp"
 #include "../../modeling/diffusion_gemma/arena.hpp"
+#include "../../modeling/diffusion_gemma/fusions/int4_awq.hpp"
 #include "ops.hpp"
 #include "../kernels/elementwise.hpp"
 #include "../../utils/profile.hpp"
@@ -298,6 +300,34 @@ void ensure_expert_pointer_tables_raw(DiffExpertShard& shard, GpuEngine& ctx) {
     q.wait();
     shard.pt_raw_built = true;
  }
+
+void ensure_int4_expert_pointer_tables(DiffExpertShard& shard, GpuEngine& ctx) {
+    if (shard.pt_int4_built || !shard.int4) return;
+    const int localE = shard.num_experts;
+    if ((int)shard.gate_up_proj_int4.size() != localE ||
+        (int)shard.down_proj_int4.size() != localE)
+        throw std::runtime_error("INT4 expert pointer table: incomplete shard");
+
+    std::vector<const uint8_t*> gate_w(localE), down_w(localE);
+    std::vector<const bf16*> gate_s(localE), down_s(localE);
+    for (int e = 0; e < localE; ++e) {
+        gate_w[e] = shard.gate_up_proj_int4[e].weight_packed.data();
+        gate_s[e] = shard.gate_up_proj_int4[e].weight_scale.data();
+        down_w[e] = shard.down_proj_int4[e].weight_packed.data();
+        down_s[e] = shard.down_proj_int4[e].weight_scale.data();
+    }
+    auto& q = ctx.queue;
+    shard.pt_int4_gate_w = GpuBuffer<const uint8_t*>((size_t)localE, q);
+    shard.pt_int4_gate_s = GpuBuffer<const bf16*>((size_t)localE, q);
+    shard.pt_int4_down_w = GpuBuffer<const uint8_t*>((size_t)localE, q);
+    shard.pt_int4_down_s = GpuBuffer<const bf16*>((size_t)localE, q);
+    shard.pt_int4_gate_w.upload(gate_w.data(), localE);
+    shard.pt_int4_gate_s.upload(gate_s.data(), localE);
+    shard.pt_int4_down_w.upload(down_w.data(), localE);
+    shard.pt_int4_down_s.upload(down_s.data(), localE);
+    q.wait();
+    shard.pt_int4_built = true;
+}
 
 // Build persistent COALESCED (xe2 DPAS) weight pointer tables, once at load.
 // Pre-warms nvfp4_coalesced_weight per expert (caches in W.weight_coal; the
@@ -632,7 +662,8 @@ static void run_shard(
 	    const std::vector<float>& weight,
 	    const ExpertProfileLabels& prof,
 	    const int* idx_dev = nullptr,
-	    const float* weight_dev = nullptr)
+	    const float* weight_dev = nullptr,
+        const ExpertPostnormFusion* postnorm = nullptr)
 	{
 	    auto& q = ctx.queue;
 	    auto& ar = diffarena::arena(ctx.index);
@@ -691,7 +722,7 @@ static void run_shard(
 	        }
 	    }
 
-    q.memset(out, 0, (size_t)seq * H * sizeof(bf16));
+	    if (out) q.memset(out, 0, (size_t)seq * H * sizeof(bf16));
     if (A == 0) return;
 
     int T = std::min(moe_tail_cap(), round_up(seq, 8));
@@ -1379,7 +1410,14 @@ static void run_shard(
     }
 
     auto t_combine = diffprof::tic(q);
-    {
+    if (postnorm) {
+        fused_int4_expert_combine_postnorm(
+            q, Ye.data(), slot_dev.data(), w_dev.data(), top_k,
+            postnorm->mlp_out, postnorm->mlp_norm_weight,
+            postnorm->moe_norm_weight, postnorm->combine_norm_weight,
+            postnorm->hidden, postnorm->layer_scalar,
+            seq, H, postnorm->rms_eps);
+    } else {
         const int32_t* slot = slot_dev.data();
         const float* wt = w_dev.data();
         const bf16* ye = Ye.data();
@@ -1447,6 +1485,33 @@ void expert_parallel_forward(
             if (!nvfp4_session_recording(owner_q)) owner_q.wait();
         }
     }
+}
+
+bool expert_parallel_forward_int4_fused_postnorm(
+    GpuEngine& owner,
+    const DiffMoE& moe,
+    const bf16* expert_in,
+    int seq, int H, int E, int top_k, int moe_intermediate,
+    const int* idx_dev,
+    const float* weight_dev,
+    const ExpertPostnormFusion& fusion,
+    const ExpertProfileLabels& prof)
+{
+    if (!diff_int4_fuse_expert_postnorm_enabled() ||
+        !idx_dev || !weight_dev || moe.expert_shards.size() != 1)
+        return false;
+
+    const DiffExpertShard& shard = moe.expert_shards.front();
+    if (!shard.int4 || shard.gpu != owner.index || shard.first_expert != 0 ||
+        shard.num_experts != E)
+        return false;
+
+    static const std::vector<int> empty_idx;
+    static const std::vector<float> empty_weight;
+    run_shard(owner, shard, expert_in, /*out=*/nullptr, seq, H, top_k,
+              moe_intermediate, empty_idx, empty_weight, prof,
+              idx_dev, weight_dev, &fusion);
+    return true;
 }
 
 void expert_parallel_forward(

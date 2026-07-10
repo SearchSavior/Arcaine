@@ -47,6 +47,10 @@ struct DiffDenseMLP {
     DiffLinearWeight gate_proj;  // BF16 path: (2112, 2816)
     DiffLinearWeight up_proj;    // BF16 path: (2112, 2816)
     DiffLinearWeight down_proj;  // BF16 or NVFP4 equivalent
+    // AWQ checkpoint keeps the shared MLP in BF16/F16.  Optional gate+up row
+    // concatenation turns its two same-input GEMMs into one (2*intermediate,N)
+    // GEMM. Populated only under DIFF_INT4_FUSE_DENSE_GATE_UP.
+    GpuBuffer<bf16> gate_up_proj_bf16;
     Nvfp4Linear gate_up_proj_fp4; // NVFP4 fused gate/up: (2*2112, 2816)
 };
 
@@ -98,6 +102,16 @@ struct DiffExpertShard {
     GpuBuffer<const uint8_t*> pt_gate_w_coal;
     GpuBuffer<const uint8_t*> pt_down_w_coal;
     bool                      pt_coal_built = false;
+
+    // Persistent raw pointer tables for the native grouped INT4-AWQ DPAS MoE
+    // path.  Int4Linear stores N-major packed s4 rows and [K/group,N] BF16
+    // scales; the grouped kernel follows these pointers directly, avoiding a
+    // per-denoising-step host upload of the local expert vector.
+    GpuBuffer<const uint8_t*> pt_int4_gate_w;
+    GpuBuffer<const bf16*>    pt_int4_gate_s;
+    GpuBuffer<const uint8_t*> pt_int4_down_w;
+    GpuBuffer<const bf16*>    pt_int4_down_s;
+    bool                      pt_int4_built = false;
 };
 
 // Sparse MoE (128 experts, top-8, per-expert intermediate 704). Router weights
