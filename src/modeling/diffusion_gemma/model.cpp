@@ -5,6 +5,7 @@
 #include "self_conditioning.hpp"
 #include "fusions/logits.hpp"
 #include "../../common/gpu/engine.hpp"
+#include "../../common/gpu/nvfp4.hpp"
 #include "../../common/kernels/embedding.hpp"
 #include <algorithm>
 #include <cmath>
@@ -227,9 +228,28 @@ void DiffusionGemmaModel::decode_forward(
                                 seq, H, cfg_.text.intermediate_size, cfg_.text.rms_norm_eps); }
 
     // Decoder layers (bidirectional, read-only encoder KV).
-    for (int l = 0; l < split_layer_; ++l)
-        diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
-                           seq, enc_len, cfg_.text, /*is_encoder=*/false);
+    //
+    // Whole-step SYCL graph capture: each decoder layer's attention→MoE kernel
+    // sequence is captured as one command_graph keyed by (layer, is_sliding), then
+    // replayed on every subsequent denoising step. The Nvfp4GraphSession
+    // registers itself in the global active-session map on begin(), so every
+    // downstream guard (session-conditional waits in profile/expert_parallel/
+    // matmul_nvfp4, and run_shard's forced gpu_layout dispatch) activates
+    // automatically via nvfp4_session_recording(q) — no pointer threading needed.
+    // Gate: DIFF_NVFP4_SYCL_GRAPH (unset = eager, no capture). AB knob for perf.
+    // Single-GPU scope: split_layer_==L so this loop runs every layer on ctx0;
+    // the multi-GPU ctx1 loop below is untouched (stays on existing per-kernel
+    // capture). Workspace address stability across steps is verified in Phase 4.
+    for (int l = 0; l < split_layer_; ++l) {
+        Nvfp4GraphSession session;
+        Nvfp4SyclGraphKey key = nvfp4_step_key(q0, l, /*is_sliding=*/!w_.layers[l].is_full,
+                                               /*denoise_step=*/0);
+        if (session.begin(q0, key)) {
+            diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
+                               seq, enc_len, cfg_.text, /*is_encoder=*/false);
+            session.end_and_replay();
+        }
+    }
 
     if (split_layer_ < L) {
         auto& ctx1 = GpuEngine::get(1);

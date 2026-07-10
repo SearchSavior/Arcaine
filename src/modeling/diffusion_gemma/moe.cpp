@@ -85,7 +85,16 @@ static void dense_mlp(GpuEngine& ctx, const DiffDenseMLP& w,
         auto act_a = ar.alloc<bf16>((size_t)seq * inter);
         geglu_strided(q, gate_up_a.data(), act_a.data(), seq, inter);
         gate_up_a.reset();
-        matmul_nvfp4(act_a.data(), seq, inter, w.down_proj.fp4, out, ctx);
+        // down_proj goes through matmul_nvfp4 (bf16->pack->matmul). Pass stable
+        // arena-backed pack workspaces so matmul_nvfp4 does NOT allocate a
+        // transient sycl::malloc_device buffer (which would be freed at scope
+        // exit and dangle at SYCL-graph-replay time) and does NOT wait. This
+        // keeps the dense-MLP down_proj capture-safe inside a Nvfp4GraphSession.
+        int dG = inter / 16;
+        auto dp_packed_a = ar.alloc<uint8_t>((size_t)seq * inter / 2);
+        auto dp_scale_a  = ar.alloc<uint8_t>((size_t)seq * dG);
+        matmul_nvfp4(act_a.data(), seq, inter, w.down_proj.fp4, out, ctx,
+                    dp_packed_a.data(), dp_scale_a.data());
         return;
     }
 

@@ -19,13 +19,11 @@
 #include <string>
 #include "buffer.hpp"
 #include "engine.hpp"
-
 #ifndef DIFF_DPAS_INTRINSIC_DECL
 #define DIFF_DPAS_INTRINSIC_DECL
 using diff_dpas_v8s = short __attribute__((ext_vector_type(8)));
 using diff_dpas_v8i = int   __attribute__((ext_vector_type(8)));
 using diff_dpas_v8f = float __attribute__((ext_vector_type(8)));
-
 // __spirv_SubgroupMatrixMultiplyAccumulateINTEL has no host definition (it's a
 // SPIRV intrinsic materialized only under __SYCL_DEVICE_ONLY__). The #else
 // stub exists so host-side translation units that pull in this header compile,
@@ -45,9 +43,7 @@ SYCL_EXTERNAL inline diff_dpas_v8f __spirv_SubgroupMatrixMultiplyAccumulateINTEL
 #pragma clang diagnostic pop
 #endif
 #endif
-
 static constexpr int kNvfp4DpasBF16 = 0x3000;
-
 struct Nvfp4Linear {
     int in_features = 0;
     int out_features = 0;
@@ -67,12 +63,9 @@ struct Nvfp4Linear {
     // [n/16][k/16][16 lanes][8 packed bytes].
     mutable GpuBuffer<uint8_t> weight_coal;
     mutable int weight_coal_gpu = -1;
-
     bool empty() const { return weight_packed.empty(); }
 };
-
 enum class Nvfp4WeightLayout { Raw = 0, Any = 1 };
-
 inline Nvfp4WeightLayout nvfp4_weight_layout() {
     static Nvfp4WeightLayout layout = [] {
         const char* env = std::getenv("DIFF_NVFP4_WEIGHT_LAYOUT");
@@ -83,12 +76,10 @@ inline Nvfp4WeightLayout nvfp4_weight_layout() {
     }();
     return layout;
 }
-
 inline bool nvfp4_verbose() {
     static bool enabled = std::getenv("DIFF_NVFP4_VERBOSE") != nullptr;
     return enabled;
 }
-
 inline bool nvfp4_sycl_graph_enabled() {
     static bool enabled = [] {
         const char* env = std::getenv("DIFF_NVFP4_SYCL_GRAPH");
@@ -97,7 +88,6 @@ inline bool nvfp4_sycl_graph_enabled() {
     }();
     return enabled;
 }
-
 inline size_t nvfp4_sycl_graph_cache_limit() {
     static size_t limit = [] {
         const char* env = std::getenv("DIFF_NVFP4_SYCL_GRAPH_CACHE_LIMIT");
@@ -108,17 +98,14 @@ inline size_t nvfp4_sycl_graph_cache_limit() {
     }();
     return limit;
 }
-
 struct Nvfp4SyclGraphKey {
     const sycl::queue* queue = nullptr;
     int kind = 0;
     std::vector<uintptr_t> args;
-
     bool operator==(const Nvfp4SyclGraphKey& other) const {
         return queue == other.queue && kind == other.kind && args == other.args;
     }
 };
-
 struct Nvfp4SyclGraphKeyHash {
     size_t operator()(const Nvfp4SyclGraphKey& key) const {
         size_t hash = std::hash<const sycl::queue*>{}(key.queue);
@@ -130,17 +117,14 @@ struct Nvfp4SyclGraphKeyHash {
         return hash;
     }
 };
-
 struct Nvfp4SyclGraphEntry {
     using Modifiable = sycl::ext::oneapi::experimental::command_graph<>;
     using Executable = sycl::ext::oneapi::experimental::command_graph<
         sycl::ext::oneapi::experimental::graph_state::executable>;
-
     std::unique_ptr<Modifiable> graph;
     std::unique_ptr<Executable> executable;
     bool unavailable = false;
 };
-
 struct Nvfp4SyclGraphCache {
     std::mutex mutex;
     std::unordered_map<Nvfp4SyclGraphKey, Nvfp4SyclGraphEntry,
@@ -150,27 +134,260 @@ struct Nvfp4SyclGraphCache {
     size_t fallbacks = 0;
     size_t capacity_bypasses = 0;
 };
-
 inline Nvfp4SyclGraphCache& nvfp4_sycl_graph_cache() {
     static Nvfp4SyclGraphCache cache;
     return cache;
 }
-
 inline uintptr_t nvfp4_sycl_graph_float_key(float value) {
     uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
 }
 
+// ---------------------------------------------------------------------------
+// Nvfp4GraphSession
+//
+// The per-call micro-graph cache below (nvfp4_sycl_graph_submit) captures and
+// replays ONE kernel at a time, keyed by that kernel's own buffer pointers.
+// That's fine for amortizing a single pack/matmul launch, but a denoising
+// step calls many of these in sequence (attention -> router -> gather/pack ->
+// grouped GEMM -> combine), and today each still gets its own
+// begin_recording/end_recording/finalize and its own q.ext_oneapi_graph()
+// dispatch. A session instead lets a caller open ONE graph, have every kernel
+// in the step record into it (including attention kernels defined outside
+// this file), and replay the whole step with a single graph launch -- which
+// is the piece that actually removes host round-trips between kernels within
+// a step, not just between repeated steps.
+//
+// Usage:
+//   Nvfp4GraphSession session;
+//   if (session.begin(q, step_key)) {
+//       attn_forward(..., &session);
+//       moe_forward(..., &session);
+//       session.end_and_replay();
+//   } else {
+//       // cache hit: session.begin() already replayed the cached graph.
+//   }
+//
+// Layer types are static per DiffusionGemma config (layer_types is fixed at
+// model-build time), so the sequence of kernels captured for a given
+// (layer_index, is_sliding) step_key never changes shape across replays --
+// this is what makes whole-step capture safe to cache and replay verbatim,
+// the same way the per-kernel cache below already relies on stable shapes.
+// Queue-keyed registry of *actively recording* sessions. nvfp4_sycl_graph_submit()
+// consults this as a backstop: when a session is recording on a queue, ANY
+// per-kernel micro-capture attempt on that queue would call begin_recording on
+// an already-recording queue, which throws (intel-llvm graph_impl.cpp:2238) and
+// would poison the per-kernel cache (entry marked `unavailable` forever).
+// The registry lets such call sites stand down to a bare submit() -- which the
+// active session's recording captures as a node -- even when the caller didn't
+// receive an explicit session pointer (e.g. the dense-MLP pack_bf16_to_nvfp4
+// and the MoE Xe-pack paths, which thread through matmul_nvfp4 / expert_parallel
+// without an explicit session argument). Explicit session threading (Phases 1-2)
+// remains the preferred fast path; this registry is the correctness backstop.
+struct Nvfp4GraphSession;
+inline std::mutex& nvfp4_session_registry_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::unordered_map<const sycl::queue*, Nvfp4GraphSession*>&
+nvfp4_session_registry() {
+    static std::unordered_map<const sycl::queue*, Nvfp4GraphSession*> r;
+    return r;
+}
+// Returns the session currently recording on `q`, or nullptr if none. Called
+// on the hot path of nvfp4_sycl_graph_submit; the map is normally empty when no
+// session is active, so the lookup is a fast miss.
+inline Nvfp4GraphSession* nvfp4_active_session(const sycl::queue& q) {
+    std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
+    auto it = nvfp4_session_registry().find(&q);
+    return it == nvfp4_session_registry().end() ? nullptr : it->second;
+}
+// True iff a Nvfp4GraphSession is currently recording on `q`. Forward-declarable
+// (no Nvfp4GraphSession definition needed) so lightweight headers such as
+// utils/profile.hpp can call it without including nvfp4.hpp's DPAS intrinsics.
+// Used to skip queue waits during recording (q.wait()/stream.wait() throw on a
+// recording queue: "wait cannot be called for a queue which is recording to a
+// command graph").
+//
+// NOTE: declared here, defined out-of-line in common/gpu/expert_parallel.cpp.
+// It must NOT be `inline`: a TU that only forward-declares it (e.g. profile.cpp)
+// emits an external reference; an `inline` definition is only emitted as
+// linkonce_odr by TUs that include this header and use it, and if all such uses
+// are inlined away there is no standalone symbol to satisfy that reference.
+bool nvfp4_session_recording(const sycl::queue& q);
+struct Nvfp4GraphSession {
+    using Modifiable = sycl::ext::oneapi::experimental::command_graph<>;
+    using Executable = sycl::ext::oneapi::experimental::command_graph<
+        sycl::ext::oneapi::experimental::graph_state::executable>;
+
+    sycl::queue* queue_ = nullptr;
+    std::unique_ptr<Modifiable> graph_;
+    bool recording_ = false;
+    // True once begin() has opened a *new* recording that the caller must
+    // populate and close with end_and_replay(). False if begin() found a
+    // cached executable and already replayed it (nothing left to record).
+    bool needs_recording_ = false;
+
+    // True while this session is actively recording -- kernels submitted via
+    // nvfp4_sycl_graph_submit() check this and skip their own micro-graph
+    // capture, just enqueuing directly so they land inside the session graph.
+    bool active() const { return recording_; }
+
+    // Returns true if the caller must record the step's kernels (cache miss);
+    // false if a cached graph was found and already replayed (cache hit).
+    bool begin(sycl::queue& q, const Nvfp4SyclGraphKey& step_key) {
+        queue_ = &q;
+        if (!nvfp4_sycl_graph_enabled()) {
+            needs_recording_ = false;
+            recording_ = false;
+            return true;  // graphs disabled: caller runs kernels eagerly every time
+        }
+        auto& cache = nvfp4_sycl_graph_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto found = cache.entries.find(step_key);
+        if (found != cache.entries.end() && found->second.executable) {
+            ++cache.replays;
+            q.ext_oneapi_graph(*found->second.executable);
+            needs_recording_ = false;
+            recording_ = false;
+            return false;
+        }
+        // Either not present, or present-but-unavailable (previous capture
+        // failed) -- try recording fresh. Reserve/replace the slot now so a
+        // racing session doesn't also try to record the same key.
+        if (found == cache.entries.end() &&
+            cache.entries.size() >= nvfp4_sycl_graph_cache_limit()) {
+            ++cache.capacity_bypasses;
+            needs_recording_ = false;
+            recording_ = false;
+            return true;  // caller runs kernels eagerly, no capture this time
+        }
+        key_ = step_key;
+        // assume_buffer_outlives_graph: oneDNN's SYCL interop may internally use
+        // sycl::buffer for some primitives (e.g. non-batched matmul_bf16). SYCL
+        // throws "Cannot use buffers in a graph without ... assume_buffer_outlives_graph"
+        // if a buffer-accessor is recorded into a graph lacking this property. All
+        // persistent data (weights, KV cache, arena workspaces) is USM and outlives
+        // the graph; the property is the documented oneDNN-interop capture enabler.
+        graph_ = std::make_unique<Modifiable>(q,
+            sycl::property_list{
+                sycl::ext::oneapi::experimental::property::graph::assume_buffer_outlives_graph{}});
+        try {
+            graph_->begin_recording(q);
+        } catch (const std::exception& error) {
+            graph_.reset();
+            needs_recording_ = false;
+            recording_ = false;
+            if (nvfp4_verbose())
+                std::fprintf(stderr, "[nvfp4-graph] session capture disabled: %s\n",
+                             error.what());
+            return true;  // caller runs kernels eagerly this time
+        }
+        recording_ = true;
+        needs_recording_ = true;
+        {
+            std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
+            nvfp4_session_registry()[&q] = this;
+        }
+        return true;
+    }
+
+    // Closes recording, finalizes, caches, and replays the freshly-captured
+    // graph. Call exactly once, after the caller has submitted every kernel
+    // for the step, only when begin() returned true AND active() is true
+    // (i.e. begin() did not already replay a cached hit).
+    void end_and_replay() {
+        if (!recording_) return;  // begin() already replayed a cached graph
+        auto& cache = nvfp4_sycl_graph_cache();
+        // Unregister from the active-session registry now that recording has
+        // ended, so nvfp4_sycl_graph_submit stops standing down for this queue.
+        {
+            std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
+            nvfp4_session_registry().erase(queue_);
+        }
+        try {
+            graph_->end_recording(*queue_);
+            recording_ = false;
+            auto executable = std::make_unique<Executable>(graph_->finalize());
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            Nvfp4SyclGraphEntry entry;
+            entry.graph = std::move(graph_);
+            entry.executable = std::move(executable);
+            ++cache.captures;
+            queue_->ext_oneapi_graph(*entry.executable);
+            cache.entries[key_] = std::move(entry);
+        } catch (const std::exception& error) {
+            if (recording_) {
+                try { graph_->end_recording(*queue_); } catch (...) {}
+                recording_ = false;
+            }
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            ++cache.fallbacks;
+            Nvfp4SyclGraphEntry entry;
+            entry.unavailable = true;
+            cache.entries[key_] = std::move(entry);
+            if (nvfp4_verbose())
+                std::fprintf(stderr, "[nvfp4-graph] session finalize failed: %s\n",
+                             error.what());
+            // Kernels already ran eagerly on queue_ during recording attempts
+            // in SYCL graph semantics recording still enqueues work, so no
+            // separate re-run is needed here; the step's results are correct,
+            // only the *caching* of it for next time failed.
+        }
+    }
+
+    Nvfp4SyclGraphKey key_;
+};
+
+// Builds a step-level cache key from a layer index and its (static) attention
+// kind, so sliding-window layers and global layers -- which submit different
+// kernel sequences -- are never conflated into the same cached graph even
+// though both are "one decoder layer step" at the call site.
+inline Nvfp4SyclGraphKey nvfp4_step_key(const sycl::queue& q, int layer_index,
+                                       bool is_sliding, int denoise_step) {
+    // denoise_step is intentionally NOT part of the key for the *replay*
+    // path -- the kernel sequence for "decoder layer L, sliding" is identical
+    // on every denoising step, so one capture at step 0 should serve all
+    // subsequent steps. It's accepted here only so callers that want
+    // per-step keys (e.g. while validating that shapes truly don't change
+    // across steps) can opt into it via kind, without changing this
+    // function's signature.
+    (void)denoise_step;
+    Nvfp4SyclGraphKey key;
+    key.queue = &q;
+    key.kind = 1000 + layer_index * 2 + (is_sliding ? 0 : 1);
+    return key;
+}
+
 template <class Submit>
 inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
                                     std::initializer_list<uintptr_t> args,
-                                    Submit&& submit) {
+                                    Submit&& submit,
+                                    Nvfp4GraphSession* session = nullptr) {
+    if (session && session->active()) {
+        // An outer Nvfp4GraphSession is already recording this step's graph;
+        // just enqueue -- it gets captured as part of that larger graph
+        // rather than owning its own begin/end/finalize here.
+        submit();
+        return;
+    }
+    if (Nvfp4GraphSession* active = nvfp4_active_session(q)) {
+        // Backstop: a session is recording on this queue but the caller didn't
+        // carry an explicit session pointer (e.g. dense-MLP pack_bf16_to_nvfp4
+        // via matmul_nvfp4, or MoE pack paths via expert_parallel). Stand down
+        // the same way -- a bare submit() is captured as a node of the active
+        // session's graph. Without this, the begin_recording() below would
+        // throw on the already-recording queue and poison this per-kernel
+        // cache entry (unavailable forever).
+        (void)active;
+        submit();
+        return;
+    }
     if (!nvfp4_sycl_graph_enabled()) {
         submit();
         return;
     }
-
     Nvfp4SyclGraphKey key{&q, kind, args};
     auto& cache = nvfp4_sycl_graph_cache();
     std::lock_guard<std::mutex> lock(cache.mutex);
@@ -190,7 +407,6 @@ inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
         submit();
         return;
     }
-
     auto [it, inserted] = cache.entries.emplace(std::move(key), Nvfp4SyclGraphEntry{});
     auto& entry = it->second;
     bool recording = false;
@@ -220,7 +436,6 @@ inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
         submit();
     }
 }
-
 inline void nvfp4_sycl_graph_report() {
     if (!nvfp4_sycl_graph_enabled()) return;
     auto& cache = nvfp4_sycl_graph_cache();
@@ -230,14 +445,12 @@ inline void nvfp4_sycl_graph_report() {
                  cache.captures, cache.replays, cache.fallbacks,
                  cache.capacity_bypasses, cache.entries.size());
 }
-
 struct Nvfp4MatmulKey {
     int gpu, M, K, N, layout;
     bool operator==(const Nvfp4MatmulKey& o) const {
         return gpu == o.gpu && M == o.M && K == o.K && N == o.N && layout == o.layout;
     }
 };
-
 struct Nvfp4MatmulKeyHash {
     size_t operator()(const Nvfp4MatmulKey& k) const {
         size_t h = std::hash<int>{}(k.gpu);
@@ -248,12 +461,10 @@ struct Nvfp4MatmulKeyHash {
         return h;
     }
 };
-
 struct Nvfp4MatmulEntry {
     dnnl::matmul primitive;
     dnnl::memory::desc weights_md;
 };
-
 inline float nvfp4_e4m3_to_float(uint8_t bits) {
     if (bits == 0) return 0.0f;
     float sign = (bits & 0x80) ? -1.0f : 1.0f;
@@ -264,28 +475,23 @@ inline float nvfp4_e4m3_to_float(uint8_t bits) {
         : (1.0f + mant / 8.0f) * sycl::exp2((float)exp - 7.0f);
     return sign * v;
 }
-
 inline uint8_t nvfp4_encode_e4m3_positive(float x) {
     if (!(x > 0.0f)) return 0;
     if (x >= 448.0f) return 0x7e;
-
     constexpr float kSubStep = 0.001953125f;      // 2^-9
     constexpr float kNormalMin = 0.015625f;       // 2^-6
     constexpr float kSubNormalCut = 0.0146484375f; // midpoint between 7*2^-9 and 2^-6
-
     if (x < kSubNormalCut) {
         int mant = (int)sycl::floor(x / kSubStep + 0.5f);
         if (mant <= 0) return 0;
         if (mant > 7) mant = 7;
         return (uint8_t)mant;
     }
-
     float efloat = sycl::floor(sycl::log2(sycl::fmax(x, kNormalMin)));
     int actual_exp = (int)efloat;
     if (actual_exp < -6) actual_exp = -6;
     int exp = actual_exp + 7;
     if (exp > 15) return 0x7e;
-
     float step = sycl::exp2((float)actual_exp - 3.0f);
     int mant = (int)sycl::floor(x / step - 8.0f + 0.5f);
     if (mant < 0) mant = 0;
@@ -297,11 +503,9 @@ inline uint8_t nvfp4_encode_e4m3_positive(float x) {
     if (exp == 15 && mant > 6) return 0x7e;
     return (uint8_t)((exp << 3) | mant);
 }
-
 inline uint8_t nvfp4_encode_e2m1(float x) {
     uint8_t sign = 0;
     if (x < 0.0f) { sign = 0x8; x = -x; }
-
     uint8_t code = 0;
     if (x < 0.25f) code = 0;          // 0
     else if (x < 0.75f) code = 1;     // 0.5
@@ -313,7 +517,6 @@ inline uint8_t nvfp4_encode_e2m1(float x) {
     else code = 7;                    // 6
     return sign | code;
 }
-
 inline void pack_bf16_to_nvfp4(
     sycl::queue& q,
     const bf16* src,
@@ -321,7 +524,8 @@ inline void pack_bf16_to_nvfp4(
     uint8_t* scales,
     int M,
     int K,
-    float input_global_scale)
+    float input_global_scale,
+    Nvfp4GraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("NVFP4 activation K must be divisible by 16");
     int G = K / 16;
@@ -335,13 +539,11 @@ inline void pack_bf16_to_nvfp4(
             int m = (int)id[0];
             int g = (int)id[1];
             int k0 = g * 16;
-
             float max_abs = 0.0f;
             for (int i = 0; i < 16; ++i) {
                 float v = bf16_to_float(src[(size_t)m * K + k0 + i]);
                 max_abs = sycl::fmax(max_abs, sycl::fabs(v));
             }
-
             uint8_t scale_bits = 0;
             float scale = 0.0f;
             if (max_abs > 0.0f) {
@@ -350,7 +552,6 @@ inline void pack_bf16_to_nvfp4(
                 scale = nvfp4_e4m3_to_float(scale_bits);
             }
             scales[(size_t)m * G + g] = scale_bits;
-
             for (int i = 0; i < 16; i += 2) {
                 uint8_t lo = 0, hi = 0;
                 if (scale > 0.0f) {
@@ -365,9 +566,8 @@ inline void pack_bf16_to_nvfp4(
             }
         });
     });
-    });
+    }, session);
 }
-
 inline Nvfp4MatmulEntry& nvfp4_matmul_entry(GpuEngine& ctx, int M, int K, int N) {
     static std::unordered_map<Nvfp4MatmulKey, Nvfp4MatmulEntry, Nvfp4MatmulKeyHash> cache;
     Nvfp4WeightLayout layout = nvfp4_weight_layout();
@@ -405,13 +605,11 @@ inline Nvfp4MatmulEntry& nvfp4_matmul_entry(GpuEngine& ctx, int M, int K, int N)
     }
     return it->second;
 }
-
 inline const uint8_t* nvfp4_weight_data(const Nvfp4Linear& W,
                                         const dnnl::memory::desc& weights_md,
                                         int K, int N, GpuEngine& ctx) {
     if (nvfp4_weight_layout() == Nvfp4WeightLayout::Raw)
         return W.weight_packed.data();
-
     size_t bytes = weights_md.get_size();
     if (W.weight_any.empty() || W.weight_any_bytes != bytes || W.weight_any_gpu != ctx.index) {
         using dt = dnnl::memory::data_type;
@@ -431,7 +629,6 @@ inline const uint8_t* nvfp4_weight_data(const Nvfp4Linear& W,
     }
     return W.weight_any.data();
 }
-
 inline void matmul_nvfp4_packed(
     const uint8_t* A_packed,
     const uint8_t* A_scale,
@@ -447,10 +644,8 @@ inline void matmul_nvfp4_packed(
         throw std::runtime_error("matmul_nvfp4_packed: K must be divisible by 16");
     if (W.dst_scale.empty())
         throw std::runtime_error("matmul_nvfp4_packed: missing persistent destination scale");
-
     int N = W.out_features;
     int G = K / 16;
-
     using dt = dnnl::memory::data_type;
     using tag = dnnl::memory::format_tag;
     auto src_md = dnnl::memory::desc({M, K}, dt::f4_e2m1, tag::ab);
@@ -458,10 +653,8 @@ inline void matmul_nvfp4_packed(
     auto src_scales_md = dnnl::memory::desc({M, G}, dt::f8_e4m3, tag::ab);
     auto weight_scales_md = dnnl::memory::desc({G, N}, dt::f8_e4m3, tag::ab);
     auto dst_scale_md = dnnl::memory::desc({1}, dt::f32, tag::a);
-
     auto& entry = nvfp4_matmul_entry(ctx, M, K, N);
     const uint8_t* weight_data = nvfp4_weight_data(W, entry.weights_md, K, N, ctx);
-
     entry.primitive.execute(ctx.stream, {
         {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
             src_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
@@ -482,14 +675,13 @@ inline void matmul_nvfp4_packed(
             dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
 }
-
 // ---------------------------------------------------------------------------
 // Batched NVFP4 GEMM (Direction B, Phase 1).
 //
 // oneDNN batched f4_e2m1 matmul. Validated by Probe 1 (nvfp4_batched_probe):
 //   - src scales     [B,M,G] f8_e4m3, mask=7, groups{1,1,16}
 //   - weight scales  [B,G,N] f8_e4m3, mask=7, groups{1,16,1}   (batched; the
-//     shared [G,N] layout is REJECTED by oneDNN at execute — do not use it)
+//     shared [G,N] layout is REJECTED by oneDNN at execute -- do not use it)
 //   - dst scale      [1]     f32,    mask=0 (shared across the batch)
 // Weights are fed in the raw per-expert layout (each [N,K] f4, K-contiguous,
 // matching the single kernel's tag::ba on {K,N}). Concatenating E experts
@@ -497,14 +689,12 @@ inline void matmul_nvfp4_packed(
 // tag::acb (B slow, N mid, K fast). No reorder / no Any-layout path (the bench
 // builds the batched buffer directly from the per-expert packed weights).
 // ---------------------------------------------------------------------------
-
 struct Nvfp4BatchedMatmulKey {
     int gpu, B, M, K, N;
     bool operator==(const Nvfp4BatchedMatmulKey& o) const {
         return gpu == o.gpu && B == o.B && M == o.M && K == o.K && N == o.N;
     }
 };
-
 struct Nvfp4BatchedMatmulKeyHash {
     size_t operator()(const Nvfp4BatchedMatmulKey& k) const {
         size_t h = std::hash<int>{}(k.gpu);
@@ -515,12 +705,10 @@ struct Nvfp4BatchedMatmulKeyHash {
         return h;
     }
 };
-
 struct Nvfp4BatchedMatmulEntry {
     dnnl::matmul primitive;
     dnnl::memory::desc weights_md;
 };
-
 inline Nvfp4BatchedMatmulEntry& nvfp4_matmul_batched_entry(
     GpuEngine& ctx, int B, int M, int K, int N)
 {
@@ -557,7 +745,6 @@ inline Nvfp4BatchedMatmulEntry& nvfp4_matmul_batched_entry(
     }
     return it->second;
 }
-
 inline void matmul_nvfp4_packed_batched(
     const uint8_t* A_packed,    // [B, M, K] f4_e2m1 (tag::abc, K contiguous)
     const uint8_t* A_scale,     // [B, M, G] f8_e4m3 (tag::abc, G contiguous)
@@ -571,7 +758,6 @@ inline void matmul_nvfp4_packed_batched(
     if (K % 16 != 0)
         throw std::runtime_error("matmul_nvfp4_packed_batched: K must be divisible by 16");
     int G = K / 16;
-
     using dt = dnnl::memory::data_type;
     using tag = dnnl::memory::format_tag;
     auto src_md         = dnnl::memory::desc({B, M, K}, dt::f4_e2m1, tag::abc);
@@ -579,7 +765,6 @@ inline void matmul_nvfp4_packed_batched(
     auto src_scales_md  = dnnl::memory::desc({B, M, G}, dt::f8_e4m3, tag::abc);
     auto w_scales_md    = dnnl::memory::desc({B, G, N}, dt::f8_e4m3, tag::abc);
     auto dst_scale_md   = dnnl::memory::desc({1},       dt::f32,     tag::a);
-
     auto& entry = nvfp4_matmul_batched_entry(ctx, B, M, K, N);
     entry.primitive.execute(ctx.stream, {
         {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
@@ -601,34 +786,46 @@ inline void matmul_nvfp4_packed_batched(
             dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
 }
-
 inline void matmul_nvfp4(
     const bf16* A,
     int M,
     int K,
     const Nvfp4Linear& W,
     bf16* C,
-    GpuEngine& ctx = GpuEngine::get(0))
+    GpuEngine& ctx = GpuEngine::get(0),
+    uint8_t* A_packed_buf = nullptr,
+    uint8_t* A_scale_buf = nullptr)
 {
     if (W.in_features != K)
         throw std::runtime_error("matmul_nvfp4: K does not match weight shape");
     if (K % 16 != 0)
         throw std::runtime_error("matmul_nvfp4: K must be divisible by 16");
-
     int G = K / 16;
     auto& q = ctx.queue;
-
+    // When caller-provided (stable, arena-backed) workspaces are passed, use
+    // them directly: no per-call sycl::malloc_device (which would be truly
+    // freed at scope exit and so dangle at graph-replay time) and no
+    // ctx.stream.wait() (the in-order queue serializes the pack before the
+    // matmul, and the workspace is owned by the caller so there is no
+    // use-after-free on free). This makes matmul_nvfp4 safe to capture inside a
+    // Nvfp4GraphSession. Without caller workspaces, fall back to the original
+    // transient-GpuBuffer + synchronous-wait behavior (unchanged for existing
+    // callers that don't opt in).
+    if (A_packed_buf && A_scale_buf) {
+        pack_bf16_to_nvfp4(q, A, A_packed_buf, A_scale_buf, M, K,
+                           W.input_global_scale);
+        matmul_nvfp4_packed(A_packed_buf, A_scale_buf, M, K, W, C, ctx);
+        return;
+    }
     GpuBuffer<uint8_t> A_packed((size_t)M * K / 2, q);
     GpuBuffer<uint8_t> A_scale((size_t)M * G, q);
     pack_bf16_to_nvfp4(q, A, A_packed.data(), A_scale.data(), M, K,
                        W.input_global_scale);
     matmul_nvfp4_packed(A_packed.data(), A_scale.data(), M, K, W, C, ctx);
-
     // A_packed/A_scale are temporary workspaces owned by this call. Keep the
     // execution synchronous until callers pass reusable workspaces explicitly.
-    ctx.stream.wait();
+    if (!nvfp4_session_recording(q)) ctx.stream.wait();
 }
-
 inline float nvfp4_e2m1_to_float(uint8_t bits) {
     float mag = 0.0f;
     switch (bits & 0x07) {
@@ -643,7 +840,6 @@ inline float nvfp4_e2m1_to_float(uint8_t bits) {
     }
     return (bits & 0x08) ? -mag : mag;
 }
-
 inline float nvfp4_e4m3_fast(uint8_t b) {
     uint32_t exp = (b >> 3) & 0x0f;
     uint32_t mant = b & 0x07;
@@ -656,13 +852,11 @@ inline float nvfp4_e4m3_fast(uint8_t b) {
     __builtin_memcpy(&out, &bits, 4);
     return out;
 }
-
 inline float nvfp4_e2m1_fast(uint8_t bits) {
     const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     return (bits & 8) ? -mag[bits & 7] : mag[bits & 7];
 }
-
-// Vectorized (ESIMD simd) arithmetic e2m1 dequant — no LUT, no scalar loop.
+// Vectorized (ESIMD simd) arithmetic e2m1 dequant -- no LUT, no scalar loop.
 // Validated bit-exact vs nvfp4_e2m1_fast by src/nvfp4_vec_dequant_probe.cpp.
 // nib holds 4-bit e2m1 codes (0..15); returns the dequanted float values.
 namespace esimd_vec {
@@ -684,8 +878,7 @@ inline esimd_local::simd<float, N> e2m1(esimd_local::simd<uint16_t, N> nib) {
     val.merge(-absval, s != esimd_local::simd<uint16_t, N>(0));
     return val;
 }
-
-// Vectorized (ESIMD simd) arithmetic e4m3 dequant — bit-exact vs nvfp4_e4m3_fast.
+// Vectorized (ESIMD simd) arithmetic e4m3 dequant -- bit-exact vs nvfp4_e4m3_fast.
 // b holds 8-bit e4m3 codes (0..255); returns the dequanted float values.
 // Normal: 2^(exp-7)*(1+mant/8); subnormal (exp==0): mant*2^-9 (= (mant/8)*2^-6).
 // Uses float(1<<exp)/128 instead of exp2() to stay bit-exact and avoid negative-shift UB.
@@ -707,7 +900,6 @@ inline esimd_local::simd<float, N> e4m3(esimd_local::simd<uint16_t, N> b) {
     return val;
 }
 }  // namespace esimd_vec
-
 inline int nvfp4_dpas_ksplit_factor(int m_tiles, int k_tiles, int n_tiles) {
     static int target = [] {
         const char* env = std::getenv("DIFF_NVFP4_DPAS_OCC");
@@ -721,7 +913,6 @@ inline int nvfp4_dpas_ksplit_factor(int m_tiles, int k_tiles, int n_tiles) {
     if (ks > 32) ks = 32;
     return ks;
 }
-
 inline const uint16_t* nvfp4_dequant_lut(GpuEngine& ctx) {
     static std::vector<GpuBuffer<uint16_t>>* luts =
         new std::vector<GpuBuffer<uint16_t>>(GpuEngine::count());
@@ -738,7 +929,6 @@ inline const uint16_t* nvfp4_dequant_lut(GpuEngine& ctx) {
     }
     return buf.data();
 }
-
 inline const uint8_t* nvfp4_coalesced_weight(const Nvfp4Linear& W,
                                              int K,
                                              int N,
@@ -765,7 +955,6 @@ inline const uint8_t* nvfp4_coalesced_weight(const Nvfp4Linear& W,
     ctx.queue.wait();
     return dst;
 }
-
 inline diff_dpas_v8i nvfp4_dequant_b_coal(const uint8_t* wcoal,
                                           const uint16_t* lut,
                                           const uint8_t* wscale,
@@ -786,7 +975,6 @@ inline diff_dpas_v8i nvfp4_dequant_b_coal(const uint8_t* wcoal,
     }
     return b;
 }
-
 inline void pack_bf16_to_nvfp4_grouped(
     sycl::queue& q,
     const bf16* src,
@@ -796,7 +984,8 @@ inline void pack_bf16_to_nvfp4_grouped(
     int rows,
     const float* input_global_scale,
     uint8_t* packed,
-    uint8_t* scales)
+    uint8_t* scales,
+    Nvfp4GraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("grouped NVFP4 activation K must be divisible by 16");
     int G = K / 16;
@@ -817,13 +1006,11 @@ inline void pack_bf16_to_nvfp4_grouped(
             uint8_t* packed_row = packed + (size_t)slot * (K / 2);
             uint8_t* scale_row = scales + (size_t)slot * G;
             float input_scale = input_global_scale[expert];
-
             float max_abs = 0.0f;
             for (int i = 0; i < 16; ++i) {
                 float v = bf16_to_float(src_row[k0 + i]);
                 max_abs = sycl::fmax(max_abs, sycl::fabs(v));
             }
-
             uint8_t scale_bits = 0;
             float scale = 0.0f;
             if (max_abs > 0.0f) {
@@ -832,7 +1019,6 @@ inline void pack_bf16_to_nvfp4_grouped(
                 scale = nvfp4_e4m3_to_float(scale_bits);
             }
             scale_row[g] = scale_bits;
-
             for (int i = 0; i < 16; i += 2) {
                 uint8_t lo = 0, hi = 0;
                 if (scale > 0.0f) {
@@ -845,9 +1031,8 @@ inline void pack_bf16_to_nvfp4_grouped(
             }
         });
     });
-    });
+    }, session);
 }
-
 // Fuse GeGLU (gate_up -> act) with the down-projection input pack (act -> nvfp4).
 // Eliminates the bf16 `act` intermediate and one kernel launch. Bit-exact with
 // the unfused sequence (geglu_strided_grouped + pack_bf16_to_nvfp4_grouped):
@@ -862,7 +1047,8 @@ inline void geglu_pack_nvfp4_grouped(
     int rows,
     const float* input_global_scale,  // [num_experts] (down proj's per-expert input scale)
     uint8_t* packed,              // [total_rows, inter/2]
-    uint8_t* scales)              // [total_rows, inter/16]
+    uint8_t* scales,              // [total_rows, inter/16]
+    Nvfp4GraphSession* session = nullptr)
 {
     if (inter % 16 != 0)
         throw std::runtime_error("geglu_pack_nvfp4_grouped: inter must be divisible by 16");
@@ -886,7 +1072,6 @@ inline void geglu_pack_nvfp4_grouped(
             uint8_t* packed_row = packed + (size_t)slot * (inter / 2);
             uint8_t* scale_row = scales + (size_t)slot * G;
             float input_scale = input_global_scale[expert];
-
             float vals[16];
             float max_abs = 0.0f;
             for (int i = 0; i < 16; ++i) {
@@ -898,7 +1083,6 @@ inline void geglu_pack_nvfp4_grouped(
                 vals[i] = v;
                 max_abs = sycl::fmax(max_abs, sycl::fabs(v));
             }
-
             uint8_t scale_bits = 0;
             float scale = 0.0f;
             if (max_abs > 0.0f) {
@@ -907,7 +1091,6 @@ inline void geglu_pack_nvfp4_grouped(
                 scale = nvfp4_e4m3_to_float(scale_bits);
             }
             scale_row[g] = scale_bits;
-
             for (int i = 0; i < 16; i += 2) {
                 uint8_t lo = 0, hi = 0;
                 if (scale > 0.0f) {
@@ -920,9 +1103,8 @@ inline void geglu_pack_nvfp4_grouped(
             }
         });
     });
-    });
+    }, session);
 }
-
 // Fuse the hidden-state scatter with the gate/up-projection input pack.
 // Replaces: scatter hidden->Xe (bf16) + pack_bf16_to_nvfp4_grouped(Xe,...).
 // Iterates source assignments a in [0, A_all); for each valid a (slot >= 0),
@@ -945,7 +1127,8 @@ inline void scatter_pack_nvfp4_grouped(
     int A_all,
     int top_k,
     uint8_t* packed,             // [total_rows, H/2]
-    uint8_t* scales)             // [total_rows, H/16]
+    uint8_t* scales,             // [total_rows, H/16]
+    Nvfp4GraphSession* session = nullptr)
 {
     if (H % 16 != 0)
         throw std::runtime_error("scatter_pack_nvfp4_grouped: H must be divisible by 16");
@@ -971,7 +1154,6 @@ inline void scatter_pack_nvfp4_grouped(
             uint8_t* packed_row = packed + (size_t)s * (H / 2);
             uint8_t* scale_row = scales + (size_t)s * G;
             float input_scale = input_global_scale[expert];
-
             float max_abs = 0.0f;
             for (int i = 0; i < 16; ++i) {
                 float v = bf16_to_float(src_row[k0 + i]);
@@ -997,9 +1179,29 @@ inline void scatter_pack_nvfp4_grouped(
             }
         });
     });
-    });
+    }, session);
 }
-
+// ---------------------------------------------------------------------------
+// Grouped-GEMM entry points (custom scalar / DPAS gateup-geglu-pack / Xe2).
+// These submit raw sycl kernels via q.submit (no oneDNN primitive, no per-kernel
+// nvfp4_sycl_graph_submit wrapper). Session-awareness (Phase 2): each accepts a
+// trailing `session` pointer for API consistency with the pack functions and so
+// the orchestrator (Phase 3) can pass an active Nvfp4GraphSession through the
+// MoE call chain. They are NOT individually wrapped in nvfp4_sycl_graph_submit
+// (task Phase-2 option a) because:
+//   * Under an active session recording, bare q.submit calls are captured
+//     automatically as graph nodes (the canonical SYCL graph capture path;
+//     oneDNN primitives were separately confirmed capture-safe in Phase 0).
+//   * Wrapping them (option b) for per-kernel micro-caching on the no-session
+//     path is deferred: it requires (1) per-kernel capture+replay validation of
+//     these DPAS/custom ESIMD kernels (Phase 0 tested oneDNN only) and (2) the
+//     Phase-4 confirmation that the arena yields stable USM offsets across
+//     denoising steps (the existing pack micro-cache's captures=512/replays=4651
+//     ratio is empirical evidence this holds for the fixed-shape path). The
+//     `session` argument is therefore accepted but not yet consumed here; the
+//     registry backstop in nvfp4_sycl_graph_submit already protects any nested
+//     per-kernel capture from conflicting with an active session.
+// ---------------------------------------------------------------------------
 inline void matmul_nvfp4_grouped_custom(
     sycl::queue& q,
     const uint8_t* A_packed,
@@ -1012,7 +1214,8 @@ inline void matmul_nvfp4_grouped_custom(
     const uint8_t* const* W_scale_by_expert,
     const float* const* dst_scale_by_expert,
     int N,
-    bf16* C)
+    bf16* C,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("grouped NVFP4 matmul K must be divisible by 16");
     int G = K / 16;
@@ -1029,7 +1232,6 @@ inline void matmul_nvfp4_grouped_custom(
             const uint8_t* ws = W_scale_by_expert[expert];
             float inv_dst = 1.0f / dst_scale_by_expert[expert][0];
             float acc = 0.0f;
-
             for (int g = 0; g < G; ++g) {
                 float a_scale = nvfp4_e4m3_to_float(as_row[g]);
                 float w_scale = nvfp4_e4m3_to_float(ws[(size_t)g * N + n]);
@@ -1050,7 +1252,6 @@ inline void matmul_nvfp4_grouped_custom(
         });
     });
 }
-
 inline void pack_bf16_to_nvfp4_grouped_rows(
     sycl::queue& q,
     const bf16* src,
@@ -1059,7 +1260,8 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
     int max_rows,
     const float* input_global_scale,
     uint8_t* packed,
-    uint8_t* scales)
+    uint8_t* scales,
+    Nvfp4GraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("counted grouped NVFP4 activation K must be divisible by 16");
     int G = K / 16;
@@ -1075,19 +1277,16 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
             int g = (int)id[1];
             int expert = row_expert[row];
             if (expert < 0) return;
-
             int k0 = g * 16;
             const bf16* src_row = src + (size_t)row * K;
             uint8_t* packed_row = packed + (size_t)row * (K / 2);
             uint8_t* scale_row = scales + (size_t)row * G;
             float input_scale = input_global_scale[expert];
-
             float max_abs = 0.0f;
             for (int i = 0; i < 16; ++i) {
                 float v = bf16_to_float(src_row[k0 + i]);
                 max_abs = sycl::fmax(max_abs, sycl::fabs(v));
             }
-
             uint8_t scale_bits = 0;
             float scale = 0.0f;
             if (max_abs > 0.0f) {
@@ -1096,7 +1295,6 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
                 scale = nvfp4_e4m3_to_float(scale_bits);
             }
             scale_row[g] = scale_bits;
-
             for (int i = 0; i < 16; i += 2) {
                 uint8_t lo = 0, hi = 0;
                 if (scale > 0.0f) {
@@ -1109,9 +1307,8 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
             }
         });
     });
-    });
+    }, session);
 }
-
 // ============================================================================
 // Grouped DPAS gate/up + GeGLU + down-pack fused kernel.
 //
@@ -1156,12 +1353,12 @@ inline void matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
     int inter,
     const float* down_input_global_scale,      // [localE] down proj input scale
     uint8_t* act_packed,              // [total_rows, inter/2]
-    uint8_t* act_scale)              // [total_rows, inter/16]
+    uint8_t* act_scale,              // [total_rows, inter/16]
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     if (H % 16 != 0 || inter % 16 != 0)
         throw std::runtime_error("grouped-dpas gateup: H and inter must be divisible by 16");
     if (rows <= 0) return;
-
     auto& q = ctx.queue;
     int halfK = H / 2;
     int ktiles = H / 16;
@@ -1170,7 +1367,6 @@ inline void matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
     int Ngu = 2 * inter;                 // gate|up out_features
     int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, G_inter / 16);
     const uint16_t* lut = nvfp4_dequant_lut(ctx);
-
     q.submit([&](sycl::handler& h) {
         // SLM holds two accumulators (gate, up): KS threads * 8 rows * 16 lanes.
         sycl::local_accessor<float, 1> slm((size_t)2 * KS * 8 * 16, h);
@@ -1189,7 +1385,6 @@ inline void matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
                 int up_n   = inter + ng;                  // up   cols [inter+ng, ...)
                 int r0    = m0;
                 int expert = (r0 < rows) ? row_expert[r0] : -1;
-
                 diff_dpas_v8f cg = {0,0,0,0,0,0,0,0};
                 diff_dpas_v8f cu = {0,0,0,0,0,0,0,0};
                 if (expert >= 0) {
@@ -1223,14 +1418,12 @@ inline void matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
                             16, a, bu, cu, kNvfp4DpasBF16);
                     }
                 }
-
                 // Stash partials (gate + up) for the K-split reduction.
                 for (int m = 0; m < 8; ++m) {
                     slm_g[(size_t)(s * 8 + m) * 16 + lane] = cg[m];
                     slm_u[(size_t)(s * 8 + m) * 16 + lane] = cu[m];
                 }
                 it.barrier(sycl::access::fence_space::local_space);
-
                 // Epilogue: one thread (s==0, lane==0) reduces K, GeGLUs, and
                 // packs group g for the 8 rows. Pack needs all 16 GeGLU values
                 // per row (max_abs over the group), so a single thread does it
@@ -1287,7 +1480,6 @@ inline void matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
             });
     });
 }
-
 inline void matmul_nvfp4_grouped_rows_custom(
     sycl::queue& q,
     const uint8_t* A_packed,
@@ -1299,7 +1491,8 @@ inline void matmul_nvfp4_grouped_rows_custom(
     const uint8_t* const* W_scale_by_expert,
     const float* const* dst_scale_by_expert,
     int N,
-    bf16* C)
+    bf16* C,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("counted grouped NVFP4 matmul K must be divisible by 16");
     int G = K / 16;
@@ -1310,14 +1503,12 @@ inline void matmul_nvfp4_grouped_rows_custom(
             int n = (int)id[1];
             int expert = row_expert[row];
             if (expert < 0) return;
-
             const uint8_t* a_row = A_packed + (size_t)row * halfK;
             const uint8_t* as_row = A_scale + (size_t)row * G;
             const uint8_t* w = W_packed_by_expert[expert];
             const uint8_t* ws = W_scale_by_expert[expert];
             float inv_dst = 1.0f / dst_scale_by_expert[expert][0];
             float acc = 0.0f;
-
             for (int g = 0; g < G; ++g) {
                 float a_scale = nvfp4_e4m3_to_float(as_row[g]);
                 float w_scale = nvfp4_e4m3_to_float(ws[(size_t)g * N + n]);
@@ -1338,7 +1529,6 @@ inline void matmul_nvfp4_grouped_rows_custom(
         });
     });
 }
-
 inline void matmul_nvfp4_grouped_rows_xe2(
     GpuEngine& ctx,
     const uint8_t* A_packed,
@@ -1350,12 +1540,12 @@ inline void matmul_nvfp4_grouped_rows_xe2(
     const uint8_t* const* W_scale_by_expert,
     const float* const* dst_scale_by_expert,
     int N,
-    bf16* C)
+    bf16* C,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0 || N % 16 != 0)
         throw std::runtime_error("xe2 grouped NVFP4 matmul requires K%16 and N%16");
     if (max_rows <= 0) return;
-
     auto& q = ctx.queue;
     int halfK = K / 2;
     int ktiles = K / 16;
@@ -1363,7 +1553,6 @@ inline void matmul_nvfp4_grouped_rows_xe2(
     int ntiles = N / 16;
     int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, ntiles);
     const uint16_t* lut = nvfp4_dequant_lut(ctx);
-
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm((size_t)KS * 8 * 16, h);
         h.parallel_for(
@@ -1375,7 +1564,6 @@ inline void matmul_nvfp4_grouped_rows_xe2(
                 int lane = (int)it.get_local_id(1);
                 int n = (int)it.get_group(1) * 16 + lane;
                 int expert = (m0 < max_rows) ? row_expert[m0] : -1;
-
                 diff_dpas_v8f c = {0, 0, 0, 0, 0, 0, 0, 0};
                 if (expert >= 0) {
                     const uint8_t* wcoal = W_coal_by_expert[expert];
@@ -1402,11 +1590,9 @@ inline void matmul_nvfp4_grouped_rows_xe2(
                             16, a, b, c, kNvfp4DpasBF16);
                     }
                 }
-
                 for (int m = 0; m < 8; ++m)
                     slm[(size_t)(s * 8 + m) * 16 + lane] = c[m];
                 it.barrier(sycl::access::fence_space::local_space);
-
                 if (s == 0 && expert >= 0) {
                     float inv_dst = 1.0f / dst_scale_by_expert[expert][0];
                     for (int m = 0; m < 8; ++m) {

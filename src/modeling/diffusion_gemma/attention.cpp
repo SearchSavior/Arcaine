@@ -208,7 +208,8 @@ static void fused_sliding_decoder_kv_cache_postprocess(
     sycl::queue& q, bf16* K_cache, bf16* V_cache, const bf16* kn,
     int seq, int nkv, int hd, int offset,
     float theta, float partial, float eps,
-    const float* rope_cos, const float* rope_sin) {
+    const float* rope_cos, const float* rope_sin,
+    Nvfp4GraphSession* /*session*/ = nullptr) {
     int pair_offset = hd / 2;
     int n_active_pairs = static_cast<int>(partial * hd / 2.0f);
     float freq_denom = static_cast<float>(hd);
@@ -271,7 +272,8 @@ static void fused_full_decoder_kv_cache_postprocess(
     sycl::queue& q, bf16* K_cache, bf16* V_cache, const bf16* kn,
     int seq, int nkv, int hd, int offset,
     float theta, float partial, float eps,
-    const float* rope_cos, const float* rope_sin) {
+    const float* rope_cos, const float* rope_sin,
+    Nvfp4GraphSession* /*session*/ = nullptr) {
     int pair_offset = hd / 2;
     int n_active_pairs = static_cast<int>(partial * hd / 2.0f);
     float freq_denom = static_cast<float>(hd);
@@ -333,7 +335,8 @@ static void fused_sliding_qkv_postprocess(
     const bf16* qn, const bf16* kn,
     int seq, int nq, int nkv, int hd, int offset,
     float theta, float partial, float eps,
-    const float* rope_cos, const float* rope_sin) {
+    const float* rope_cos, const float* rope_sin,
+    Nvfp4GraphSession* /*session*/ = nullptr) {
     int rows = nq + 2 * nkv;
     int q_dim = nq * hd;
     int kv_dim = nkv * hd;
@@ -410,7 +413,8 @@ static void fused_full_qk_postprocess(
     const bf16* qn, const bf16* kn,
     int seq, int nq, int nkv, int hd, int offset,
     float theta, float partial, float eps,
-    const float* rope_cos, const float* rope_sin) {
+    const float* rope_cos, const float* rope_sin,
+    Nvfp4GraphSession* /*session*/ = nullptr) {
     int rows = nq + nkv;
     int q_dim = nq * hd;
     int kv_dim = nkv * hd;
@@ -490,7 +494,8 @@ struct QKV {
 // Project + per-head Q/K RMSNorm + (scaleless) V norm + RoPE at `offset`.
 QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
                 int seq, const DiffTextConfig& cfg, int offset,
-                AttnProfileKind prof) {
+                AttnProfileKind prof,
+                Nvfp4GraphSession* session = nullptr) {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
     int nq = cfg.num_attn_heads;
@@ -536,9 +541,10 @@ QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
               matmul_int4(hidden, seq, H, s.qkv_proj_int4, fused.data(), ctx); }
             { DIFF_PROF(q, attn_fused_split_prof(prof));
               fused_sliding_qkv_postprocess(q, fused.data(), Q, K, V,
-                                            qn, kn, seq, nq, nkv, hd, offset,
-                                            theta, partial, cfg.rms_norm_eps,
-                                            rope.cos_data(), rope.sin_data()); }
+                                             qn, kn, seq, nq, nkv, hd, offset,
+                                             theta, partial, cfg.rms_norm_eps,
+                                             rope.cos_data(), rope.sin_data(),
+                                             session); }
             used_fused_proj = true;
             rope_done = true;
         }
@@ -555,7 +561,8 @@ QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
               fused_full_qk_postprocess(q, fused.data(), Q, K, V,
                                         qn, kn, seq, nq, nkv, hd, offset,
                                         theta, partial, cfg.rms_norm_eps,
-                                        rope.cos_data(), rope.sin_data()); }
+                                        rope.cos_data(), rope.sin_data(),
+                                        session); }
             used_fused_proj = true;
             rope_done = true;
         }
@@ -603,7 +610,8 @@ QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
 QKV project_qkv_decoder_direct_cache(
     GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
     int seq, const DiffTextConfig& cfg, int offset,
-    bf16* K_cache, bf16* V_cache, AttnProfileKind prof) {
+    bf16* K_cache, bf16* V_cache, AttnProfileKind prof,
+    Nvfp4GraphSession* session = nullptr) {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
     int nq = cfg.num_attn_heads;
@@ -653,7 +661,7 @@ QKV project_qkv_decoder_direct_cache(
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::KNorm));
           fused_sliding_decoder_kv_cache_postprocess(
               q, K_cache, V_cache, kn, seq, nkv, hd, offset, theta, partial,
-              cfg.rms_norm_eps, rope.cos_data(), rope.sin_data()); }
+              cfg.rms_norm_eps, rope.cos_data(), rope.sin_data(), session); }
     } else {
         // Full attention derives V from raw K before applying K's learned scale.
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::KProj));
@@ -661,7 +669,7 @@ QKV project_qkv_decoder_direct_cache(
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::KNorm));
           fused_full_decoder_kv_cache_postprocess(
               q, K_cache, V_cache, kn, seq, nkv, hd, offset, theta, partial,
-              cfg.rms_norm_eps, rope.cos_data(), rope.sin_data()); }
+              cfg.rms_norm_eps, rope.cos_data(), rope.sin_data(), session); }
     }
     return out;
 }
@@ -700,7 +708,8 @@ diffarena::Alloc<bf16> gqa_attention(
     const bf16* Q, int seq, int nq, int hd,
     const bf16* Kc, const bf16* Vc, int kv_len, int nkv,
     int past_offset, int sliding_window, bool causal,
-    AttnProfileKind prof)
+    AttnProfileKind prof,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     auto& q = ctx.queue;
     int g = nq / nkv;
@@ -923,7 +932,8 @@ diffarena::Alloc<bf16> gqa_attention_sdpa(
     const bf16* Q, int seq, int nq, int hd,
     const bf16* Kc, const bf16* Vc, int kv_len, int nkv,
     const float* mask, int mask_type,
-    AttnProfileKind prof)
+    AttnProfileKind prof,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     static std::unordered_map<SdpaKey, dnnl::primitive, SdpaKeyHash> cache;
 
@@ -990,12 +1000,13 @@ void encoder_attention_forward(
     GpuEngine& ctx, const DiffLayer& lw,
     const bf16* hidden, bf16* out,
     DiffLayerKv& kv, int seq, int past_len,
-    const DiffTextConfig& cfg)
+    const DiffTextConfig& cfg,
+    Nvfp4GraphSession* session)
 {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
     AttnProfileKind prof = attn_profile_kind(/*is_encoder=*/true, lw.is_full);
-    QKV x = project_qkv(ctx, lw, hidden, seq, cfg, past_len, prof);
+    QKV x = project_qkv(ctx, lw, hidden, seq, cfg, past_len, prof, session);
 
     // Append K/V to cache at past_len, then release them (the GEMMs read the
     // cache, not these staging buffers).
@@ -1018,7 +1029,7 @@ void encoder_attention_forward(
         attn = gqa_attention_sdpa(ctx,
             x.Q.data(), seq, x.nq, x.hd,
             kv.k.data(), kv.v.data(), kv.filled, x.nkv,
-            /*mask=*/nullptr, /*mask_type=*/3, prof);
+            /*mask=*/nullptr, /*mask_type=*/3, prof, session);
     } else if (!lw.is_full && onednn_sdpa_encoder_sliding_enabled()) {
         auto& ar = diffarena::arena(ctx.index);
         sdpa_mask = ar.alloc<float>((size_t)seq * kv.filled);
@@ -1026,12 +1037,12 @@ void encoder_attention_forward(
         attn = gqa_attention_sdpa(ctx,
             x.Q.data(), seq, x.nq, x.hd,
             kv.k.data(), kv.v.data(), kv.filled, x.nkv,
-            sdpa_mask.data(), /*mask_type=*/1, prof);
+            sdpa_mask.data(), /*mask_type=*/1, prof, session);
     } else {
         attn = gqa_attention(ctx,
             x.Q.data(), seq, x.nq, x.hd,
             kv.k.data(), kv.v.data(), kv.filled, x.nkv,
-            /*past_offset=*/past_len, win, /*causal=*/true, prof);
+            /*past_offset=*/past_len, win, /*causal=*/true, prof, session);
     }
     x.Q.reset();   // Q consumed by the score GEMM
 
@@ -1046,7 +1057,8 @@ void decoder_attention_forward(
     GpuEngine& ctx, const DiffLayer& lw,
     const bf16* hidden, bf16* out,
     DiffLayerKv& enc_kv, int seq, int enc_len,
-    const DiffTextConfig& cfg)
+    const DiffTextConfig& cfg,
+    Nvfp4GraphSession* session)
 {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
@@ -1071,7 +1083,7 @@ void decoder_attention_forward(
     // copy/launch).  DIFF_DECODE_KV_DIRECT_CACHE / DIFF_STAGE_DECODER_KV_KERNEL
     // and the staging kernel are gone.
     QKV x = project_qkv_decoder_direct_cache(ctx, lw, hidden, seq, cfg, enc_len,
-                                             k_dst, v_dst, prof);
+                                             k_dst, v_dst, prof, session);
 
     // Bidirectional decoder attention: full layers see all encoder KV + canvas;
     // sliding layers see the last sliding_window-1 encoder positions + canvas
@@ -1084,11 +1096,11 @@ void decoder_attention_forward(
     auto attn = onednn_sdpa_decoder_enabled()
         ? gqa_attention_sdpa(ctx,
             x.Q.data(), seq, x.nq, x.hd, Kc, Vc, kv_len - kv0, x.nkv,
-            /*mask=*/nullptr, /*mask_type=*/0, prof)
+            /*mask=*/nullptr, /*mask_type=*/0, prof, session)
         : gqa_attention(ctx,
             x.Q.data(), seq, x.nq, x.hd, Kc, Vc, kv_len - kv0, x.nkv,
             /*past_offset=*/0, /*sliding_window=*/INT_MAX, /*causal=*/false,
-            prof);
+            prof, session);
     x.Q.reset();
 
     const DiffLinearWeight& o_proj = lw.is_full

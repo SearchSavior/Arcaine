@@ -78,3 +78,22 @@ void expert_parallel_forward(
     const int* idx_dev,
     const float* weight_dev,
     const ExpertProfileLabels& prof);
+
+// Build (idempotent) the persistent raw-weight pointer tables for an NVFP4
+// expert shard -- the per-expert device pointers + input_global_scales the
+// grouped-GEMM kernels read. Call once at load (outside any session); the
+// tables are then reused every denoising step without a host->device upload.
+// No-op for non-NVFP4 shards. See DiffExpertShard::pt_*.
+void ensure_expert_pointer_tables_raw(DiffExpertShard& shard, GpuEngine& ctx);
+
+// Build the persistent COALESCED (xe2 DPAS) weight pointer tables for an NVFP4
+// shard, once at load. Pre-warms nvfp4_dequant_lut + nvfp4_coalesced_weight per
+// expert (which cache on first call and return stable USM ptrs thereafter), then
+// uploads the coalesced weight ptr table to pt_gate_w_coal/pt_down_w_coal. The
+// scale/dst/input tables (pt_gate_s etc.) are shared with the raw tables and are
+// NOT rebuilt. This eliminates the xe2 path's per-step pointer-table upload +
+// the lazy nvfp4_coalesced_weight ctx.queue.wait(), making the xe2 DPAS path
+// SYCL-graph-capturable. Requires the raw tables to be built first. No-op for
+// non-NVFP4 shards. See DiffExpertShard::pt_*_coal.
+void ensure_expert_pointer_tables_coalesced(DiffExpertShard& shard, GpuEngine& ctx,
+                                             int moe_intermediate, int hidden_size);

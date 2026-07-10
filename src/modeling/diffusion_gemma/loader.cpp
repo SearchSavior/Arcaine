@@ -1,5 +1,6 @@
 #include "loader.hpp"
 #include "../../common/gpu/placement.hpp"
+#include "../../common/gpu/expert_parallel.hpp"
 #include "../../common/io/quant_loader.hpp"
 #include "../../common/io/safetensors.hpp"
 #include "../../common/io/gguf.hpp"
@@ -156,18 +157,38 @@ static float f16_to_float(uint16_t h) {
 // ---------------------------------------------------------------------------
 // compressed-tensors int4 W4A16 ("pack-quantized"): weight_packed is I32 with
 // 8 signed int4 per word along K (low-nibble first), so its raw byte stream is
-// already oneDNN s4 tag::ba for logical dims (K, N). weight_scale is BF16
-// (out, K/group_size) and is transposed to (groups, out) for oneDNN.
+// already oneDNN s4 tag::ba for logical dims (K, N). weight_scale is BF16 or
+// F16 (out, K/group_size) and is transposed to (groups, out) for oneDNN; F16
+// scales are normalized to BF16 at load (see as_bf16_scale_bits).
 // ---------------------------------------------------------------------------
+// compressed-tensors int4 checkpoints may store the per-group weight scales as
+// F16 instead of BF16 (the model dtype is float16).  oneDNN's s4 weight-scale
+// path consumes BF16 scales, so normalize F16 -> BF16 (round-to-nearest-even
+// via float) into a host staging buffer and return BF16 bits; BF16 scales are
+// returned as-is.  The returned pointer is valid for the lifetime of `storage`.
+static const uint16_t* as_bf16_scale_bits(const TensorView& tv,
+                                          std::vector<uint16_t>& storage,
+                                          const char* name) {
+    if (tv.dtype != "BF16" && tv.dtype != "F16")
+        throw std::runtime_error(std::string("Expected BF16/F16 int4 scale for ") + name + ", got " + tv.dtype);
+    const uint16_t* src = static_cast<const uint16_t*>(tv.data);
+    if (tv.dtype == "BF16") return src;
+    size_t n = tv.numel();
+    storage.resize(n);
+    for (size_t i = 0; i < n; ++i) storage[i] = float_to_bf16(f16_to_float(src[i]));
+    return storage.data();
+}
+
 static GpuBuffer<bf16> upload_int4_scales_transposed(
     const TensorView& tv, int out_features, int groups, sycl::queue& q,
     const char* name = "?") {
-    if (tv.dtype != "BF16")
-        throw std::runtime_error(std::string("Expected BF16 int4 scale for ") + name + ", got " + tv.dtype);
+    if (tv.dtype != "BF16" && tv.dtype != "F16")
+        throw std::runtime_error(std::string("Expected BF16/F16 int4 scale for ") + name + ", got " + tv.dtype);
     if (tv.shape.size() != 2 || tv.shape[0] != out_features || tv.shape[1] != groups)
         throw std::runtime_error(std::string("Unexpected int4 scale shape for ") + name);
 
-    const uint16_t* src = static_cast<const uint16_t*>(tv.data);  // (out, groups)
+    std::vector<uint16_t> scale_storage;
+    const uint16_t* src = as_bf16_scale_bits(tv, scale_storage, name);  // (out, groups) BF16 bits
     static bool gpu_transpose = [] {
         const char* e = std::getenv("DIFF_INT4_GPU_SCALE_TRANSPOSE");
         return e && std::strcmp(e, "0") != 0 && std::strcmp(e, "false") != 0 &&
@@ -300,8 +321,8 @@ static Int4Linear upload_int4_linear_concat(const TensorSource& sf,
             throw std::runtime_error(std::string("Expected 2D packed weight for fused attention: ") + prefix);
 
         const TensorView& scale = sf.get(prefix + ".weight_scale");
-        if (scale.dtype != "BF16")
-            throw std::runtime_error(std::string("Expected BF16 int4 scale for fused attention: ") + prefix);
+        if (scale.dtype != "BF16" && scale.dtype != "F16")
+            throw std::runtime_error(std::string("Expected BF16/F16 int4 scale for fused attention: ") + prefix);
         if (scale.shape.size() != 2 || scale.shape[0] != packed.shape[0])
             throw std::runtime_error(std::string("Unexpected int4 scale shape for fused attention: ") + prefix);
 
@@ -339,9 +360,10 @@ static Int4Linear upload_int4_linear_concat(const TensorSource& sf,
     lin.weight_packed = upload_int4_packed_rebased(packed_spans, byte_off, q);
 
     std::vector<uint16_t> transposed((size_t)groups * total_out);
+    std::vector<uint16_t> scale_storage;
     int out_off = 0;
     for (const Part& part : parts) {
-        const uint16_t* src = static_cast<const uint16_t*>(part.scale->data);
+        const uint16_t* src = as_bf16_scale_bits(*part.scale, scale_storage, name);
         for (int g = 0; g < groups; ++g)
             for (int n = 0; n < part.out_features; ++n)
                 transposed[(size_t)g * total_out + out_off + n] =
@@ -380,8 +402,9 @@ static Int4Linear upload_int4_linear_pair(const TensorSource& sf,
 
     const TensorView& gate_scale = sf.get(gate_prefix + ".weight_scale");
     const TensorView& up_scale   = sf.get(up_prefix + ".weight_scale");
-    if (gate_scale.dtype != "BF16" || up_scale.dtype != "BF16")
-        throw std::runtime_error("Expected BF16 gate/up int4 scales: " + gate_prefix);
+    if ((gate_scale.dtype != "BF16" && gate_scale.dtype != "F16") ||
+        (up_scale.dtype != "BF16" && up_scale.dtype != "F16"))
+        throw std::runtime_error("Expected BF16/F16 gate/up int4 scales: " + gate_prefix);
     if (gate_scale.shape.size() != 2 || up_scale.shape.size() != 2 ||
         gate_scale.shape[0] != half_out || up_scale.shape[0] != half_out ||
         gate_scale.shape[1] != up_scale.shape[1])
@@ -389,8 +412,9 @@ static Int4Linear upload_int4_linear_pair(const TensorSource& sf,
     int groups = (int)gate_scale.shape[1];
     lin.group_size = lin.in_features / groups;
 
-    const uint16_t* gate_s = static_cast<const uint16_t*>(gate_scale.data);
-    const uint16_t* up_s   = static_cast<const uint16_t*>(up_scale.data);
+    std::vector<uint16_t> gate_storage, up_storage;
+    const uint16_t* gate_s = as_bf16_scale_bits(gate_scale, gate_storage, "gate scale");
+    const uint16_t* up_s   = as_bf16_scale_bits(up_scale, up_storage, "up scale");
     std::vector<uint16_t> transposed((size_t)groups * lin.out_features);
     for (int g = 0; g < groups; ++g) {
         for (int n = 0; n < half_out; ++n) {
@@ -722,6 +746,18 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
                             sf, ep + "gate_proj", ep + "up_proj", eq));
                         shard.down_proj_fp4.push_back(upload_nvfp4_linear(sf, ep + "down_proj", eq));
                     }
+                    // Build the persistent raw-weight pointer tables once, at
+                    // load (no session is active), so the per-step host->device
+                    // upload the gpu-layout MoE path used to do is gone and the
+                    // path is SYCL-graph-capturable. See DiffExpertShard::pt_*.
+                    ensure_expert_pointer_tables_raw(shard, GpuEngine::get(shard_gpu));
+                    // Build the coalesced (xe2 DPAS) pointer tables too: pre-warms
+                    // nvfp4_coalesced_weight + the dequant LUT (one-time waits that
+                    // cannot happen inside a session) and caches the coalesced
+                    // weight ptrs. Makes the xe2 DPAS path capturable.
+                    ensure_expert_pointer_tables_coalesced(shard, GpuEngine::get(shard_gpu),
+                                                            cfg.text.moe_intermediate_size,
+                                                            cfg.text.hidden_size);
                 } else {
                     const TensorView& gate_up = sf.get(p + "experts.gate_up_proj");
                     const TensorView& down    = sf.get(p + "experts.down_proj");

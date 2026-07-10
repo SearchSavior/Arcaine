@@ -56,6 +56,7 @@ set(COMMON_SRCS
     src/register_builtins.cpp
     src/common/registry.cpp
     src/common/io/quant_loader.cpp
+    src/common/gpu/nvfp4_session.cpp
     src/common/preprocess/tokenizer.cpp
     src/common/preprocess/chat_template.cpp
     src/common/preprocess/image_proc.cpp
@@ -142,6 +143,7 @@ set(DIFFUSION_SRCS
     src/common/preprocess/chat_template.cpp
     src/common/io/quant_loader.cpp
     ${UNICODE_SRCS}
+    src/common/gpu/nvfp4_session.cpp
     src/modeling/diffusion_gemma/loader.cpp
     src/modeling/diffusion_gemma/moe.cpp
     src/common/gpu/expert_parallel.cpp
@@ -231,7 +233,8 @@ target_link_libraries(diffusion_attn_selfcheck PRIVATE DNNL::dnnl)
 # validation vs HF is Phase 6 (deferred).
 add_executable(qwen_attn_selfcheck
     src/qwen_attn_selfcheck.cpp
-    src/common/io/quant_loader.cpp)
+    src/common/io/quant_loader.cpp
+    src/common/gpu/nvfp4_session.cpp)
 target_compile_options(qwen_attn_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(qwen_attn_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(qwen_attn_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
@@ -246,7 +249,8 @@ target_link_libraries(qwen_attn_selfcheck PRIVATE DNNL::dnnl)
 # ARCAINE_QWEN_MODEL_DIR=<qwen checkpoint dir> (optional ARCAINE_QWEN_MOE_LAYER=<idx>).
 add_executable(qwen_moe_selfcheck
     src/qwen_moe_selfcheck.cpp
-    src/common/io/quant_loader.cpp)
+    src/common/io/quant_loader.cpp
+    src/common/gpu/nvfp4_session.cpp)
 target_compile_options(qwen_moe_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(qwen_moe_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(qwen_moe_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
@@ -263,7 +267,8 @@ target_link_libraries(qwen_moe_selfcheck PRIVATE DNNL::dnnl)
 # (optional ARCAINE_QWEN_DELTANET_LAYER=<linear-attn idx, default 0>).
 add_executable(qwen_deltanet_selfcheck
     src/qwen_deltanet_selfcheck.cpp
-    src/common/io/quant_loader.cpp)
+    src/common/io/quant_loader.cpp
+    src/common/gpu/nvfp4_session.cpp)
 target_compile_options(qwen_deltanet_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(qwen_deltanet_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(qwen_deltanet_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
@@ -310,6 +315,31 @@ target_compile_options(nvfp4_batched_check PRIVATE -fsycl -fno-sycl-id-queries-f
 target_link_options(nvfp4_batched_check PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(nvfp4_batched_check PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(nvfp4_batched_check PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
+# Phase 0 (graph-capture) probe — is dnnl::matmul::execute() capture-safe
+# inside a SYCL command_graph recording? Tests matmul_nvfp4_packed and
+# matmul_nvfp4_packed_batched: direct vs captured-graph vs replay, bit-exact.
+# Includes nvfp4.hpp (DPAS intrinsics) => needs the spirv-ext link option.
+# Run: ZE_AFFINITY_MASK=0 ./build/nvfp4_graph_capture_probe [GC_M/K/N/B env]
+add_executable(nvfp4_graph_capture_probe src/nvfp4_graph_capture_probe.cpp src/common/gpu/nvfp4_session.cpp)
+target_compile_options(nvfp4_graph_capture_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_graph_capture_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_graph_capture_probe PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(nvfp4_graph_capture_probe PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
+# xe2 DPAS capture probe — is the __spirv_SubgroupMatrixMultiplyAccumulateINTEL
+# grouped-rows kernel (matmul_nvfp4_grouped_rows_xe2) capture-safe inside a SYCL
+# command_graph on BMG G31? Tests direct vs captured-graph vs replay + the
+# decisive replay3 input-mutation re-execution test. Scalar sibling run as a
+# control. Includes nvfp4.hpp (DPAS intrinsics) => needs the spirv-ext link opt.
+# Run: ZE_AFFINITY_MASK=0 ./build/nvfp4_xe2_capture_probe [XE2_M/K/N/E env]
+add_executable(nvfp4_xe2_capture_probe src/nvfp4_xe2_capture_probe.cpp src/common/gpu/nvfp4_session.cpp)
+target_compile_options(nvfp4_xe2_capture_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_xe2_capture_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(nvfp4_xe2_capture_probe PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(nvfp4_xe2_capture_probe PRIVATE DNNL::dnnl)
 
 # ---------------------------------------------------------------------------
 # Phase 0, Probe 2 — hand-rolled Intel block-2D-load primitive (device-side).
