@@ -44,6 +44,49 @@ static std::vector<float> resize_bilinear(
     return dst;
 }
 
+static float cubic_weight(float x) {
+    x = std::fabs(x);
+    constexpr float a = -0.5f;
+    if (x <= 1.0f)
+        return (a + 2.0f) * x * x * x - (a + 3.0f) * x * x + 1.0f;
+    if (x < 2.0f)
+        return a * x * x * x - 5.0f * a * x * x + 8.0f * a * x - 4.0f * a;
+    return 0.0f;
+}
+
+static std::vector<float> resize_bicubic(
+    const float* src, int src_h, int src_w,
+    int dst_h, int dst_w, int channels) {
+    std::vector<float> dst((size_t)dst_h * dst_w * channels);
+    float yscale = static_cast<float>(src_h) / dst_h;
+    float xscale = static_cast<float>(src_w) / dst_w;
+    for (int y = 0; y < dst_h; ++y) {
+        float source_y = (y + 0.5f) * yscale - 0.5f;
+        int ybase = static_cast<int>(std::floor(source_y));
+        for (int x = 0; x < dst_w; ++x) {
+            float source_x = (x + 0.5f) * xscale - 0.5f;
+            int xbase = static_cast<int>(std::floor(source_x));
+            for (int channel = 0; channel < channels; ++channel) {
+                float value = 0.0f;
+                float total_weight = 0.0f;
+                for (int dy = -1; dy <= 2; ++dy) {
+                    int sy = std::clamp(ybase + dy, 0, src_h - 1);
+                    float wy = cubic_weight(source_y - (ybase + dy));
+                    for (int dx = -1; dx <= 2; ++dx) {
+                        int sx = std::clamp(xbase + dx, 0, src_w - 1);
+                        float weight = wy * cubic_weight(source_x - (xbase + dx));
+                        value += src[((size_t)sy * src_w + sx) * channels + channel] * weight;
+                        total_weight += weight;
+                    }
+                }
+                dst[((size_t)y * dst_w + x) * channels + channel] =
+                    total_weight != 0.0f ? value / total_weight : value;
+            }
+        }
+    }
+    return dst;
+}
+
 // ---------------------------------------------------------------------------
 // Patchify: (H,W,C) pixels → (num_patches, ps*ps*C) + (num_patches, 2) positions
 // Input pixels are float in [0, 1] (pre-scaled).
@@ -228,5 +271,104 @@ ImageInput preprocess_image(
         out.position_ids[i] = mp.positions[i];
     }
 
+    return out;
+}
+
+ImageInput preprocess_qwen_image(
+    const std::string& path,
+    int patch_size,
+    int temporal_patch_size,
+    int merge_size,
+    int min_pixels,
+    int max_pixels,
+    float rescale_factor,
+    bool do_rescale,
+    bool do_normalize,
+    const std::vector<float>& mean,
+    const std::vector<float>& stddev) {
+    if (mean.size() != 3 || stddev.size() != 3)
+        throw std::runtime_error("Qwen image mean/std must have three channels");
+    int width = 0;
+    int height = 0;
+    int source_channels = 0;
+    uint8_t* raw = stbi_load(path.c_str(), &width, &height, &source_channels, 3);
+    if (!raw) throw std::runtime_error("stbi_load failed: " + path);
+    if (height <= 0 || width <= 0 ||
+        static_cast<float>(std::max(height, width)) / std::min(height, width) > 200.0f) {
+        stbi_image_free(raw);
+        throw std::runtime_error("Qwen image aspect ratio must be smaller than 200");
+    }
+
+    int factor = patch_size * merge_size;
+    int resized_h = static_cast<int>(std::round(static_cast<float>(height) / factor)) * factor;
+    int resized_w = static_cast<int>(std::round(static_cast<float>(width) / factor)) * factor;
+    resized_h = std::max(factor, resized_h);
+    resized_w = std::max(factor, resized_w);
+    if ((int64_t)resized_h * resized_w > max_pixels) {
+        float beta = std::sqrt(static_cast<float>((int64_t)height * width) / max_pixels);
+        resized_h = std::max(factor,
+            static_cast<int>(std::floor(height / beta / factor)) * factor);
+        resized_w = std::max(factor,
+            static_cast<int>(std::floor(width / beta / factor)) * factor);
+    } else if ((int64_t)resized_h * resized_w < min_pixels) {
+        float beta = std::sqrt(static_cast<float>(min_pixels) / ((int64_t)height * width));
+        resized_h = static_cast<int>(std::ceil(height * beta / factor)) * factor;
+        resized_w = static_cast<int>(std::ceil(width * beta / factor)) * factor;
+    }
+
+    std::vector<float> pixels((size_t)height * width * 3);
+    for (size_t i = 0; i < pixels.size(); ++i)
+        pixels[i] = do_rescale ? raw[i] * rescale_factor : static_cast<float>(raw[i]);
+    stbi_image_free(raw);
+    std::vector<float> resized = resize_bicubic(
+        pixels.data(), height, width, resized_h, resized_w, 3);
+    if (do_normalize) {
+        for (int y = 0; y < resized_h; ++y)
+            for (int x = 0; x < resized_w; ++x)
+                for (int channel = 0; channel < 3; ++channel) {
+                    size_t at = ((size_t)y * resized_w + x) * 3 + channel;
+                    resized[at] = (resized[at] - mean[channel]) / stddev[channel];
+                }
+    }
+
+    int grid_h = resized_h / patch_size;
+    int grid_w = resized_w / patch_size;
+    int raw_patches = grid_h * grid_w;
+    int patch_dim = 3 * temporal_patch_size * patch_size * patch_size;
+    ImageInput out;
+    out.grid_thw = {1, grid_h, grid_w};
+    out.raw_patches = raw_patches;
+    out.patch_dim = patch_dim;
+    out.max_patches = raw_patches;
+    out.num_valid_patches = raw_patches / (merge_size * merge_size);
+    out.pixel_values.resize((size_t)raw_patches * patch_dim);
+
+    int patch_index = 0;
+    for (int group_y = 0; group_y < grid_h / merge_size; ++group_y) {
+        for (int group_x = 0; group_x < grid_w / merge_size; ++group_x) {
+            for (int merge_y = 0; merge_y < merge_size; ++merge_y) {
+                for (int merge_x = 0; merge_x < merge_size; ++merge_x) {
+                    int patch_y = group_y * merge_size + merge_y;
+                    int patch_x = group_x * merge_size + merge_x;
+                    float* destination = out.pixel_values.data() + (size_t)patch_index * patch_dim;
+                    size_t cursor = 0;
+                    for (int channel = 0; channel < 3; ++channel) {
+                        for (int temporal = 0; temporal < temporal_patch_size; ++temporal) {
+                            (void)temporal;  // still image: duplicate the frame
+                            for (int py = 0; py < patch_size; ++py) {
+                                for (int px = 0; px < patch_size; ++px) {
+                                    int y = patch_y * patch_size + py;
+                                    int x = patch_x * patch_size + px;
+                                    destination[cursor++] =
+                                        resized[((size_t)y * resized_w + x) * 3 + channel];
+                                }
+                            }
+                        }
+                    }
+                    ++patch_index;
+                }
+            }
+        }
+    }
     return out;
 }

@@ -900,6 +900,7 @@ inline esimd_local::simd<float, N> e4m3(esimd_local::simd<uint16_t, N> b) {
     return val;
 }
 }  // namespace esimd_vec
+
 inline int nvfp4_dpas_ksplit_factor(int m_tiles, int k_tiles, int n_tiles) {
     static int target = [] {
         const char* env = std::getenv("DIFF_NVFP4_DPAS_OCC");
@@ -1606,4 +1607,234 @@ inline void matmul_nvfp4_grouped_rows_xe2(
                 }
             });
     });
+}
+
+// Dense counterpart of matmul_nvfp4_grouped_rows_xe2. This keeps the
+// checkpoint and activations packed as NVFP4, dequantizes 16-wide K tiles to
+// BF16 registers, and feeds the Xe2 subgroup DPAS intrinsic. It is deliberately
+// a separate entry point: architecture code selects it through a descriptive
+// environment variable so the oneDNN path remains available for A/B checks.
+inline void matmul_nvfp4_packed_xe2(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int M,
+    int K,
+    const Nvfp4Linear& W,
+    bf16* C) {
+    int N = W.out_features;
+    if (W.in_features != K)
+        throw std::runtime_error("matmul_nvfp4_packed_xe2: K does not match weight shape");
+    if (K % 16 != 0 || N % 16 != 0)
+        throw std::runtime_error("matmul_nvfp4_packed_xe2 requires K%16 and N%16");
+    if (M <= 0) return;
+
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / 16;
+    int mtiles = (M + 7) / 8;
+    int ntiles = N / 16;
+    int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, ntiles);
+    const uint16_t* lut = nvfp4_dequant_lut(ctx);
+    const uint8_t* wcoal = nvfp4_coalesced_weight(W, K, N, ctx);
+    const uint8_t* wscale = W.weight_scale.data();
+    const float* dst_scale = W.dst_scale.data();
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm((size_t)KS * 8 * 16, h);
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)mtiles * KS, (size_t)N),
+                              sycl::range<2>((size_t)KS, (size_t)16)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int m0 = static_cast<int>(it.get_group(0)) * 8;
+                int s = static_cast<int>(it.get_local_id(0));
+                int lane = static_cast<int>(it.get_local_id(1));
+                int n = static_cast<int>(it.get_group(1)) * 16 + lane;
+                diff_dpas_v8f accum = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (int kt = s; kt < ktiles; kt += KS) {
+                    diff_dpas_v8i b = nvfp4_dequant_b_coal(
+                        wcoal, lut, wscale, n, lane, kt, K, N);
+                    int kk = kt * 16 + lane;
+                    diff_dpas_v8s a;
+                    for (int m = 0; m < 8; ++m) {
+                        int row = m0 + m;
+                        uint16_t av = 0;
+                        if (row < M) {
+                            uint8_t byte = A_packed[(size_t)row * halfK + kk / 2];
+                            uint8_t nib = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
+                            av = float_to_bf16(
+                                nvfp4_e2m1_fast(nib) *
+                                nvfp4_e4m3_fast(A_scale[(size_t)row * ktiles + kt]));
+                        }
+                        a[m] = static_cast<short>(av);
+                    }
+                    accum = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                        16, a, b, accum, kNvfp4DpasBF16);
+                }
+                for (int m = 0; m < 8; ++m)
+                    slm[(size_t)(s * 8 + m) * 16 + lane] = accum[m];
+                it.barrier(sycl::access::fence_space::local_space);
+                if (s == 0) {
+                    float inv_dst = 1.0f / dst_scale[0];
+                    for (int m = 0; m < 8; ++m) {
+                        int row = m0 + m;
+                        if (row >= M) continue;
+                        float sum = 0.0f;
+                        for (int ss = 0; ss < KS; ++ss)
+                            sum += slm[(size_t)(ss * 8 + m) * 16 + lane];
+                        C[(size_t)row * N + n] = float_to_bf16(sum * inv_dst);
+                    }
+                }
+            });
+    });
+}
+
+// Fused dense gate/up DPAS + SwiGLU + NVFP4 pack for the following down
+// projection. Gate and up occupy the two halves of W_gate_up's output rows.
+// The input activation tile is loaded once and shared by both DPAS operations.
+inline void matmul_nvfp4_swiglu_pack_xe2(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int M,
+    int K,
+    const Nvfp4Linear& W_gate_up,
+    const Nvfp4Linear& W_down,
+    uint8_t* out_packed,
+    uint8_t* out_scale) {
+    if (W_gate_up.in_features != K || W_gate_up.out_features % 2 != 0)
+        throw std::runtime_error("matmul_nvfp4_swiglu_pack_xe2: invalid gate/up shape");
+    int inter = W_gate_up.out_features / 2;
+    if (W_down.in_features != inter)
+        throw std::runtime_error("matmul_nvfp4_swiglu_pack_xe2: down K mismatch");
+    if (K % 16 != 0 || inter % 16 != 0)
+        throw std::runtime_error("matmul_nvfp4_swiglu_pack_xe2 requires K/inter divisible by 16");
+    if (M <= 0) return;
+
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / 16;
+    int mtiles = (M + 7) / 8;
+    int groups = inter / 16;
+    int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, groups);
+    const uint16_t* lut = nvfp4_dequant_lut(ctx);
+    const uint8_t* wcoal = nvfp4_coalesced_weight(
+        W_gate_up, K, W_gate_up.out_features, ctx);
+    const uint8_t* wscale = W_gate_up.weight_scale.data();
+    const float* gate_up_dst_scale = W_gate_up.dst_scale.data();
+    float down_input_global_scale = W_down.input_global_scale;
+    int Ngu = W_gate_up.out_features;
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm((size_t)2 * KS * 8 * 16, h);
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)mtiles * KS, (size_t)inter),
+                              sycl::range<2>((size_t)KS, (size_t)16)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int m0 = static_cast<int>(it.get_group(0)) * 8;
+                int split = static_cast<int>(it.get_local_id(0));
+                int lane = static_cast<int>(it.get_local_id(1));
+                int group = static_cast<int>(it.get_group(1));
+                int n0 = group * 16;
+                diff_dpas_v8f gate_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                diff_dpas_v8f up_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (int kt = split; kt < ktiles; kt += KS) {
+                    diff_dpas_v8i gate_b = nvfp4_dequant_b_coal(
+                        wcoal, lut, wscale, n0, lane, kt, K, Ngu);
+                    diff_dpas_v8i up_b = nvfp4_dequant_b_coal(
+                        wcoal, lut, wscale, inter + n0, lane, kt, K, Ngu);
+                    int kk = kt * 16 + lane;
+                    diff_dpas_v8s a;
+                    for (int m = 0; m < 8; ++m) {
+                        int row = m0 + m;
+                        uint16_t av = 0;
+                        if (row < M) {
+                            uint8_t byte = A_packed[(size_t)row * halfK + kk / 2];
+                            uint8_t nib = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
+                            av = float_to_bf16(
+                                nvfp4_e2m1_fast(nib) *
+                                nvfp4_e4m3_fast(A_scale[(size_t)row * ktiles + kt]));
+                        }
+                        a[m] = static_cast<short>(av);
+                    }
+                    gate_acc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                        16, a, gate_b, gate_acc, kNvfp4DpasBF16);
+                    up_acc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                        16, a, up_b, up_acc, kNvfp4DpasBF16);
+                }
+
+                size_t plane = (size_t)KS * 8 * 16;
+                for (int m = 0; m < 8; ++m) {
+                    size_t at = (size_t)(split * 8 + m) * 16 + lane;
+                    slm[at] = gate_acc[m];
+                    slm[plane + at] = up_acc[m];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                if (split == 0 && lane == 0) {
+                    float inv_dst = 1.0f / gate_up_dst_scale[0];
+                    for (int m = 0; m < 8; ++m) {
+                        int row = m0 + m;
+                        if (row >= M) continue;
+                        float values[16];
+                        float max_abs = 0.0f;
+                        for (int i = 0; i < 16; ++i) {
+                            float gate = 0.0f;
+                            float up = 0.0f;
+                            for (int s = 0; s < KS; ++s) {
+                                size_t at = (size_t)(s * 8 + m) * 16 + i;
+                                gate += slm[at];
+                                up += slm[plane + at];
+                            }
+                            gate *= inv_dst;
+                            up *= inv_dst;
+                            // Match the unfused BF16 boundary before SwiGLU.
+                            gate = bf16_to_float(float_to_bf16(gate));
+                            up = bf16_to_float(float_to_bf16(up));
+                            float value = gate / (1.0f + sycl::exp(-gate)) * up;
+                            value = bf16_to_float(float_to_bf16(value));
+                            values[i] = value;
+                            max_abs = sycl::fmax(max_abs, sycl::fabs(value));
+                        }
+                        uint8_t scale_bits = 0;
+                        float scale = 0.0f;
+                        if (max_abs > 0.0f) {
+                            scale_bits = nvfp4_encode_e4m3_positive(
+                                max_abs * down_input_global_scale / 6.0f);
+                            scale = nvfp4_e4m3_fast(scale_bits);
+                        }
+                        out_scale[(size_t)row * groups + group] = scale_bits;
+                        uint8_t* packed_row = out_packed + (size_t)row * (inter / 2);
+                        for (int i = 0; i < 16; i += 2) {
+                            uint8_t lo = 0;
+                            uint8_t hi = 0;
+                            if (scale > 0.0f) {
+                                lo = nvfp4_encode_e2m1(
+                                    values[i] * down_input_global_scale / scale);
+                                hi = nvfp4_encode_e2m1(
+                                    values[i + 1] * down_input_global_scale / scale);
+                            }
+                            packed_row[(n0 + i) / 2] = lo | (hi << 4);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+inline void matmul_nvfp4_xe2(
+    const bf16* A,
+    int M,
+    int K,
+    const Nvfp4Linear& W,
+    bf16* C,
+    GpuEngine& ctx = GpuEngine::get(0)) {
+    if (K % 16 != 0)
+        throw std::runtime_error("matmul_nvfp4_xe2: K must be divisible by 16");
+    GpuBuffer<uint8_t> packed((size_t)M * K / 2, ctx.queue);
+    GpuBuffer<uint8_t> scales((size_t)M * (K / 16), ctx.queue);
+    pack_bf16_to_nvfp4(ctx.queue, A, packed.data(), scales.data(), M, K,
+                       W.input_global_scale);
+    matmul_nvfp4_packed_xe2(ctx, packed.data(), scales.data(), M, K, W, C);
+    ctx.stream.wait();
 }

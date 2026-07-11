@@ -56,6 +56,11 @@ TokenizerMetadata load_tokenizer_metadata(const std::string& model_dir) {
     meta.boa_token   = string_or_empty(t, "boa_token");
     meta.eoa_token   = string_or_empty(t, "eoa_token");
     meta.audio_token = string_or_empty(t, "audio_token");
+    // Qwen VL names the same boundaries vision_bos/eos and audio_bos/eos.
+    if (meta.boi_token.empty()) meta.boi_token = string_or_empty(t, "vision_bos_token");
+    if (meta.eoi_token.empty()) meta.eoi_token = string_or_empty(t, "vision_eos_token");
+    if (meta.boa_token.empty()) meta.boa_token = string_or_empty(t, "audio_bos_token");
+    if (meta.eoa_token.empty()) meta.eoa_token = string_or_empty(t, "audio_eos_token");
     if (t.contains("video_token")) {
         meta.video_token = string_or_empty(t, "video_token");
     } else if (t.contains("extra_special_tokens") && !t.at("extra_special_tokens").empty()) {

@@ -4,12 +4,12 @@
 // various KV-cache depths.  Each row times N actual forward passes and
 // reports mean t/s ± σ so you can see how decode slows as the cache fills.
 //
-// Usage: ./build/bench <model_dir> [options]
-//   -p P,...      prefill prompt sizes to test   (default: 128,512)
-//   -n N          max new tokens (decode steps)  (default: 128)
+// Usage: ./build/bench --model <model_dir> [options]
+//   -p, --p P,... prefill prompt sizes to test   (default: 128,512)
+//   -n, --n N,... new-token counts to test       (default: 128)
 //   -d D,...      starting KV-cache depth(s)     (default: 0,512,1024,2048)
-//   --reps  R     timed repetitions              (default: 3)
-//   --warmup W    discarded warmup runs          (default: 1)
+//   -r, --r R     timed repetitions              (default: 3)
+//   -w, --w W     discarded warmup runs          (default: 1)
 //   --max-seq N   KvCache allocation size        (default: auto)
 //   --device N    restrict visible GPUs to one Level Zero device
 
@@ -95,43 +95,53 @@ static void print_row(const char* test, const char* depth,
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
     static const char* USAGE =
-        "Usage: bench <model_dir> [options]\n"
+        "Usage: bench --model <model_dir> [options]\n"
         "  -h, --help    show this help text\n"
-        "  -p P,...      prefill sizes          (default: 128,512)\n"
-        "  -n N          max new tokens         (default: 128)\n"
+        "  -p, --p P,... prefill sizes          (default: 128,512)\n"
+        "  -n, --n N,... new-token counts       (default: 128)\n"
         "  -d D,...      KV-cache depths        (default: 0,512,1024,2048)\n"
-        "  --reps R      timed repetitions      (default: 3)\n"
-        "  --warmup W    warmup runs            (default: 1)\n"
+        "  -r, --r R     timed repetitions      (default: 3)\n"
+        "  -w, --w W     warmup runs            (default: 1)\n"
         "  --max-seq N   KvCache capacity       (default: auto)\n"
         "  --device N    run with one visible Level Zero GPU\n";
 
-    if (argc < 2) { fputs(USAGE, stderr); return 1; }
-    if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
-        fputs(USAGE, stderr);
-        return 0;
-    }
-
-    std::string model_dir = argv[1];
+    std::string model_dir;
     std::vector<int> pp_list  = {128, 512};
+    std::vector<int> tg_list  = {128};
     std::vector<int> depths   = {0, 512, 1024, 2048};
     std::string device_index;
-    int tg      = 128;
     int reps    = 3;
     int warmup  = 1;
     int max_seq = -1;  // computed after arg parsing
     bool device_index_set = false;
 
-    for (int i = 2; i < argc; ++i) {
-        if      (!strcmp(argv[i], "-p")         && i+1<argc) pp_list = parse_list(argv[++i]);
-        else if (!strcmp(argv[i], "-n")         && i+1<argc) tg      = atoi(argv[++i]);
+    for (int i = 1; i < argc; ++i) {
+        if      (!strcmp(argv[i], "--model")    && i+1<argc) model_dir = argv[++i];
+        else if ((!strcmp(argv[i], "-p") || !strcmp(argv[i], "--p")) && i+1<argc)
+            pp_list = parse_list(argv[++i]);
+        else if ((!strcmp(argv[i], "-n") || !strcmp(argv[i], "--n")) && i+1<argc)
+            tg_list = parse_list(argv[++i]);
         else if (!strcmp(argv[i], "-d")         && i+1<argc) depths  = parse_list(argv[++i]);
-        else if (!strcmp(argv[i], "--reps")    && i+1<argc) reps    = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--warmup")  && i+1<argc) warmup  = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "-r") || !strcmp(argv[i], "--r") ||
+                  !strcmp(argv[i], "--reps")) && i+1<argc) reps = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "-w") || !strcmp(argv[i], "--w") ||
+                  !strcmp(argv[i], "--warmup")) && i+1<argc) warmup = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-seq") && i+1<argc) max_seq = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--device")  && i+1<argc) { device_index = argv[++i]; device_index_set = true; }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { fputs(USAGE, stderr); return 0; }
+        else if (argv[i][0] != '-' && model_dir.empty()) model_dir = argv[i];
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); fputs(USAGE, stderr); return 1; }
     }
+
+    if (model_dir.empty() || pp_list.empty() || tg_list.empty() || depths.empty() ||
+        reps <= 0 || warmup < 0) {
+        fputs(USAGE, stderr);
+        return 1;
+    }
+    for (int value : pp_list)
+        if (value <= 0) { fputs("--p values must be positive\n", stderr); return 1; }
+    for (int value : tg_list)
+        if (value <= 0) { fputs("--n values must be positive\n", stderr); return 1; }
 
     try {
         if (device_index_set) gpu_device_control::apply_device_index(device_index);
@@ -143,9 +153,10 @@ int main(int argc, char* argv[]) {
     // Derive max_seq from the largest depth + n, plus the largest pp size,
     // if the user did not override it with --max-seq.
     if (max_seq < 0) {
-        int max_d = depths.empty() ? 0 : *std::max_element(depths.begin(), depths.end());
-        int max_p = pp_list.empty() ? 0 : *std::max_element(pp_list.begin(), pp_list.end());
-        max_seq = std::max(max_d + tg, max_p);
+        int max_d = *std::max_element(depths.begin(), depths.end());
+        int max_p = *std::max_element(pp_list.begin(), pp_list.end());
+        int max_n = *std::max_element(tg_list.begin(), tg_list.end());
+        max_seq = std::max(max_d + max_n, max_p);
     }
 
     // ── Load ────────────────────────────────────────────────────────────────
@@ -194,9 +205,10 @@ int main(int argc, char* argv[]) {
     }
 
     // ── Decode (TG) at various KV-cache depths ──────────────────────────────
-    for (int depth : depths) {
-        char name[32];  snprintf(name, sizeof name, "tg %d", tg);
-        char dstr[32];  snprintf(dstr, sizeof dstr, "%d", depth);
+    for (int tg : tg_list) {
+      for (int depth : depths) {
+        char name[32]; snprintf(name, sizeof name, "tg %d", tg);
+        char dstr[32]; snprintf(dstr, sizeof dstr, "%d", depth);
 
         if (depth + tg > max_seq) {
             print_row(name, dstr, {}, /*skipped=*/true);
@@ -233,6 +245,7 @@ int main(int argc, char* argv[]) {
         }
 
         print_row(name, dstr, compute_stats(times, tg));
+      }
     }
 
     printf("\n");

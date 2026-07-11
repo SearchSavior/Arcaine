@@ -68,6 +68,13 @@ bool ShardedSafetensors::has(const std::string& name) const {
     return name_to_shard_.count(name) > 0;
 }
 
+std::vector<std::string> ShardedSafetensors::names() const {
+    std::vector<std::string> out;
+    out.reserve(name_to_shard_.size());
+    for (const auto& entry : name_to_shard_) out.push_back(entry.first);
+    return out;
+}
+
 // Set DIFF_LOAD_TRACE=1 (legacy) or QUANT_LOAD_TRACE=1 for per-tensor
 // stall debugging.
 static bool g_trace = std::getenv("DIFF_LOAD_TRACE") != nullptr ||
@@ -152,6 +159,81 @@ GpuBuffer<uint8_t> upload_u8(const TensorView& tv, sycl::queue& q, const char* n
     GpuBuffer<uint8_t> buf(tv.nbytes, q);
     buf.upload(static_cast<const uint8_t*>(tv.data), tv.nbytes);
     return buf;
+}
+
+Fp8Linear upload_fp8_linear(const TensorSource& sf, const std::string& prefix,
+                            sycl::queue& q) {
+    const TensorView& weight = sf.get(prefix + ".weight");
+    const TensorView& scale = sf.get(prefix + ".weight_scale");
+    if (weight.dtype != "F8_E4M3" || weight.shape.size() != 2)
+        throw std::runtime_error("Expected F8_E4M3 [N,K] weight: " + prefix);
+    if (scale.dtype != "BF16" || scale.shape.size() != 2 ||
+        scale.shape[0] != weight.shape[0] || scale.shape[1] != 1)
+        throw std::runtime_error("Expected BF16 [N,1] weight scale: " + prefix);
+
+    Fp8Linear lin;
+    lin.out_features = static_cast<int>(weight.shape[0]);
+    lin.in_features = static_cast<int>(weight.shape[1]);
+    lin.weight = upload_u8(weight, q, (prefix + ".weight").c_str());
+    lin.weight_scale = upload(scale, q, (prefix + ".weight_scale").c_str());
+    return lin;
+}
+
+Fp8Linear upload_fp8_linear_pair(const TensorSource& sf,
+                                 const std::string& first_prefix,
+                                 const std::string& second_prefix,
+                                 sycl::queue& q) {
+    return upload_fp8_linear_concat(sf, {first_prefix, second_prefix}, q);
+}
+
+Fp8Linear upload_fp8_linear_concat(
+    const TensorSource& sf, const std::vector<std::string>& prefixes,
+    sycl::queue& q) {
+    if (prefixes.empty())
+        throw std::runtime_error("FP8 concat requires at least one projection");
+    int in = -1;
+    int total_out = 0;
+    size_t total_weight_bytes = 0;
+    std::vector<const TensorView*> weights;
+    std::vector<const TensorView*> scales;
+    for (const std::string& prefix : prefixes) {
+        const TensorView& weight = sf.get(prefix + ".weight");
+        const TensorView& scale = sf.get(prefix + ".weight_scale");
+        if (weight.dtype != "F8_E4M3" || weight.shape.size() != 2)
+            throw std::runtime_error("Expected FP8 [N,K] weight: " + prefix);
+        if (scale.dtype != "BF16" || scale.shape.size() != 2 ||
+            scale.shape[0] != weight.shape[0] || scale.shape[1] != 1)
+            throw std::runtime_error("Expected BF16 [N,1] FP8 scale: " + prefix);
+        int current_in = static_cast<int>(weight.shape[1]);
+        if (in < 0) in = current_in;
+        if (current_in != in)
+            throw std::runtime_error("FP8 concat K mismatch: " + prefix);
+        total_out += static_cast<int>(weight.shape[0]);
+        total_weight_bytes += weight.nbytes;
+        weights.push_back(&weight);
+        scales.push_back(&scale);
+    }
+    std::vector<uint8_t> host_weight(total_weight_bytes);
+    std::vector<bf16> host_scale(total_out);
+    size_t weight_offset = 0;
+    size_t scale_offset = 0;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        std::memcpy(host_weight.data() + weight_offset, weights[i]->data,
+                    weights[i]->nbytes);
+        size_t outputs = static_cast<size_t>(weights[i]->shape[0]);
+        std::memcpy(host_scale.data() + scale_offset, scales[i]->data,
+                    outputs * sizeof(bf16));
+        weight_offset += weights[i]->nbytes;
+        scale_offset += outputs;
+    }
+    Fp8Linear linear;
+    linear.in_features = in;
+    linear.out_features = total_out;
+    linear.weight = GpuBuffer<uint8_t>(host_weight.size(), q);
+    linear.weight.upload(host_weight.data(), host_weight.size());
+    linear.weight_scale = GpuBuffer<bf16>(host_scale.size(), q);
+    linear.weight_scale.upload(host_scale.data(), host_scale.size());
+    return linear;
 }
 
 float scalar_f32(const TensorView& tv, const char* name) {

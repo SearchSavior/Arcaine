@@ -16,6 +16,7 @@
 
 #include "../../common/gpu/buffer.hpp"   // GpuBuffer, bf16, float_to_bf16
 #include "../../common/gpu/nvfp4.hpp"    // Nvfp4Linear
+#include "../../common/gpu/fp8.hpp"      // Fp8Linear
 #include "safetensors.hpp"              // SafetensorsFile
 #include "tensor_view.hpp"             // TensorView
 
@@ -35,6 +36,7 @@ public:
     const TensorView& get(const std::string& name) const override;
     bool has(const std::string& name) const override;
     size_t num_tensors() const { return name_to_shard_.size(); }
+    std::vector<std::string> names() const;
 
 private:
     std::vector<std::unique_ptr<SafetensorsFile>> shards_;
@@ -54,6 +56,22 @@ GpuBuffer<bf16>    upload_plus_one(const TensorView& tv, sycl::queue& q, const c
 
 // Upload a raw U8 / F8_E4M3 byte buffer verbatim (no conversion).
 GpuBuffer<uint8_t> upload_u8(const TensorView& tv, sycl::queue& q, const char* name = "?");
+
+// Build a compressed-tensors float-quantized FP8 linear from
+// <prefix>.weight (F8_E4M3 [N,K]) and <prefix>.weight_scale (BF16 [N,1]).
+Fp8Linear           upload_fp8_linear(const TensorSource& sf, const std::string& prefix,
+                                      sycl::queue& q);
+
+// Concatenate two FP8 projections with identical K into one [2N,K] linear.
+Fp8Linear           upload_fp8_linear_pair(const TensorSource& sf,
+                                           const std::string& first_prefix,
+                                           const std::string& second_prefix,
+                                           sycl::queue& q);
+
+Fp8Linear           upload_fp8_linear_concat(
+                         const TensorSource& sf,
+                         const std::vector<std::string>& prefixes,
+                         sycl::queue& q);
 
 // Read a single-element F32 tensor.
 float              scalar_f32(const TensorView& tv, const char* name = "?");

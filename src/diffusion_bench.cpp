@@ -168,13 +168,13 @@ void print_bench_result(TokenizerBridge& tokenizer,
 void usage(const char* p) {
     std::fprintf(stderr,
         "Usage: %s --model <dir> [options]\n"
-        "  -p <csv>          prompt token counts to sweep   (default: 512)\n"
-        "  -n <csv>          new-token counts to sweep       (default: 128)\n"
+        "  -p, --p <csv>     prompt token counts to sweep   (default: 512)\n"
+        "  -n, --n <csv>     new-token counts to sweep       (default: 128)\n"
         "                    NOTE: block diffusion generates whole 256-token canvases,\n"
         "                    so -n sets the block count ceil(n/256); n<=256 = 1 block.\n"
         "  -ds <N>           denoising steps                 (default: 48)\n"
-        "  -w <N>            warmup runs per cell            (default: 1)\n"
-        "  -r <N>            timed runs per cell             (default: 5)\n"
+        "  -w, --w <N>       warmup runs per cell            (default: 1)\n"
+        "  -r, --r <N>       timed runs per cell             (default: 5)\n"
         "  --kernels <csv>   expert kernels: default,hybrid,custom  (default: hybrid)\n"
         "  --layers <spec>   layer placement: auto, single, split:N, ranges:N,N,..., gpus:N\n"
         "  --experts <spec>  expert placement: auto, layer-owner, replicate, shard, ranges:N,N,..., gpus:N\n"
@@ -213,11 +213,11 @@ int main(int argc, char** argv) {
                 return argv[++i]; };
             if      (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
             else if (a == "--model")   model_dir = next();
-            else if (a == "-p")        p_csv = next();
-            else if (a == "-n")        n_csv = next();
+            else if (a == "-p" || a == "--p") p_csv = next();
+            else if (a == "-n" || a == "--n") n_csv = next();
             else if (a == "-ds")       ds = std::stoi(next());
-            else if (a == "-w")        warmup = std::stoi(next());
-            else if (a == "-r")        runs = std::stoi(next());
+            else if (a == "-w" || a == "--w") warmup = std::stoi(next());
+            else if (a == "-r" || a == "--r") runs = std::stoi(next());
             else if (a == "--kernels") kernels = next();
             else if (a == "--layers")  apply_layers_spec(next(), placement);
             else if (a == "--experts") apply_experts_spec(next(), placement);

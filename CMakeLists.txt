@@ -80,8 +80,15 @@ set(QWEN_SRCS
     src/modeling/qwen3_5_moe/register.cpp
 )
 
+set(QWEN35_SRCS
+    src/modeling/qwen3_5/loader.cpp
+    src/modeling/qwen3_5/vision.cpp
+    src/modeling/qwen3_5/model.cpp
+    src/modeling/qwen3_5/register.cpp
+)
+
 # All built-in architectures linked into the inference/bench binaries.
-set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS})
+set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS} ${QWEN35_SRCS})
 
 # ---------------------------------------------------------------------------
 add_executable(get_device_props src/utils/gpu_check.cpp)
@@ -208,6 +215,41 @@ target_link_options(qwen_load_smoke PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # the translator needs the extension even though this binary runs no DPAS kernel.
 target_link_options(qwen_load_smoke PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(qwen_load_smoke PRIVATE DNNL::dnnl)
+
+# Architecture-shaped Qwen3.5 dense MLP kernel benchmark. This loads one real
+# NVFP4 layer and benchmarks only gate/up -> SwiGLU -> down, never inference.
+# ARCAINE_QWEN35_NVFP4_DPAS=0/1 selects the oneDNN baseline or Xe2 DPAS path.
+add_executable(qwen35_nvfp4_mlp_bench
+    src/qwen35_nvfp4_mlp_bench.cpp
+    src/common/io/quant_loader.cpp
+    src/common/gpu/nvfp4_session.cpp)
+target_compile_options(qwen35_nvfp4_mlp_bench PRIVATE
+    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen35_nvfp4_mlp_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen35_nvfp4_mlp_bench PRIVATE
+    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen35_nvfp4_mlp_bench PRIVATE DNNL::dnnl)
+
+# Architecture-shaped Qwen3.5 full-attention benchmark. Compares the scalar
+# online-softmax baseline with subgroup and XMX/DPAS paths at 24Q/4KV/D256.
+add_executable(qwen35_attention_bench src/qwen35_attention_bench.cpp)
+target_compile_options(qwen35_attention_bench PRIVATE
+    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen35_attention_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen35_attention_bench PRIVATE
+    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen35_attention_bench PRIVATE DNNL::dnnl)
+
+# Architecture-shaped Qwen3.5 Gated DeltaNet recurrent-core benchmark. It
+# compares the scalar/SIMT and ESIMD paths at the checkpoint's 48x128x128
+# shape, including sequential decode, without running end-to-end inference.
+add_executable(qwen35_deltanet_bench src/qwen35_deltanet_bench.cpp)
+target_compile_options(qwen35_deltanet_bench PRIVATE
+    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen35_deltanet_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen35_deltanet_bench PRIVATE
+    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen35_deltanet_bench PRIVATE DNNL::dnnl)
 
 # qwen_kernels_selfcheck: build-verify + GPU smoke for qwen3_5_moe/kernels.hpp.
 # An unused inline SYCL lambda is not device-codegen'd, so calling each kernel

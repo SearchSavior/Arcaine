@@ -89,7 +89,7 @@ and `POST /v1/chat/completions`. Authentication is disabled by default; set
 
 ```bash
 ARCAINE_API_KEY=local ./build/diffusion_server \
-  --model models/diffusiongemma-26B-A4B-it-NVFP4 \
+  --model models/diffusiongemma-26B-A4B-it-AWQ-INT4 \
   --served-model-name diffusiongemma-26B-A4B-it-NVFP4 \
   --host 0.0.0.0 \
   --port 7461
