@@ -370,6 +370,209 @@ inline void qwen35_recurrent_delta_esimd(
     });
 }
 
+// M=1 fused DeltaNet decode core. It consumes sequential [q|k|v|z]
+// projection output and [beta|a] gate projection output, then performs causal
+// conv1d, Q/K normalization, gate evaluation, the recurrent update, and z
+// extraction in one ESIMD kernel. The recurrent state is [head,value,key]; the
+// conv state for this path is time-major [history,channel].
+inline void qwen35_delta_decode_fused_esimd(
+    sycl::queue& queue, const bf16* projected, int projected_stride,
+    const bf16* conv_weight_time_major, const bf16* conv_state,
+    const bf16* A_log, const bf16* dt_bias, const bf16* beta_a,
+    float* recurrent_state, bf16* core, bf16* z_output,
+    int key_heads, int value_heads, int key_dim, int value_dim,
+    int conv_dim, int conv_kernel, float norm_epsilon) {
+    if (key_dim != 128 || value_dim != 128 || conv_kernel != 4 ||
+        value_heads % key_heads != 0)
+        throw std::runtime_error(
+            "fused ESIMD DeltaNet decode requires K=V=128 and conv4");
+    constexpr int work_group = 64;
+    int value_heads_per_key = value_heads / key_heads;
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>((size_t)value_heads * work_group, work_group),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                namespace esimd = sycl::ext::intel::esimd;
+                using native_bf16 = sycl::ext::oneapi::bfloat16;
+                esimd::slm_init<2048>();
+                int value_head = static_cast<int>(item.get_group(0));
+                int lane = static_cast<int>(item.get_local_id(0));
+                int key_head = value_head / value_heads_per_key;
+
+                // Six work-items compute q/key/value lo/hi chunks.
+                if (lane < 6) {
+                    int chunk;
+                    if (lane < 2)
+                        chunk = key_head * key_dim + lane * 64;
+                    else if (lane < 4)
+                        chunk = key_heads * key_dim + key_head * key_dim +
+                                (lane - 2) * 64;
+                    else
+                        chunk = 2 * key_heads * key_dim + value_head * value_dim +
+                                (lane - 4) * 64;
+                    auto* input_ptr = reinterpret_cast<const native_bf16*>(
+                        projected + chunk);
+                    esimd::simd<native_bf16, 64> input_raw =
+                        esimd::block_load<native_bf16, 64>(input_ptr);
+                    esimd::simd<float, 64> input = input_raw;
+                    esimd::simd<float, 64> convolution = 0.0f;
+#pragma unroll
+                    for (int tap = 0; tap < 3; ++tap) {
+                        auto* state_ptr = reinterpret_cast<const native_bf16*>(
+                            conv_state + (size_t)tap * conv_dim + chunk);
+                        auto* weight_ptr = reinterpret_cast<const native_bf16*>(
+                            conv_weight_time_major +
+                            (size_t)tap * conv_dim + chunk);
+                        esimd::simd<native_bf16, 64> state_raw =
+                            esimd::block_load<native_bf16, 64>(state_ptr);
+                        esimd::simd<native_bf16, 64> weight_raw =
+                            esimd::block_load<native_bf16, 64>(weight_ptr);
+                        esimd::simd<float, 64> state_values = state_raw;
+                        esimd::simd<float, 64> weight_values = weight_raw;
+                        convolution += state_values * weight_values;
+                    }
+                    auto* last_weight_ptr = reinterpret_cast<const native_bf16*>(
+                        conv_weight_time_major +
+                        (size_t)3 * conv_dim + chunk);
+                    esimd::simd<native_bf16, 64> last_weight_raw =
+                        esimd::block_load<native_bf16, 64>(last_weight_ptr);
+                    esimd::simd<float, 64> last_weight = last_weight_raw;
+                    convolution += input * last_weight;
+                    convolution = convolution /
+                        (1.0f + esimd::exp(-convolution));
+                    // Match the BF16 conv output boundary.
+                    esimd::simd<native_bf16, 64> convolution_bf16 = convolution;
+                    esimd::simd<float, 64> rounded = convolution_bf16;
+                    esimd::slm_block_store<float, 64>(lane * 256, rounded);
+                }
+                esimd::barrier();
+
+                esimd::simd<float, 64> q0 =
+                    esimd::slm_block_load<float, 64>(0);
+                esimd::simd<float, 64> q1 =
+                    esimd::slm_block_load<float, 64>(256);
+                esimd::simd<float, 64> k0 =
+                    esimd::slm_block_load<float, 64>(512);
+                esimd::simd<float, 64> k1 =
+                    esimd::slm_block_load<float, 64>(768);
+                float q_norm = qwen35_esimd::dot128(q0, q1, q0, q1);
+                float k_norm = qwen35_esimd::dot128(k0, k1, k0, k1);
+                float q_inverse = 1.0f / esimd::sqrt(
+                    esimd::simd<float, 8>(q_norm + norm_epsilon))[0];
+                float k_inverse = 1.0f / esimd::sqrt(
+                    esimd::simd<float, 8>(k_norm + norm_epsilon))[0];
+                q0 *= q_inverse;
+                q1 *= q_inverse;
+                k0 *= k_inverse;
+                k1 *= k_inverse;
+                // Match l2norm BF16, then scale_inplace BF16 for Q.
+                esimd::simd<native_bf16, 64> q0_bf16 = q0, q1_bf16 = q1;
+                esimd::simd<native_bf16, 64> k0_bf16 = k0, k1_bf16 = k1;
+                q0 = esimd::simd<float, 64>(q0_bf16) * 0.08838834764831845f;
+                q1 = esimd::simd<float, 64>(q1_bf16) * 0.08838834764831845f;
+                k0 = k0_bf16;
+                k1 = k1_bf16;
+                q0_bf16 = q0;
+                q1_bf16 = q1;
+                q0 = q0_bf16;
+                q1 = q1_bf16;
+
+                int value0 = lane * 2;
+                int value1 = value0 + 1;
+                esimd::simd<float, 2> value_pair =
+                    esimd::slm_block_load<float, 2>(1024 + value0 * 4);
+                float beta_raw = qwen35_esimd::load_bf16_scalar(
+                    beta_a, value_head);
+                float a_raw = qwen35_esimd::load_bf16_scalar(
+                    beta_a, value_heads + value_head);
+                float beta_value = 1.0f / (1.0f + esimd::exp(
+                    esimd::simd<float, 8>(-beta_raw))[0]);
+                esimd::simd<native_bf16, 1> beta_bf16 =
+                    esimd::simd<float, 1>(beta_value);
+                beta_value = esimd::simd<float, 1>(beta_bf16)[0];
+                float gate_input = a_raw + qwen35_esimd::load_bf16_scalar(
+                    dt_bias, value_head);
+                float absolute_gate = gate_input < 0.0f ? -gate_input : gate_input;
+                float exp_negative_abs = esimd::exp(
+                    esimd::simd<float, 8>(-absolute_gate))[0];
+                float log_term = esimd::log(
+                    esimd::simd<float, 8>(1.0f + exp_negative_abs))[0];
+                float softplus = (gate_input > 0.0f ? gate_input : 0.0f) + log_term;
+                float gate = -esimd::exp(esimd::simd<float, 8>(
+                    qwen35_esimd::load_bf16_scalar(A_log, value_head)))[0] *
+                    softplus;
+                esimd::simd<native_bf16, 1> gate_bf16 =
+                    esimd::simd<float, 1>(gate);
+                gate = esimd::simd<float, 1>(gate_bf16)[0];
+                float decay = esimd::exp(esimd::simd<float, 8>(gate))[0];
+
+                size_t state_base =
+                    (size_t)value_head * value_dim * key_dim;
+                esimd::simd<float, 64> state00 = esimd::block_load<float, 64>(
+                    recurrent_state + state_base + (size_t)value0 * key_dim);
+                esimd::simd<float, 64> state01 = esimd::block_load<float, 64>(
+                    recurrent_state + state_base + (size_t)value0 * key_dim + 64);
+                esimd::simd<float, 64> state10 = esimd::block_load<float, 64>(
+                    recurrent_state + state_base + (size_t)value1 * key_dim);
+                esimd::simd<float, 64> state11 = esimd::block_load<float, 64>(
+                    recurrent_state + state_base + (size_t)value1 * key_dim + 64);
+                state00 *= decay;
+                state01 *= decay;
+                state10 *= decay;
+                state11 *= decay;
+                float memory0 = qwen35_esimd::dot128(state00, state01, k0, k1);
+                float memory1 = qwen35_esimd::dot128(state10, state11, k0, k1);
+                float delta0 = (value_pair[0] - memory0) * beta_value;
+                float delta1 = (value_pair[1] - memory1) * beta_value;
+                state00 += delta0 * k0;
+                state01 += delta0 * k1;
+                state10 += delta1 * k0;
+                state11 += delta1 * k1;
+                esimd::simd<float, 2> result;
+                result[0] = qwen35_esimd::dot128(state00, state01, q0, q1);
+                result[1] = qwen35_esimd::dot128(state10, state11, q0, q1);
+                auto* core_ptr = reinterpret_cast<native_bf16*>(
+                    core + (size_t)value_head * value_dim + value0);
+                esimd::block_store<native_bf16, 2>(
+                    core_ptr, esimd::simd<native_bf16, 2>(result));
+                esimd::block_store<float, 64>(
+                    recurrent_state + state_base + (size_t)value0 * key_dim,
+                    state00);
+                esimd::block_store<float, 64>(
+                    recurrent_state + state_base + (size_t)value0 * key_dim + 64,
+                    state01);
+                esimd::block_store<float, 64>(
+                    recurrent_state + state_base + (size_t)value1 * key_dim,
+                    state10);
+                esimd::block_store<float, 64>(
+                    recurrent_state + state_base + (size_t)value1 * key_dim + 64,
+                    state11);
+
+                auto* z_source = reinterpret_cast<const native_bf16*>(
+                    projected + conv_dim +
+                    (size_t)value_head * value_dim + value0);
+                auto* z_destination = reinterpret_cast<native_bf16*>(
+                    z_output + (size_t)value_head * value_dim + value0);
+                esimd::simd<native_bf16, 2> z_values =
+                    esimd::block_load<native_bf16, 2>(z_source);
+                esimd::block_store<native_bf16, 2>(z_destination, z_values);
+            });
+    });
+}
+
+inline void qwen35_update_conv_state_time_major(
+    sycl::queue& queue, const bf16* projected, int projected_stride,
+    bf16* state, int channels) {
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(sycl::range<1>((size_t)channels), [=](sycl::id<1> id) {
+            int channel = static_cast<int>(id[0]);
+            state[channel] = state[channels + channel];
+            state[channels + channel] = state[2 * channels + channel];
+            state[2 * channels + channel] = projected[channel];
+        });
+    });
+}
+
 inline int qwen35_mrope_axis(int frequency, const int* sections) {
     for (int axis = 1; axis <= 2; ++axis) {
         int limit = sections[axis] * 3;
@@ -696,6 +899,155 @@ inline void qwen35_xmx_attention(
                                    head_dim + output_tile * sg_size + lane] =
                             float_to_bf16(output_acc[m] / denominator);
                     }
+                }
+            });
+    });
+}
+
+// Decode-only XMX GQA kernel. One work-group owns a KV head and computes its
+// six query heads together as the M rows of the 8x16 DPAS tile. K and V tiles
+// are therefore loaded once and reused across the full GQA group.
+inline void qwen35_xmx_attention_decode_gqa(
+    sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
+    bf16* output, int past, int query_heads, int key_heads,
+    int head_dim, float scale) {
+    if (head_dim != 256 || query_heads % key_heads != 0 ||
+        query_heads / key_heads > 8)
+        throw std::runtime_error("Qwen3.5 GQA-reuse decode kernel shape mismatch");
+    constexpr int subgroup_size = 16;
+    constexpr int rows = 8;
+    constexpr int output_tiles = 16;
+    constexpr int partitions = 4;
+    constexpr int output_tiles_per_partition = output_tiles / partitions;
+    constexpr int work_group =
+        subgroup_size * output_tiles_per_partition;
+    int queries_per_key = query_heads / key_heads;
+    int visible_tokens = past + 1;
+    queue.submit([&](sycl::handler& handler) {
+        sycl::local_accessor<float, 1> shared(
+            rows * subgroup_size + 2 * rows, handler);
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                (size_t)key_heads * partitions * work_group, work_group),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                int group = static_cast<int>(item.get_group(0));
+                int key_head = group / partitions;
+                int partition = group % partitions;
+                auto subgroup = item.get_sub_group();
+                int local_output_tile =
+                    static_cast<int>(subgroup.get_group_linear_id());
+                int output_tile = partition * output_tiles_per_partition +
+                    local_output_tile;
+                int lane = static_cast<int>(subgroup.get_local_linear_id());
+                int query_head0 = key_head * queries_per_key;
+                diff_dpas_v8f output_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                float running_max[rows];
+                float running_sum[rows];
+                for (int row = 0; row < rows; ++row) {
+                    running_max[row] = -INFINITY;
+                    running_sum[row] = 0.0f;
+                }
+
+                int blocks = (visible_tokens + subgroup_size - 1) / subgroup_size;
+                for (int block = 0; block < blocks; ++block) {
+                    int key0 = block * subgroup_size;
+                    if (local_output_tile == 0) {
+                        diff_dpas_v8f scores = {0, 0, 0, 0, 0, 0, 0, 0};
+                        for (int kt = 0; kt < head_dim / subgroup_size; ++kt) {
+                            int dimension = kt * subgroup_size + lane;
+                            diff_dpas_v8s query_fragment;
+                            for (int row = 0; row < rows; ++row) {
+                                query_fragment[row] = row < queries_per_key
+                                    ? static_cast<short>(query[
+                                        (size_t)(query_head0 + row) * head_dim +
+                                        dimension])
+                                    : 0;
+                            }
+                            diff_dpas_v8i key_fragment;
+                            int key_position = key0 + lane;
+                            for (int pair = 0; pair < 8; ++pair) {
+                                uint32_t packed = 0;
+                                if (key_position < visible_tokens) {
+                                    const bf16* key_row = key +
+                                        ((size_t)key_position * key_heads + key_head) *
+                                            head_dim;
+                                    packed = static_cast<uint32_t>(
+                                        key_row[kt * 16 + pair * 2]) |
+                                        (static_cast<uint32_t>(
+                                            key_row[kt * 16 + pair * 2 + 1]) << 16);
+                                }
+                                key_fragment[pair] = static_cast<int>(packed);
+                            }
+                            scores = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                                16, query_fragment, key_fragment, scores,
+                                kNvfp4DpasBF16);
+                        }
+
+                        for (int row = 0; row < rows; ++row) {
+                            int key_position = key0 + lane;
+                            bool visible = row < queries_per_key &&
+                                           key_position < visible_tokens;
+                            float score = visible ? scores[row] * scale : -INFINITY;
+                            float block_max = sycl::reduce_over_group(
+                                subgroup, score, sycl::maximum<float>());
+                            float next_max = sycl::fmax(running_max[row], block_max);
+                            float alpha = sycl::exp(running_max[row] - next_max);
+                            float probability = visible
+                                ? sycl::exp(score - next_max) : 0.0f;
+                            float block_sum = sycl::reduce_over_group(
+                                subgroup, probability, sycl::plus<float>());
+                            running_sum[row] =
+                                running_sum[row] * alpha + block_sum;
+                            running_max[row] = next_max;
+                            shared[row * subgroup_size + lane] = probability;
+                            if (lane == 0)
+                                shared[rows * subgroup_size + row] = alpha;
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int row = 0; row < rows; ++row)
+                        output_acc[row] *= shared[rows * subgroup_size + row];
+                    diff_dpas_v8s probability_fragment;
+                    for (int row = 0; row < rows; ++row)
+                        probability_fragment[row] = static_cast<short>(
+                            float_to_bf16(shared[row * subgroup_size + lane]));
+                    diff_dpas_v8i value_fragment;
+                    int output_dimension = output_tile * subgroup_size + lane;
+                    for (int pair = 0; pair < 8; ++pair) {
+                        int key_position0 = key0 + pair * 2;
+                        uint32_t packed = 0;
+                        if (key_position0 < visible_tokens) {
+                            bf16 low = value[
+                                ((size_t)key_position0 * key_heads + key_head) *
+                                    head_dim + output_dimension];
+                            bf16 high = 0;
+                            if (key_position0 + 1 < visible_tokens)
+                                high = value[
+                                    ((size_t)(key_position0 + 1) * key_heads + key_head) *
+                                        head_dim + output_dimension];
+                            packed = static_cast<uint32_t>(low) |
+                                     (static_cast<uint32_t>(high) << 16);
+                        }
+                        value_fragment[pair] = static_cast<int>(packed);
+                    }
+                    output_acc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                        16, probability_fragment, value_fragment, output_acc,
+                        kNvfp4DpasBF16);
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                if (local_output_tile == 0 && lane == 0)
+                    for (int row = 0; row < rows; ++row)
+                        shared[rows * (subgroup_size + 1) + row] =
+                            running_sum[row];
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int row = 0; row < queries_per_key; ++row) {
+                    float denominator =
+                        shared[rows * (subgroup_size + 1) + row];
+                    output[((size_t)query_head0 + row) * head_dim +
+                           output_tile * subgroup_size + lane] =
+                        float_to_bf16(output_acc[row] / denominator);
                 }
             });
     });

@@ -568,6 +568,58 @@ inline void pack_bf16_to_nvfp4(
     });
     }, session);
 }
+
+// Dense SwiGLU followed by NVFP4 activation packing. This preserves the BF16
+// boundary of the unfused sequence (gate/up BF16 -> SwiGLU BF16 -> pack) while
+// eliminating the compact BF16 activation round-trip and one kernel launch.
+inline void swiglu_pack_nvfp4(
+    sycl::queue& queue, const bf16* gate_up, int M, int intermediate,
+    float input_global_scale, uint8_t* packed, uint8_t* scales) {
+    if (intermediate % 16 != 0)
+        throw std::runtime_error(
+            "fused SwiGLU NVFP4 pack requires intermediate divisible by 16");
+    int groups = intermediate / 16;
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::range<2>((size_t)M, (size_t)groups),
+            [=](sycl::id<2> id) {
+                int row = static_cast<int>(id[0]);
+                int group = static_cast<int>(id[1]);
+                int k0 = group * 16;
+                const bf16* source = gate_up + (size_t)row * 2 * intermediate;
+                float values[16];
+                float maximum = 0.0f;
+                for (int i = 0; i < 16; ++i) {
+                    float gate = bf16_to_float(source[k0 + i]);
+                    float up = bf16_to_float(source[intermediate + k0 + i]);
+                    float value = gate / (1.0f + sycl::exp(-gate)) * up;
+                    value = bf16_to_float(float_to_bf16(value));
+                    values[i] = value;
+                    maximum = sycl::fmax(maximum, sycl::fabs(value));
+                }
+                uint8_t scale_bits = 0;
+                float scale = 0.0f;
+                if (maximum > 0.0f) {
+                    scale_bits = nvfp4_encode_e4m3_positive(
+                        maximum * input_global_scale / 6.0f);
+                    scale = nvfp4_e4m3_to_float(scale_bits);
+                }
+                scales[(size_t)row * groups + group] = scale_bits;
+                uint8_t* destination =
+                    packed + (size_t)row * (intermediate / 2) + k0 / 2;
+                for (int i = 0; i < 16; i += 2) {
+                    uint8_t low = 0, high = 0;
+                    if (scale > 0.0f) {
+                        low = nvfp4_encode_e2m1(
+                            values[i] * input_global_scale / scale);
+                        high = nvfp4_encode_e2m1(
+                            values[i + 1] * input_global_scale / scale);
+                    }
+                    destination[i / 2] = low | (high << 4);
+                }
+            });
+    });
+}
 inline Nvfp4MatmulEntry& nvfp4_matmul_entry(GpuEngine& ctx, int M, int K, int N) {
     static std::unordered_map<Nvfp4MatmulKey, Nvfp4MatmulEntry, Nvfp4MatmulKeyHash> cache;
     Nvfp4WeightLayout layout = nvfp4_weight_layout();
@@ -900,6 +952,209 @@ inline esimd_local::simd<float, N> e4m3(esimd_local::simd<uint16_t, N> b) {
     return val;
 }
 }  // namespace esimd_vec
+
+namespace nvfp4_decode_esimd {
+
+namespace esimd = sycl::ext::intel::esimd;
+using native_bf16 = sycl::ext::oneapi::bfloat16;
+
+ESIMD_INLINE float e4m3_scale(const uint8_t* scales, size_t index) {
+    uint16_t code = scales[index];
+    uint16_t exponent = (code >> 3) & 15;
+    uint16_t mantissa = code & 7;
+    float magnitude;
+    if (exponent == 0) {
+        magnitude = static_cast<float>(mantissa) * (1.0f / 512.0f);
+    } else {
+        magnitude = static_cast<float>(uint16_t{1} << exponent) *
+                    (1.0f / 128.0f) *
+                    (1.0f + static_cast<float>(mantissa) * (1.0f / 8.0f));
+    }
+    return (code & 128) ? -magnitude : magnitude;
+}
+
+ESIMD_INLINE float reduce64(esimd::simd<float, 64> values) {
+    values.select<32, 1>(0) += values.select<32, 1>(32);
+    values.select<16, 1>(0) += values.select<16, 1>(16);
+    values.select<8, 1>(0) += values.select<8, 1>(8);
+    values.select<4, 1>(0) += values.select<4, 1>(4);
+    values.select<2, 1>(0) += values.select<2, 1>(2);
+    return values[0] + values[1];
+}
+
+}  // namespace nvfp4_decode_esimd
+
+// M=1 decode GEMV over the checkpoint's native W4A4 layout. One ESIMD
+// work-item owns one output row and streams packed E2M1 activations/weights in
+// 128-value blocks. Activation scales are E4M3 [K/16], weight scales are E4M3
+// [K/16,N], and accumulation is FP32.
+inline void matmul_nvfp4_decode_gemv_esimd(
+    const uint8_t* input_packed, const uint8_t* input_scales, int K,
+    const Nvfp4Linear& weights, bf16* output,
+    GpuEngine& context = GpuEngine::get(0)) {
+    if (weights.in_features != K || K % 128 != 0)
+        throw std::runtime_error(
+            "NVFP4 decode GEMV requires a matching K divisible by 128");
+    int N = weights.out_features;
+    const uint8_t* packed = weights.weight_packed.data();
+    const uint8_t* scales = weights.weight_scale.data();
+    float inverse_destination_scale =
+        1.0f / (weights.input_global_scale * weights.weight_global_scale);
+    auto& queue = context.queue;
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>((size_t)N, size_t{1}),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                namespace esimd = sycl::ext::intel::esimd;
+                using native_bf16 = sycl::ext::oneapi::bfloat16;
+                int n = static_cast<int>(item.get_group(0));
+                const uint8_t* weight_row = packed + (size_t)n * (K / 2);
+                esimd::simd<float, 64> even_accumulator = 0.0f;
+                esimd::simd<float, 64> odd_accumulator = 0.0f;
+
+                for (int k = 0; k < K; k += 128) {
+                    esimd::simd<uint8_t, 64> input_raw =
+                        esimd::block_load<uint8_t, 64>(input_packed + k / 2);
+                    esimd::simd<uint16_t, 64> input_wide =
+                        esimd::convert<uint16_t>(input_raw);
+                    esimd::simd<float, 64> input_even =
+                        esimd_vec::e2m1<64>(input_wide & uint16_t{15});
+                    esimd::simd<float, 64> input_odd =
+                        esimd_vec::e2m1<64>((input_wide >> 4) & uint16_t{15});
+                    esimd::simd<uint8_t, 64> raw =
+                        esimd::block_load<uint8_t, 64>(weight_row + k / 2);
+                    esimd::simd<uint16_t, 64> widened =
+                        esimd::convert<uint16_t>(raw);
+                    esimd::simd<float, 64> weight_even =
+                        esimd_vec::e2m1<64>(widened & uint16_t{15});
+                    esimd::simd<float, 64> weight_odd =
+                        esimd_vec::e2m1<64>((widened >> 4) & uint16_t{15});
+                    esimd::simd<float, 64> scale_vector;
+#pragma unroll
+                    for (int group = 0; group < 8; ++group) {
+                        int scale_group = k / 16 + group;
+                        float input_scale = nvfp4_decode_esimd::e4m3_scale(
+                            input_scales, scale_group);
+                        float weight_scale = nvfp4_decode_esimd::e4m3_scale(
+                            scales, (size_t)scale_group * N + n);
+                        scale_vector.template select<8, 1>(group * 8) =
+                            input_scale * weight_scale;
+                    }
+                    scale_vector *= inverse_destination_scale;
+                    even_accumulator += input_even * weight_even * scale_vector;
+                    odd_accumulator += input_odd * weight_odd * scale_vector;
+                }
+
+                float result = nvfp4_decode_esimd::reduce64(even_accumulator) +
+                               nvfp4_decode_esimd::reduce64(odd_accumulator);
+                auto* native_output = reinterpret_cast<native_bf16*>(output + n);
+                esimd::block_store<native_bf16, 1>(
+                    native_output, esimd::simd<native_bf16, 1>(result));
+            });
+    });
+}
+
+// Fused gate/up GEMV and SwiGLU for M=1. Each work-item owns one intermediate
+// channel, accumulates its paired gate and up rows while loading the BF16 input
+// once, and writes only the compact activated vector consumed by down_proj.
+inline void matmul_nvfp4_decode_swiglu_esimd(
+    const uint8_t* input_packed, const uint8_t* input_scales, int K,
+    const Nvfp4Linear& gate_up,
+    bf16* activation, int intermediate,
+    GpuEngine& context = GpuEngine::get(0)) {
+    if (gate_up.in_features != K || gate_up.out_features != 2 * intermediate ||
+        K % 128 != 0)
+        throw std::runtime_error(
+            "NVFP4 decode SwiGLU requires paired gate/up and K divisible by 128");
+    int N = gate_up.out_features;
+    const uint8_t* packed = gate_up.weight_packed.data();
+    const uint8_t* scales = gate_up.weight_scale.data();
+    float inverse_destination_scale =
+        1.0f / (gate_up.input_global_scale * gate_up.weight_global_scale);
+    auto& queue = context.queue;
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>((size_t)intermediate, size_t{1}),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                namespace esimd = sycl::ext::intel::esimd;
+                using native_bf16 = sycl::ext::oneapi::bfloat16;
+                int n = static_cast<int>(item.get_group(0));
+                const uint8_t* gate_row = packed + (size_t)n * (K / 2);
+                const uint8_t* up_row =
+                    packed + (size_t)(intermediate + n) * (K / 2);
+                esimd::simd<float, 64> gate_even = 0.0f, gate_odd = 0.0f;
+                esimd::simd<float, 64> up_even = 0.0f, up_odd = 0.0f;
+
+                for (int k = 0; k < K; k += 128) {
+                    esimd::simd<uint8_t, 64> input_raw =
+                        esimd::block_load<uint8_t, 64>(input_packed + k / 2);
+                    esimd::simd<uint16_t, 64> input_wide =
+                        esimd::convert<uint16_t>(input_raw);
+                    esimd::simd<float, 64> input_even =
+                        esimd_vec::e2m1<64>(input_wide & uint16_t{15});
+                    esimd::simd<float, 64> input_odd =
+                        esimd_vec::e2m1<64>((input_wide >> 4) & uint16_t{15});
+                    esimd::simd<uint8_t, 64> gate_raw =
+                        esimd::block_load<uint8_t, 64>(gate_row + k / 2);
+                    esimd::simd<uint8_t, 64> up_raw =
+                        esimd::block_load<uint8_t, 64>(up_row + k / 2);
+                    esimd::simd<uint16_t, 64> gate_wide =
+                        esimd::convert<uint16_t>(gate_raw);
+                    esimd::simd<uint16_t, 64> up_wide =
+                        esimd::convert<uint16_t>(up_raw);
+                    esimd::simd<float, 64> gate_weight_even =
+                        esimd_vec::e2m1<64>(gate_wide & uint16_t{15});
+                    esimd::simd<float, 64> gate_weight_odd =
+                        esimd_vec::e2m1<64>((gate_wide >> 4) & uint16_t{15});
+                    esimd::simd<float, 64> up_weight_even =
+                        esimd_vec::e2m1<64>(up_wide & uint16_t{15});
+                    esimd::simd<float, 64> up_weight_odd =
+                        esimd_vec::e2m1<64>((up_wide >> 4) & uint16_t{15});
+                    esimd::simd<float, 64> gate_scales, up_scales;
+#pragma unroll
+                    for (int group = 0; group < 8; ++group) {
+                        int scale_group = k / 16 + group;
+                        size_t scale_base = (size_t)scale_group * N;
+                        float input_scale = nvfp4_decode_esimd::e4m3_scale(
+                            input_scales, scale_group);
+                        float gate_scale = nvfp4_decode_esimd::e4m3_scale(
+                            scales, scale_base + n);
+                        float up_scale = nvfp4_decode_esimd::e4m3_scale(
+                            scales, scale_base + intermediate + n);
+                        gate_scales.template select<8, 1>(group * 8) =
+                            input_scale * gate_scale;
+                        up_scales.template select<8, 1>(group * 8) =
+                            input_scale * up_scale;
+                    }
+                    gate_scales *= inverse_destination_scale;
+                    up_scales *= inverse_destination_scale;
+                    gate_even += input_even * gate_weight_even * gate_scales;
+                    gate_odd += input_odd * gate_weight_odd * gate_scales;
+                    up_even += input_even * up_weight_even * up_scales;
+                    up_odd += input_odd * up_weight_odd * up_scales;
+                }
+
+                float gate_value = nvfp4_decode_esimd::reduce64(gate_even) +
+                                   nvfp4_decode_esimd::reduce64(gate_odd);
+                float up_value = nvfp4_decode_esimd::reduce64(up_even) +
+                                 nvfp4_decode_esimd::reduce64(up_odd);
+                esimd::simd<float, 2> projected;
+                projected[0] = gate_value;
+                projected[1] = up_value;
+                esimd::simd<native_bf16, 2> projected_bf16 = projected;
+                esimd::simd<float, 2> rounded = projected_bf16;
+                gate_value = rounded[0];
+                up_value = rounded[1];
+                float sigmoid = 1.0f / (1.0f +
+                    esimd::exp(esimd::simd<float, 8>(-gate_value))[0]);
+                float result = gate_value * sigmoid * up_value;
+                auto* native_output =
+                    reinterpret_cast<native_bf16*>(activation + n);
+                esimd::block_store<native_bf16, 1>(
+                    native_output, esimd::simd<native_bf16, 1>(result));
+            });
+    });
+}
 
 inline int nvfp4_dpas_ksplit_factor(int m_tiles, int k_tiles, int n_tiles) {
     static int target = [] {

@@ -65,6 +65,28 @@ inline bool qwen35_esimd_delta_enabled() {
     return enabled;
 }
 
+inline bool qwen35_fused_esimd_delta_decode_enabled() {
+    static bool enabled = [] {
+        const char* value =
+            std::getenv("ARCAINE_QWEN35_FUSED_ESIMD_DELTA_DECODE");
+        if (!value) return true;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
+inline bool qwen35_fused_ba_projection_enabled() {
+    static bool enabled = [] {
+        const char* value =
+            std::getenv("ARCAINE_QWEN35_FUSED_BA_PROJECTION");
+        if (!value) return true;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
 inline void qwen35_full_attention_forward(
     GpuEngine& context,
     const Qwen35FullAttentionWeights& weights,
@@ -166,6 +188,37 @@ inline void qwen35_linear_attention_forward(
         matmul_fp8(hidden, seq, c.hidden_size, weights.in_proj_qkv,
                    workspace.tmp0.data(), context);
     }
+    if (seq == 1 && weights.fused_projections &&
+        qwen35_fused_esimd_delta_decode_enabled()) {
+        if (qwen35_fused_ba_projection_enabled())
+            matmul_bf16(hidden, 1, c.hidden_size, weights.in_proj_ba.data(),
+                        2 * heads, workspace.tmp1.data(), context);
+        else {
+            matmul_bf16(hidden, 1, c.hidden_size, weights.in_proj_b.data(), heads,
+                        workspace.tmp1.data(), context);
+            matmul_bf16(hidden, 1, c.hidden_size, weights.in_proj_a.data(), heads,
+                        workspace.tmp1.data() + heads, context);
+        }
+        qwen35_delta_decode_fused_esimd(
+            queue, workspace.tmp0.data(), projected_stride,
+            weights.conv1d_time_major.data(), cache.conv_state.data(),
+            weights.A_log.data(), weights.dt_bias.data(), workspace.tmp1.data(),
+            cache.recurrent_state.data(), workspace.tmp4.data(),
+            workspace.tmp2.data(), c.linear_num_key_heads, heads,
+            c.linear_key_head_dim, c.linear_value_head_dim, conv_dim,
+            c.linear_conv_kernel_dim, c.rms_norm_eps);
+        qwen35_update_conv_state_time_major(
+            queue, workspace.tmp0.data(), projected_stride,
+            cache.conv_state.data(), conv_dim);
+        cache.has_state = true;
+        gated_rmsnorm(
+            queue, workspace.tmp4.data(), workspace.tmp2.data(),
+            weights.norm.data(), workspace.tmp4.data(), heads,
+            c.linear_value_head_dim, c.rms_norm_eps);
+        matmul_fp8(workspace.tmp4.data(), 1, value_dim, weights.out_proj,
+                   output, context);
+        return;
+    }
     qwen35_conv_causal(queue, workspace.tmp0.data(), weights.conv1d.data(),
                        cache.conv_state.data(), workspace.tmp1.data(), seq,
                        conv_dim, c.linear_conv_kernel_dim, cache.has_state,
@@ -192,10 +245,15 @@ inline void qwen35_linear_attention_forward(
                    workspace.tmp0.data(), context);
     bf16* beta = workspace.tmp1.data();
     bf16* g = workspace.tmp1.data() + head_values;
-    matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_b.data(), heads,
-                beta, context);
-    matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
-                g, context);
+    if (qwen35_fused_ba_projection_enabled())
+        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_ba.data(),
+                    2 * heads, beta, context);
+    else {
+        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_b.data(), heads,
+                    beta, context);
+        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
+                    g, context);
+    }
     sigmoid_inplace(queue, beta, head_values);
     qwen35_compute_g(queue, g, weights.A_log.data(), weights.dt_bias.data(),
                      g, seq, heads);

@@ -28,7 +28,10 @@ struct Qwen35LinearAttentionWeights {
     Fp8Linear out_proj;
     GpuBuffer<bf16> in_proj_a;
     GpuBuffer<bf16> in_proj_b;
+    GpuBuffer<bf16> in_proj_ba;
     GpuBuffer<bf16> conv1d;
+    // [kernel, channel], used by the fused ESIMD M=1 DeltaNet path.
+    GpuBuffer<bf16> conv1d_time_major;
     GpuBuffer<bf16> A_log;
     GpuBuffer<bf16> dt_bias;
     GpuBuffer<bf16> norm;

@@ -44,11 +44,15 @@ Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
         if (parsed > 0) max_layers = parsed;
     }
     std::printf("[qwen35] %d GPU(s), layer split=%d, NVFP4 DPAS=%s, "
-                "XMX attention=%s, ESIMD DeltaNet=%s, persistent IO=%s\n",
+                "XMX attention=%s, ESIMD DeltaNet=%s, "
+                "fused Delta decode=%s, fused BA=%s, "
+                "persistent IO=%s\n",
                 GpuEngine::count(), split_layer_,
                 qwen35_nvfp4_dpas_enabled() ? "on" : "off",
                 qwen35_xmx_attention_enabled() ? "on" : "off",
                 qwen35_esimd_delta_enabled() ? "on" : "off",
+                qwen35_fused_esimd_delta_decode_enabled() ? "on" : "off",
+                qwen35_fused_ba_projection_enabled() ? "on" : "off",
                 qwen35_persistent_io_enabled() ? "on" : "off");
     ShardedSafetensors checkpoint(model_dir);
     weights_ = load_qwen35_weights(checkpoint, config_, split_layer_, max_layers);

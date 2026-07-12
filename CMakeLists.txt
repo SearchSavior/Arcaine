@@ -251,6 +251,18 @@ target_link_options(qwen35_deltanet_bench PRIVATE
     -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(qwen35_deltanet_bench PRIVATE DNNL::dnnl)
 
+# Architecture-shaped M=1 DeltaNet decode-fusion benchmark. It compares the
+# exact unfused conv/norm/gate/recurrent sequence with the fused ESIMD kernel.
+add_executable(qwen35_delta_decode_fusion_bench
+    src/qwen35_delta_decode_fusion_bench.cpp)
+target_compile_options(qwen35_delta_decode_fusion_bench PRIVATE
+    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen35_delta_decode_fusion_bench PRIVATE
+    -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(qwen35_delta_decode_fusion_bench PRIVATE
+    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(qwen35_delta_decode_fusion_bench PRIVATE DNNL::dnnl)
+
 # qwen_kernels_selfcheck: build-verify + GPU smoke for qwen3_5_moe/kernels.hpp.
 # An unused inline SYCL lambda is not device-codegen'd, so calling each kernel
 # once (this TU) is what forces SPIR-V codegen and validates the device bodies.

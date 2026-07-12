@@ -254,8 +254,35 @@ Qwen35Weights load_qwen35_weights(
                                              {c.linear_num_value_heads, c.hidden_size}, queue);
             attention.in_proj_b = load_bf16(source, prefix + "in_proj_b.weight",
                                              {c.linear_num_value_heads, c.hidden_size}, queue);
+            attention.in_proj_ba = GpuBuffer<bf16>(
+                (size_t)2 * c.linear_num_value_heads * c.hidden_size, queue);
+            queue.memcpy(
+                attention.in_proj_ba.data(), attention.in_proj_b.data(),
+                (size_t)c.linear_num_value_heads * c.hidden_size * sizeof(bf16));
+            queue.memcpy(
+                attention.in_proj_ba.data() +
+                    (size_t)c.linear_num_value_heads * c.hidden_size,
+                attention.in_proj_a.data(),
+                (size_t)c.linear_num_value_heads * c.hidden_size * sizeof(bf16));
             attention.conv1d = load_bf16(source, prefix + "conv1d.weight",
                                           {conv_dim, 1, c.linear_conv_kernel_dim}, queue);
+            attention.conv1d_time_major = GpuBuffer<bf16>(
+                (size_t)conv_dim * c.linear_conv_kernel_dim, queue);
+            {
+                const bf16* source_weight = attention.conv1d.data();
+                bf16* destination_weight = attention.conv1d_time_major.data();
+                int kernel = c.linear_conv_kernel_dim;
+                queue.submit([&](sycl::handler& handler) {
+                    handler.parallel_for(
+                        sycl::range<2>((size_t)kernel, (size_t)conv_dim),
+                        [=](sycl::id<2> id) {
+                            int tap = static_cast<int>(id[0]);
+                            int channel = static_cast<int>(id[1]);
+                            destination_weight[(size_t)tap * conv_dim + channel] =
+                                source_weight[(size_t)channel * kernel + tap];
+                        });
+                });
+            }
             attention.A_log = load_bf16(source, prefix + "A_log",
                                          {c.linear_num_value_heads}, queue);
             attention.dt_bias = load_bf16(source, prefix + "dt_bias",

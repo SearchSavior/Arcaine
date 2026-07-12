@@ -61,6 +61,30 @@ On BMG G31 this reduces the recurrent-core time from 6.84 to 1.07 ms at
 32-step sequential decode drops from 0.0356 to 0.00484 ms/token. Maximum BF16
 output error against the baseline was 8e-6 over the full sweep.
 
+For M=1 decode, `ARCAINE_QWEN35_FUSED_ESIMD_DELTA_DECODE=1` (the default)
+also fuses causal conv1d, Q/K normalization and query scaling, beta/decay gate
+evaluation, recurrent update, and z extraction. Its convolution state is
+time-major; the scalar fallback selected with `=0` retains the original
+channel-major layout, so the setting must not change inside a live cache.
+`ARCAINE_QWEN35_FUSED_BA_PROJECTION=1` (also default) concatenates the small
+beta/a weights and replaces two 48-output BF16 matmuls with one 96-output
+matmul.
+
+The architecture-shaped decode-fusion benchmark is:
+
+```bash
+docker exec arcaine-dev-run-a82a51b2b852 bash -lc \
+  'cd /workspace && ARCAINE_QWEN35_DELTA_DECODE_PROMPT=1 \
+  ARCAINE_QWEN35_DELTA_DECODE_TOKENS=32 \
+  ARCAINE_QWEN35_DELTA_DECODE_WARMUP=1 \
+  ARCAINE_QWEN35_DELTA_DECODE_RUNS=5 \
+  ./scripts/benchmark_qwen35_delta_decode_fusion_ab.sh'
+```
+
+On BMG G31, the complete post-projection decode sequence drops from 0.0563
+to 0.0194 ms/token with exact BF16 core and z output. End-to-end decode reaches
+13.38, 12.26, and 11.34 tokens/s at KV depths 0, 512, and 1024.
+
 The focused benchmark is:
 
 ```bash

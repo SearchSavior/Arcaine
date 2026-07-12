@@ -54,7 +54,7 @@ void usage(const char* program) {
         "  --d <csv>          decode KV depths           (default: 0,512,1024)\n"
         "  --w <N>            warmup runs per cell       (default: 1)\n"
         "  --r <N>            timed runs per cell        (default: 5)\n"
-        "  --kernels <csv>    baseline,subgroup,xmx      (default: baseline,xmx)\n"
+        "  --kernels <csv>    baseline,subgroup,xmx,xmx-gqa (default: baseline,xmx)\n"
         "  --device <N>       visible Level Zero GPU\n",
         program);
 }
@@ -132,6 +132,10 @@ int main(int argc, char** argv) {
         else if (kernel == "xmx")
             qwen35_xmx_attention(queue, q.data(), k.data(), v.data(), destination,
                                  seq, past, query_heads, key_heads, head_dim, scale);
+        else if (kernel == "xmx-gqa" && seq == 1)
+            qwen35_xmx_attention_decode_gqa(
+                queue, q.data(), k.data(), v.data(), destination, past,
+                query_heads, key_heads, head_dim, scale);
         else
             throw std::runtime_error("unknown kernel: " + kernel);
     };
@@ -142,6 +146,7 @@ int main(int argc, char** argv) {
         std::vector<bf16> host_reference((size_t)seq * query_heads * head_dim);
         reference.download(host_reference.data(), host_reference.size());
         for (const std::string& kernel : kernels) {
+            if (kernel == "xmx-gqa" && seq != 1) continue;
             run_kernel(kernel, output.data(), seq, past);
             queue.wait();
             std::vector<bf16> host_output(host_reference.size());
