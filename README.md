@@ -36,9 +36,13 @@ These are cobbled together but define the codepath taken at inference time; Arca
 
 ## Supported Models
 
-- DiffusionGemma [BF16](https://huggingface.co/google/diffusiongemma-26B-A4B-it)/[NVFP4](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-NVFP4)/[W4A16](https://huggingface.co/pixelkaiser/diffusiongemma-26B-A4B-it-AWQ-MLP-W4A16-G64-S32-L1024)
+- DiffusionGemma [BF16](https://huggingface.co/google/diffusiongemma-26B-A4B-it)/[NVFP4](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-NVFP4)/[INT4-AWQ](https://huggingface.co/cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4)
 
 - Gemma4-12B [BF16](https://huggingface.co/google/gemma-4-12B-it)
+
+- Unsloth Qwen3.6-27B [NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4)
+
+- Qwen AgentWorld-35B-A3B [NVFP4](https://huggingface.co/Frosty40/Qwen-AgentWorld-35B-A3B-NVFP4)
 
 
 ## Container setup
