@@ -24,11 +24,11 @@ include_directories(third_party third_party/minja/include)
 # so newer symbols such as dnnl_primitive_attr_set_scales_v3 resolve at runtime.
 add_link_options(-Wl,--disable-new-dtags)
 
-# libsoxr (static, built in-tree)
+# libsoxr (static, vendored prebuilt — header + libsoxr.a only, like minja/nlohmann)
 add_library(soxr STATIC IMPORTED)
 set_target_properties(soxr PROPERTIES
-    IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/third_party/soxr/build/src/libsoxr.a"
-    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/soxr/src"
+    IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/third_party/soxr/libsoxr.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/soxr"
 )
 
 # ONNX Runtime (for Silero VAD)
