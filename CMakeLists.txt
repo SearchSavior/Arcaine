@@ -96,7 +96,7 @@ target_compile_options(get_device_props PRIVATE -fsycl -fno-sycl-id-queries-fit-
 target_link_options(get_device_props PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_libraries(get_device_props PRIVATE DNNL::dnnl)
 set_target_properties(get_device_props PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/.skills/check-available-hardware")
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/.agents/skills/check-available-hardware")
 
 # ---------------------------------------------------------------------------
 add_executable(gemma4 src/main.cpp ${COMMON_SRCS} ${ARCH_SRCS})
@@ -363,7 +363,7 @@ target_link_libraries(nvfp4_roofline_bench PRIVATE DNNL::dnnl)
 
 # ---------------------------------------------------------------------------
 # Phase 0, Probe 1 — oneDNN batched f4_e2m1 matmul feasibility (host-side).
-# SYCL + oneDNN only; needs the engine singleton. Mirrors get_device_props:70-73.
+# SYCL + oneDNN only; needs the engine singleton.
 add_executable(nvfp4_batched_probe src/nvfp4_batched_probe.cpp)
 target_compile_options(nvfp4_batched_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(nvfp4_batched_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})

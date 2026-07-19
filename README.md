@@ -51,7 +51,7 @@ These are cobbled together but define the codepath taken at inference time; Arca
 export RENDER_GID=$(getent group render | cut -d: -f3)
 docker compose build
 docker compose run --rm --service-ports \
-  -v /mnt/Ironwolf-4TB/Projects/arcana/models:/workspace/models \
+  -v /mnt/Ironwolf-4TB/Models/Arcaine/:/workspace/models \
   dev   # interactive shell in /workspace
 ```
 
