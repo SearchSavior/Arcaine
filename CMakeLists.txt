@@ -111,12 +111,6 @@ set_target_properties(gemma4 PROPERTIES
     INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
-add_executable(test_tokenizer src/common/test_tokenizer.cpp src/common/preprocess/tokenizer.cpp ${UNICODE_SRCS})
-target_compile_options(test_tokenizer PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(test_tokenizer   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_libraries(test_tokenizer PRIVATE DNNL::dnnl)
-
-# ---------------------------------------------------------------------------
 # --chat-template-kwargs parsing + chat-template merge. Logic is SYCL-free, but
 # the global -fsycl-targets flag means every target must also pass -fsycl.
 # Pass a model dir as argv[1] to exercise the render-merge assertions.
@@ -169,14 +163,26 @@ target_compile_options(diffusion_gemma PRIVATE -fsycl -fno-sycl-id-queries-fit-i
 target_link_options(diffusion_gemma   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
-# OpenAI-compatible HTTP API server for DiffusionGemma.
-add_executable(diffusion_server
-    src/diffusion_server.cpp
+# OpenAI-compatible HTTP API server. Single binary serving every registered
+# architecture: dispatches by config.json::model_type at startup.
+#   - "diffusion_gemma"   -> DiffusionGemmaModel (block-diffusion MoE)
+#   - "gemma4_unified"    -> Gemma4Model (AR, multimodal, BF16)
+#   - "qwen3_5_moe_text"  -> QwenModel (AR, NVFP4 MoE)
+#   - "qwen3_5"           -> Qwen35Model (AR, FP8/NVFP4, multimodal)
+# Links COMMON_SRCS + ARCH_SRCS (all arches, so the registry can construct any)
+# plus DIFFUSION_SRCS (the block-diffusion path) and register_builtins.cpp
+# (wires the AR arches into ModelRegistry). Needs soxr + onnxruntime for the
+# Gemma4/Qwen3.5 audio + Silero VAD preprocessing paths.
+add_executable(arcaine_server
+    src/arcaine_server.cpp
     src/utils/gemma4_tool_call_parser.cpp
-    ${DIFFUSION_SRCS})
-target_compile_options(diffusion_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+    ${DIFFUSION_SRCS}
+    ${COMMON_SRCS}
+    ${ARCH_SRCS}
+    src/register_builtins.cpp)
+target_compile_options(arcaine_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(arcaine_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(arcaine_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
 # llama-bench style throughput benchmark (loads once, sweeps expert kernels).
 add_executable(diffusion_bench src/diffusion_bench.cpp ${DIFFUSION_SRCS})
@@ -185,7 +191,10 @@ target_link_options(diffusion_bench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG}
 target_link_options(diffusion_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
-target_link_libraries(diffusion_server PRIVATE DNNL::dnnl)
+target_link_libraries(arcaine_server PRIVATE DNNL::dnnl soxr onnxruntime)
+set_target_properties(arcaine_server PROPERTIES
+    BUILD_RPATH "${ORT_DIR}/lib"
+    INSTALL_RPATH "${ORT_DIR}/lib")
 
 # Focused INT4-AWQ decode-fusion benchmark.  Uses DiffusionGemma's fixed
 # canvas=256 / hidden=2816 / top-k=8 shapes and compares the actual adjacent

@@ -1,5 +1,10 @@
-// OpenAI-compatible HTTP server for DiffusionGemma.
-//   ./build/diffusion_server --model <dir> [--host 127.0.0.1] [--port 8000]
+// OpenAI-compatible HTTP server for any registered model architecture.
+// Dispatches by config.json::model_type at startup:
+//   - "diffusion_gemma" -> DiffusionGemmaModel (block-diffusion MoE)
+//   - "gemma4_unified"   -> Gemma4Model (AR, multimodal, BF16)
+//   - "qwen3_5_moe_text" -> QwenModel (AR, NVFP4 MoE)
+//   - "qwen3_5"          -> Qwen35Model (AR, FP8/NVFP4, multimodal)
+//   ./build/arcaine_server --model <dir> [--host 127.0.0.1] [--port 8000]
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -10,7 +15,9 @@
 #include <ctime>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,6 +28,9 @@
 #include <nlohmann/json.hpp>
 
 #include "common/gpu/placement.hpp"
+#include "common/model_interface.hpp"
+#include "common/registry.hpp"
+#include "common/sampler.hpp"
 #include "modeling/diffusion_gemma/model.hpp"
 #include "utils/chat.hpp"
 #include "utils/chat_template_kwargs.hpp"
@@ -57,6 +67,11 @@ struct ChatRequest {
     int max_tokens = 0;
     int denoising_steps = -1;
     unsigned seed = 0;
+    // AR sampling params. -1 sentinel = use model defaults (ar_info). Diffusion
+    // ignores these (the denoiser owns its temperature schedule internally).
+    float temperature = -1.0f;
+    int   top_k       = -1;
+    float top_p       = -1.0f;
 };
 
 struct ResponseMetrics {
@@ -78,21 +93,50 @@ struct OpenAiError : std::runtime_error {
         : std::runtime_error(msg), status(s), type(std::move(t)), code(std::move(c)) {}
 };
 
+// Read model_type from <dir>/config.json. Used at startup to pick the backend
+// family: diffusion_gemma uses DiffusionGemmaModel; anything else goes through
+// the ModelRegistry (AR arches: gemma4_unified, qwen3_5_moe_text, qwen3_5).
+static std::string read_model_type(const std::string& model_dir) {
+    std::ifstream f(model_dir + "/config.json");
+    if (!f) throw std::runtime_error("Cannot open " + model_dir + "/config.json");
+    auto j = nlohmann::json::parse(f);
+    if (!j.contains("model_type"))
+        throw std::runtime_error("config.json missing \"model_type\"");
+    return j.at("model_type").get<std::string>();
+}
+
 struct AppState {
     ServerOptions opts;
-    std::time_t created = std::time(nullptr);
+    std::time_t created = std::time_t(std::time(nullptr));
     std::string api_key;
     TokenizerBridge tokenizer;
-    Gemma4TokenBoundaryParser token_boundaries;
-    DiffusionGemmaModel model;
+    // Gemma4/DiffusionGemma-specific; requires boi_token_id etc. in the
+    // tokenizer. Only constructed for diffusion_gemma in v1; AR arches leave
+    // this null and the handler skips boundary counting for them.
+    std::unique_ptr<Gemma4TokenBoundaryParser> token_boundaries;
+    bool is_diffusion = true;
+    std::unique_ptr<DiffusionGemmaModel> diff_model;  // valid when is_diffusion
+    std::unique_ptr<Model>              ar_model;   // valid when !is_diffusion
+    ModelInfo                           ar_info;     // snapshot of ar_model->info()
     std::mutex generate_mu;
 
     AppState(ServerOptions o)
         : opts(std::move(o)),
           api_key(std::getenv("ARCAINE_API_KEY") ? std::getenv("ARCAINE_API_KEY") : ""),
-          tokenizer(opts.model_dir),
-          token_boundaries(opts.model_dir),
-          model(opts.model_dir, opts.max_seq, opts.placement, opts.print_placement) {}
+          tokenizer(opts.model_dir) {
+        std::string mt = read_model_type(opts.model_dir);
+        if (mt == "diffusion_gemma") {
+            is_diffusion = true;
+            token_boundaries = std::make_unique<Gemma4TokenBoundaryParser>(opts.model_dir);
+            diff_model = std::make_unique<DiffusionGemmaModel>(
+                opts.model_dir, opts.max_seq, opts.placement, opts.print_placement);
+        } else {
+            is_diffusion = false;
+            register_builtin_architectures();
+            ar_model = ModelRegistry::instance().create(opts.model_dir, opts.max_seq);
+            ar_info = ar_model->info();
+        }
+    }
 };
 
 std::string basename_of(std::string path) {
@@ -405,8 +449,25 @@ ChatRequest parse_chat_request(const httplib::Request& req, const AppState& app)
     parsed.max_tokens = require_positive_int(body, "max_completion_tokens", parsed.max_tokens);
     parsed.denoising_steps = require_positive_int(body, "arcaine_denoising_steps",
                                                   app.opts.steps > 0 ? app.opts.steps
-                                                                     : app.model.config().gen.max_denoising_steps);
+                                                                     : (app.is_diffusion
+                                                                        ? app.diff_model->config().gen.max_denoising_steps
+                                                                        : 0));
     parsed.seed = require_seed(body, app.opts.seed);
+
+    // AR sampling knobs (optional; default to model info values when absent).
+    // Diffusion ignores these — its denoiser owns the temperature schedule.
+    if (body.contains("temperature")) {
+        if (!body.at("temperature").is_number()) bad_request("temperature must be a number");
+        parsed.temperature = body.at("temperature").get<float>();
+    }
+    if (body.contains("top_p")) {
+        if (!body.at("top_p").is_number()) bad_request("top_p must be a number");
+        parsed.top_p = body.at("top_p").get<float>();
+    }
+    if (body.contains("top_k")) {
+        if (!body.at("top_k").is_number_integer()) bad_request("top_k must be an integer");
+        parsed.top_k = body.at("top_k").get<int>();
+    }
 
     if (body.contains("stream_options")) {
         if (!body.at("stream_options").is_object())
@@ -590,28 +651,86 @@ void handle_non_streaming(const ChatRequest& chat, const std::vector<int>& promp
     std::lock_guard<std::mutex> lock(app.generate_mu);
     using Clock = std::chrono::steady_clock;
     auto start = Clock::now();
-    bool saw_first_commit = false;
+
+    std::vector<int> generated;
     double ttft_s = 0.0;
-    DiffStreamCallback on_step = [&](const DiffStepEvent& ev) {
-        if (ev.committed && !saw_first_commit) {
-            ttft_s = std::chrono::duration<double>(Clock::now() - start).count();
-            saw_first_commit = true;
+    double duration_s = 0.0;
+    DiffPerfStats diff_stats{};
+    Gemma4TokenBoundaryCounts boundary_counts{};
+
+    if (app.is_diffusion) {
+        bool saw_first_commit = false;
+        DiffStreamCallback on_step = [&](const DiffStepEvent& ev) {
+            if (ev.committed && !saw_first_commit) {
+                ttft_s = std::chrono::duration<double>(Clock::now() - start).count();
+                saw_first_commit = true;
+            }
+        };
+        generated = app.diff_model->generate(prompt_ids, chat.max_tokens,
+                                             chat.denoising_steps, chat.seed,
+                                             false, on_step);
+        duration_s = std::chrono::duration<double>(Clock::now() - start).count();
+        if (generated.size() > (size_t)chat.max_tokens)
+            generated.resize((size_t)chat.max_tokens);
+        if (!saw_first_commit && !generated.empty()) ttft_s = duration_s;
+        diff_stats = app.diff_model->stats();
+        boundary_counts = app.token_boundaries->count(generated);
+    } else {
+        // AR path: sampler loop lifted from src/main.cpp:88-127. The model
+        // owns weights + KV cache; we drive forward() per step and sample.
+        // prompt_ids is already tokenized by TokenizerBridge in main; AR
+        // models use the same tokenizer, so prompt_ids is valid for both.
+        std::mt19937 rng(chat.seed);
+        const float temp  = chat.temperature >= 0 ? chat.temperature : app.ar_info.temperature;
+        const int   top_k = chat.top_k       >= 0 ? chat.top_k       : app.ar_info.top_k;
+        const float top_p = chat.top_p       >= 0 ? chat.top_p       : app.ar_info.top_p;
+        auto t_prefill0 = Clock::now();
+        ForwardInput fin{
+            std::cref(prompt_ids),
+            /*past_len=*/0,
+            /*images=*/nullptr,
+            /*audio=*/nullptr,
+            /*mm_token_type_ids=*/nullptr,
+        };
+        std::vector<float> logits = app.ar_model->forward(fin);
+        double prefill_s = std::chrono::duration<double>(Clock::now() - t_prefill0).count();
+        int past = (int)prompt_ids.size();
+        auto t_gen0 = Clock::now();
+        bool saw_first = false;
+        for (int step = 0; step < chat.max_tokens; ++step) {
+            for (int id : app.ar_info.suppress_tokens)
+                if (id >= 0 && id < (int)logits.size())
+                    logits[id] = -std::numeric_limits<float>::infinity();
+            int next = sample_token(logits.data(), (int)logits.size(),
+                                    temp, top_k, top_p, rng);
+            if (app.ar_info.is_eos(next)) break;
+            if (!saw_first) {
+                ttft_s = std::chrono::duration<double>(Clock::now() - start).count();
+                saw_first = true;
+            }
+            generated.push_back(next);
+            std::vector<int> step_tok{next};
+            logits = app.ar_model->forward(ForwardInput{std::cref(step_tok), past});
+            ++past;
         }
-    };
-    std::vector<int> generated = app.model.generate(prompt_ids, chat.max_tokens,
-                                                    chat.denoising_steps, chat.seed,
-                                                    false, on_step);
-    double duration_s = std::chrono::duration<double>(Clock::now() - start).count();
-    if (generated.size() > (size_t)chat.max_tokens)
-        generated.resize((size_t)chat.max_tokens);
-    if (!saw_first_commit && !generated.empty()) ttft_s = duration_s;
+        duration_s = std::chrono::duration<double>(Clock::now() - start).count();
+        if (!saw_first && !generated.empty()) ttft_s = duration_s;
+        double gen_s = std::chrono::duration<double>(Clock::now() - t_gen0).count();
+        diff_stats.prefill_tokens = (int)prompt_ids.size();
+        diff_stats.prefill_s      = prefill_s;
+        diff_stats.decode_passes  = (int)generated.size();
+        diff_stats.decode_s       = gen_s;
+        diff_stats.output_tokens  = (int)generated.size();
+        // Boundary counting is Gemma4-specific; AR arches leave it zero in v1.
+        boundary_counts = {};
+    }
+
     ParsedAssistantOutput parsed = parse_assistant_output(app.tokenizer.decode_raw(generated));
     std::string finish_reason = parsed.tool_calls.empty()
         ? finish_reason_for(generated.size(), chat.max_tokens)
         : "tool_calls";
     ResponseMetrics metrics = make_metrics((int)prompt_ids.size(), (int)generated.size(),
-                                           ttft_s, duration_s, app.model.stats());
-    Gemma4TokenBoundaryCounts boundary_counts = app.token_boundaries.count(generated);
+                                            ttft_s, duration_s, diff_stats);
     const std::string id = completion_id();
     const std::time_t created = std::time(nullptr);
     json response = chat_response(id, chat, created, parsed,
@@ -649,6 +768,10 @@ void handle_non_streaming(const ChatRequest& chat, const std::vector<int>& promp
 
 void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                       AppState& app, httplib::Response& res) {
+    // Diffusion-only streaming: the model emits committed canvas blocks via
+    // DiffStreamCallback; we re-decode the full emitted_ids buffer per commit
+    // and prefix-diff against the streamed content. AR streaming lives in
+    // handle_streaming_ar (per-token decode+accumulate, no full re-decode).
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
     res.set_chunked_content_provider(
@@ -720,7 +843,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
             };
 
             try {
-                std::vector<int> generated = app.model.generate(prompt_ids, chat.max_tokens,
+                std::vector<int> generated = app.diff_model->generate(prompt_ids, chat.max_tokens,
                                                                 chat.denoising_steps,
                                                                 chat.seed, false, on_step);
                 double duration_s = std::chrono::duration<double>(Clock::now() - start).count();
@@ -765,10 +888,10 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     ? "tool_calls"
                     : finish_reason_for(emitted_ids.size(), chat.max_tokens);
                 ResponseMetrics metrics = make_metrics((int)prompt_ids.size(),
-                                                       (int)emitted_ids.size(),
-                                                       ttft_s, duration_s,
-                                                       app.model.stats());
-                Gemma4TokenBoundaryCounts boundary_counts = app.token_boundaries.count(generated);
+                                                        (int)emitted_ids.size(),
+                                                        ttft_s, duration_s,
+                                                        app.diff_model->stats());
+                Gemma4TokenBoundaryCounts boundary_counts = app.token_boundaries->count(generated);
                 ParsedAssistantOutput final_parsed =
                     parse_assistant_output(app.tokenizer.decode_raw(generated));
                 json final_delta = json::object();
@@ -821,6 +944,216 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                         {"model", chat.model},
                         {"choices", json::array()},
                         {"usage", usage_json((int)prompt_ids.size(), (int)emitted_ids.size())},
+                        {"metrics", metrics_json(metrics)},
+                    };
+                    ok = write_sse(sink, usage_chunk);
+                }
+            } catch (const std::exception& e) {
+                log_line("error", "stream generation failed model=" + chat.model + ": " + e.what());
+                ok = write_sse(sink, error_body(e.what(), "server_error", "internal_error"),
+                               "error");
+            }
+            if (ok) ok = write_sse_done(sink);
+            if (ok) sink.done();
+            return ok;
+        });
+}
+
+// AR streaming: per-token decode + accumulate. O(N) total decode work across
+// the whole request (one piece lookup per token), vs the diffusion path's
+// O(N^2) full-buffer re-decode per commit. The parse_assistant_output scan
+// still runs on the full accumulated text per token (it must, to detect
+// multi-token <|tool_call>...<tool_call|> markers), but it's a linear
+// string::find, not a quadratic decode.
+//
+// Correctness invariant: decode_raw({t0,t1,...,tN}) == sum of decode_raw({ti})
+// because both Gemma ▁-replacement and byte-level BPE byte-mapping are
+// per-piece operations with no cross-piece context. So per-token accumulate
+// produces byte-identical content to the non-streaming AR path.
+void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
+                         AppState& app, httplib::Response& res) {
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("X-Accel-Buffering", "no");
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [&app, chat, prompt_ids = std::move(prompt_ids), id = completion_id()]
+        (size_t, httplib::DataSink& sink) mutable -> bool {
+            std::lock_guard<std::mutex> lock(app.generate_mu);
+            using Clock = std::chrono::steady_clock;
+            auto start = Clock::now();
+            bool saw_first_token = false;
+            double ttft_s = 0.0;
+            const std::time_t created = std::time(nullptr);
+            bool ok = write_sse(sink, chat_completion_chunk(
+                id, created, chat.model, {{"role", "assistant"}}));
+
+            // Accumulated decoded text so far (decode_raw semantics: special
+            // tokens kept, leading space kept). Grows by one piece per token.
+            std::string accumulated_text;
+            // Last parsed.content we emitted; used for prefix-diffing the next
+            // parsed.content to extract the delta.
+            std::string emitted_content;
+
+            auto channel_delta = [](const std::string& full, std::string& emitted) -> std::string {
+                std::string delta;
+                if (full.size() >= emitted.size() &&
+                    full.compare(0, emitted.size(), emitted) == 0) {
+                    delta = full.substr(emitted.size());
+                } else {
+                    delta = full;
+                }
+                emitted = full;
+                return delta;
+            };
+
+            try {
+                std::mt19937 rng(chat.seed);
+                const float temp  = chat.temperature >= 0 ? chat.temperature : app.ar_info.temperature;
+                const int   top_k = chat.top_k       >= 0 ? chat.top_k       : app.ar_info.top_k;
+                const float top_p = chat.top_p       >= 0 ? chat.top_p       : app.ar_info.top_p;
+
+                auto t_prefill0 = Clock::now();
+                ForwardInput fin{std::cref(prompt_ids), /*past_len=*/0,
+                                 /*images=*/nullptr, /*audio=*/nullptr,
+                                 /*mm_token_type_ids=*/nullptr};
+                std::vector<float> logits = app.ar_model->forward(fin);
+                double prefill_s = std::chrono::duration<double>(Clock::now() - t_prefill0).count();
+                int past = (int)prompt_ids.size();
+                auto t_gen0 = Clock::now();
+
+                std::vector<int> generated;
+                // has_tools: buffer the whole output, emit tool_calls once at
+                // the end (matches the diffusion has_tools contract — tool-call
+                // markers span multiple tokens and shouldn't be streamed as
+                // content). !has_tools: stream content deltas per token.
+                for (int step = 0; step < chat.max_tokens && ok; ++step) {
+                    for (int id : app.ar_info.suppress_tokens)
+                        if (id >= 0 && id < (int)logits.size())
+                            logits[id] = -std::numeric_limits<float>::infinity();
+                    int next = sample_token(logits.data(), (int)logits.size(),
+                                            temp, top_k, top_p, rng);
+                    if (app.ar_info.is_eos(next)) break;
+                    if (!saw_first_token) {
+                        ttft_s = std::chrono::duration<double>(Clock::now() - start).count();
+                        saw_first_token = true;
+                    }
+                    generated.push_back(next);
+
+                    if (!chat.has_tools) {
+                        // Per-token decode + accumulate. decode_raw on a single
+                        // token returns its piece (with special tokens kept,
+                        // leading space preserved). Append to the running
+                        // buffer, then re-run parse_assistant_output on the
+                        // whole accumulated text so the channel stripper and
+                        // tool-call parser see full context.
+                        std::vector<int> one{next};
+                        accumulated_text += app.tokenizer.decode_raw(one);
+                        ParsedAssistantOutput parsed =
+                            parse_assistant_output(accumulated_text);
+                        std::string content_delta =
+                            channel_delta(parsed.content, emitted_content);
+                        if (!content_delta.empty()) {
+                            ok = write_sse(sink, chat_completion_chunk(
+                                id, created, chat.model, {{"content", content_delta}}));
+                        }
+                    }
+
+                    std::vector<int> step_tok{next};
+                    logits = app.ar_model->forward(ForwardInput{std::cref(step_tok), past});
+                    ++past;
+                }
+
+                double duration_s = std::chrono::duration<double>(Clock::now() - start).count();
+                if (generated.size() > (size_t)chat.max_tokens)
+                    generated.resize((size_t)chat.max_tokens);
+                if (!saw_first_token && !generated.empty()) ttft_s = duration_s;
+                double gen_s = std::chrono::duration<double>(Clock::now() - t_gen0).count();
+                DiffPerfStats diff_stats{};
+                diff_stats.prefill_tokens = (int)prompt_ids.size();
+                diff_stats.prefill_s      = prefill_s;
+                diff_stats.decode_passes  = (int)generated.size();
+                diff_stats.decode_s       = gen_s;
+                diff_stats.output_tokens  = (int)generated.size();
+                Gemma4TokenBoundaryCounts boundary_counts{};
+
+                // Final parsed output for finish_reason + final chunk + debug log.
+                const std::string final_raw = chat.has_tools
+                    ? app.tokenizer.decode_raw(generated)
+                    : accumulated_text;
+                ParsedAssistantOutput final_parsed = parse_assistant_output(final_raw);
+
+                if (chat.has_tools && ok) {
+                    // Emit the buffered tool_calls (or content fallback) as one
+                    // delta now that the full output is in hand.
+                    json delta = json::object();
+                    if (!final_parsed.tool_calls.empty()) {
+                        delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls);
+                    } else if (!final_parsed.content.empty()) {
+                        delta["content"] = final_parsed.content;
+                    }
+                    if (!delta.empty()) {
+                        ok = write_sse(sink, chat_completion_chunk(
+                            id, created, chat.model, std::move(delta)));
+                    }
+                }
+
+                const std::string finish_reason = !final_parsed.tool_calls.empty()
+                    ? "tool_calls"
+                    : finish_reason_for((int)generated.size(), chat.max_tokens);
+                ResponseMetrics metrics = make_metrics((int)prompt_ids.size(),
+                                                        (int)generated.size(),
+                                                        ttft_s, duration_s,
+                                                        diff_stats);
+                json final_delta = json::object();
+                if (!final_parsed.tool_calls.empty()) {
+                    final_delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls);
+                } else if (!final_parsed.content.empty()) {
+                    final_delta["content"] = final_parsed.content;
+                }
+                debug_log(app, {
+                    {"ts", now_string()},
+                    {"type", "chat.completion.stream"},
+                    {"id", id},
+                    {"model", chat.model},
+                    {"stream", true},
+                    {"has_tools", chat.has_tools},
+                    {"prompt_tokens", (int)prompt_ids.size()},
+                    {"prompt_text", app.tokenizer.decode_raw(prompt_ids)},
+                    {"messages", chat.messages},
+                    {"tools", chat.tools},
+                    {"requested_max_tokens", chat.max_tokens},
+                    {"generated_tokens", (int)generated.size()},
+                    {"emitted_tokens", (int)generated.size()},
+                    {"reasoning_tokens", boundary_counts.reasoning_tokens},
+                    {"response_tokens", boundary_counts.response_tokens},
+                    {"finish_reason", finish_reason},
+                    {"raw_model_text", final_raw},
+                    {"public_content", final_parsed.content},
+                    {"emitted_content", emitted_content},
+                    {"tool_calls", tool_calls_json(final_parsed.tool_calls)},
+                    {"final_delta", final_delta},
+                    {"final_chunk", chat_completion_chunk(
+                        id, created, chat.model, json::object(), finish_reason,
+                        nullptr, metrics_json(metrics))},
+                });
+                log_line("info", "stream completion generated model=" + chat.model +
+                                 " output_tokens=" + std::to_string(generated.size()) +
+                                 " finish_reason=" + finish_reason +
+                                 " " + boundary_counts_log(boundary_counts) +
+                                 " " + metrics_log(metrics));
+                if (ok) {
+                    ok = write_sse(sink, chat_completion_chunk(
+                        id, created, chat.model, json::object(), finish_reason,
+                        nullptr, metrics_json(metrics)));
+                }
+                if (ok && chat.include_usage) {
+                    json usage_chunk = {
+                        {"id", id},
+                        {"object", "chat.completion.chunk"},
+                        {"created", created},
+                        {"model", chat.model},
+                        {"choices", json::array()},
+                        {"usage", usage_json((int)prompt_ids.size(), (int)generated.size())},
                         {"metrics", metrics_json(metrics)},
                     };
                     ok = write_sse(sink, usage_chunk);
@@ -964,7 +1297,9 @@ int main(int argc, char** argv) {
                 ChatRequest chat = parse_chat_request(req, app);
                 std::vector<int> prompt_ids = app.tokenizer.build_prompt_json(
                     chat.messages, chat.tools, app.opts.chat_template_kwargs);
-                if ((int)prompt_ids.size() + chat.max_tokens > app.model.kv_cache_max_seq()) {
+                const int kv_max = app.is_diffusion ? app.diff_model->kv_cache_max_seq()
+                                                    : app.ar_info.max_seq_len;
+                if ((int)prompt_ids.size() + chat.max_tokens > kv_max) {
                     bad_request("prompt_tokens + max_tokens exceeds server max_seq");
                 }
                 log_line("info", request_label(req) + " model=" + chat.model +
@@ -973,7 +1308,10 @@ int main(int argc, char** argv) {
                                  " prompt_tokens=" + std::to_string(prompt_ids.size()) +
                                  " max_tokens=" + std::to_string(chat.max_tokens));
                 if (chat.stream) {
-                    handle_streaming(chat, std::move(prompt_ids), app, res);
+                    if (app.is_diffusion)
+                        handle_streaming(chat, std::move(prompt_ids), app, res);
+                    else
+                        handle_streaming_ar(chat, std::move(prompt_ids), app, res);
                     log_line("info", request_label(req) + " -> HTTP 200 stream");
                 } else {
                     handle_non_streaming(chat, prompt_ids, app, res);
