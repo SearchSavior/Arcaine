@@ -16,21 +16,26 @@
 // onednn-loop. DIFF_NVFP4_WEIGHT_LAYOUT must stay unset (Raw) so random weights
 // are not oneDNN-reordered.
 //
+// Registered as `nvfp4-roofline` in the unified kernel_bench binary.
+//
 // Build:
 //   cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx \
 //         -DARCAINE_SYCL_TARGETS=intel_gpu_bmg_g31
-//   cmake --build build --target nvfp4_roofline_bench
+//   cmake --build build --target kernel_bench
 //
 // Reference roofline (default), both shapes, standard sweep:
-//   ZE_AFFINITY_MASK=0 ./build/nvfp4_roofline_bench -p 512,1024,2048,8192
+//   ZE_AFFINITY_MASK=0 ./build/kernel_bench nvfp4-roofline -p 512,1024,2048,8192
 //
 // A/B the hand-rolled kernels against the reference:
-//   ZE_AFFINITY_MASK=0 ./build/nvfp4_roofline_bench \
+//   ZE_AFFINITY_MASK=0 ./build/kernel_bench nvfp4-roofline \
 //       --kernels onednn-loop,xe2,custom -p 512,1024,2048,8192
 //
 // Correctness wiring check (loose; random weights — catches pointer/stride bugs):
-//   ZE_AFFINITY_MASK=0 ./build/nvfp4_roofline_bench \
+//   ZE_AFFINITY_MASK=0 ./build/kernel_bench nvfp4-roofline \
 //       --kernels onednn-loop,xe2,custom --check -p 512 --experts 4 --shapes gateup
+
+#include "common/bench/registry.hpp"
+#include "common/bench/util.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -49,6 +54,9 @@
 #include "common/gpu/device_select.hpp"
 #include "common/gpu/engine.hpp"
 #include "common/gpu/nvfp4.hpp"
+
+using arcaine::bench::parse_int_csv;
+using arcaine::bench::split_csv;
 
 namespace {
 
@@ -78,19 +86,6 @@ const char* kernel_name(Kernel k) {
 
 struct Shape { std::string name; int K, N; };
 
-std::vector<std::string> split_csv(const std::string& s) {
-    std::vector<std::string> out; size_t i = 0;
-    while (i <= s.size()) {
-        size_t j = s.find(',', i);
-        if (j == std::string::npos) j = s.size();
-        if (j > i) out.push_back(s.substr(i, j - i));
-        i = j + 1;
-    }
-    return out;
-}
-std::vector<int> parse_int_csv(const std::string& s) {
-    std::vector<int> out; for (const auto& t : split_csv(s)) out.push_back(std::stoi(t)); return out;
-}
 std::vector<Shape> parse_shapes(const std::string& s) {
     std::vector<Shape> out;
     for (const auto& tok : split_csv(s)) {
@@ -130,9 +125,7 @@ struct Row {
     double ms, tflops, gbps, pct_tf, pct_bw;
 };
 
-}  // namespace
-
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     std::string p_csv = "512,1024,2048,8192";
     std::string kernels_csv;
     std::string shapes_csv = "gateup,down";
@@ -477,3 +470,10 @@ int main(int argc, char** argv) {
     }  // shape
     return 0;
 }
+
+}  // namespace
+
+REGISTER_BENCH("nvfp4-roofline",
+    "NVFP4 expert-kernel roofline (random weights; onednn-loop/batched/dense/xe2/custom)",
+    run)
+

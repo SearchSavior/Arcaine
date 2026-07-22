@@ -17,7 +17,7 @@ endif()
 # which is on CMAKE_PREFIX_PATH (set via ENV in the Dockerfile), so this
 # find_package picks up its DNNLConfig.cmake automatically.
 find_package(dnnl CONFIG REQUIRED)
-include_directories(third_party third_party/minja/include)
+include_directories(src third_party third_party/minja/include)
 
 # The dev image also ships older oneDNN builds through oneAPI/OpenVINO. Keep the
 # source-built oneDNN selected by find_package() ahead of LD_LIBRARY_PATH entries
@@ -126,13 +126,13 @@ target_link_libraries(test_chat_template_kwargs  PRIVATE DNNL::dnnl)
 # ---------------------------------------------------------------------------
 # Inference benchmark. Goes through the model registry, so it links the same
 # architecture + common sources as the main binary.
-add_executable(bench src/bench.cpp ${COMMON_SRCS} ${ARCH_SRCS})
-target_compile_options(bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(bench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+add_executable(arcaine_mbench src/arcaine_mbench.cpp ${COMMON_SRCS} ${ARCH_SRCS})
+target_compile_options(arcaine_mbench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(arcaine_mbench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # See gemma4: ARCH_SRCS / COMMON_SRCS include nvfp4.hpp-bearing loader TUs.
-target_link_options(bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(bench PRIVATE DNNL::dnnl soxr onnxruntime)
-set_target_properties(bench PROPERTIES
+target_link_options(arcaine_mbench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(arcaine_mbench PRIVATE DNNL::dnnl soxr onnxruntime)
+set_target_properties(arcaine_mbench PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
     INSTALL_RPATH "${ORT_DIR}/lib")
 
@@ -196,253 +196,31 @@ set_target_properties(arcaine_server PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
     INSTALL_RPATH "${ORT_DIR}/lib")
 
-# Focused INT4-AWQ decode-fusion benchmark.  Uses DiffusionGemma's fixed
-# canvas=256 / hidden=2816 / top-k=8 shapes and compares the actual adjacent
-# kernel sequences; it intentionally does not load a model or run inference.
-add_executable(diffusion_int4_fusion_bench src/diffusion_int4_fusion_bench.cpp)
-target_compile_options(diffusion_int4_fusion_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_int4_fusion_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_libraries(diffusion_int4_fusion_bench PRIVATE DNNL::dnnl)
-
-
 # ---------------------------------------------------------------------------
-# Phase 5 — Qwen3.5-MoE NVFP4 loader smoke test. Loads real checkpoint weights
-# (no kernels) and verifies tensor-name resolution, scale transpose
-# [N,K/16]->[K/16,N], dst_scale folding, and per-layer struct population.
-# Usage: qwen_load_smoke [model_dir] [max_layers]
-# NOTE: the loader harness only needs loader.cpp + quant_loader.cpp; it does
-# not construct QwenModel or register the arch, so model.cpp/register.cpp are
-# deliberately excluded (they would otherwise pull build_chat_prompt/register_arch
-# into the link line).
-add_executable(qwen_load_smoke
-    src/qwen_load_smoke.cpp
-    src/common/io/quant_loader.cpp
-    src/modeling/qwen3_5_moe/loader.cpp)
-target_compile_options(qwen_load_smoke PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_load_smoke PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-# nvfp4.hpp (included transitively) pulls __spirv_SubgroupMatrixMultiplyAccumulateINTEL;
-# the translator needs the extension even though this binary runs no DPAS kernel.
-target_link_options(qwen_load_smoke PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen_load_smoke PRIVATE DNNL::dnnl)
-
-# Architecture-shaped Qwen3.5 dense MLP kernel benchmark. This loads one real
-# NVFP4 layer and benchmarks only gate/up -> SwiGLU -> down, never inference.
-# ARCAINE_QWEN35_NVFP4_DPAS=0/1 selects the oneDNN baseline or Xe2 DPAS path.
-add_executable(qwen35_nvfp4_mlp_bench
-    src/qwen35_nvfp4_mlp_bench.cpp
+# Unified kernel benchmark binary. Each kernel bench registers itself via
+# REGISTER_BENCH() in its TU; a new kernel bench is added by dropping a new
+# .cpp into src/bench/ and appending it to KBENCH_SRCS — no main dispatch
+# table to edit. Each bench keeps its own env-var AB gating.
+# Run:
+#   ./build/arcaine_kbench --list
+#   ./build/arcaine_kbench <name> [opts]
+set(KBENCH_SRCS
+    src/arcaine_kbench.cpp
+    src/bench/qwen35_nvfp4_mlp_bench.cpp
+    src/bench/qwen35_attention_bench.cpp
+    src/bench/qwen35_deltanet_bench.cpp
+    src/bench/qwen35_delta_decode_fusion_bench.cpp
+    src/bench/nvfp4_roofline_bench.cpp
+    src/bench/diffusion_int4_fusion_bench.cpp
+    # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
     src/common/gpu/nvfp4_session.cpp)
-target_compile_options(qwen35_nvfp4_mlp_bench PRIVATE
+add_executable(arcaine_kbench ${KBENCH_SRCS})
+target_compile_options(arcaine_kbench PRIVATE
     -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen35_nvfp4_mlp_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen35_nvfp4_mlp_bench PRIVATE
+target_link_options(arcaine_kbench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(arcaine_kbench PRIVATE
     -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen35_nvfp4_mlp_bench PRIVATE DNNL::dnnl)
+target_link_libraries(arcaine_kbench PRIVATE DNNL::dnnl)
 
-# Architecture-shaped Qwen3.5 full-attention benchmark. Compares the scalar
-# online-softmax baseline with subgroup and XMX/DPAS paths at 24Q/4KV/D256.
-add_executable(qwen35_attention_bench src/qwen35_attention_bench.cpp)
-target_compile_options(qwen35_attention_bench PRIVATE
-    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen35_attention_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen35_attention_bench PRIVATE
-    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen35_attention_bench PRIVATE DNNL::dnnl)
 
-# Architecture-shaped Qwen3.5 Gated DeltaNet recurrent-core benchmark. It
-# compares the scalar/SIMT and ESIMD paths at the checkpoint's 48x128x128
-# shape, including sequential decode, without running end-to-end inference.
-add_executable(qwen35_deltanet_bench src/qwen35_deltanet_bench.cpp)
-target_compile_options(qwen35_deltanet_bench PRIVATE
-    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen35_deltanet_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen35_deltanet_bench PRIVATE
-    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen35_deltanet_bench PRIVATE DNNL::dnnl)
-
-# Architecture-shaped M=1 DeltaNet decode-fusion benchmark. It compares the
-# exact unfused conv/norm/gate/recurrent sequence with the fused ESIMD kernel.
-add_executable(qwen35_delta_decode_fusion_bench
-    src/qwen35_delta_decode_fusion_bench.cpp)
-target_compile_options(qwen35_delta_decode_fusion_bench PRIVATE
-    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen35_delta_decode_fusion_bench PRIVATE
-    -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen35_delta_decode_fusion_bench PRIVATE
-    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen35_delta_decode_fusion_bench PRIVATE DNNL::dnnl)
-
-# qwen_kernels_selfcheck: build-verify + GPU smoke for qwen3_5_moe/kernels.hpp.
-# An unused inline SYCL lambda is not device-codegen'd, so calling each kernel
-# once (this TU) is what forces SPIR-V codegen and validates the device bodies.
-# Compile in arcaine-dev-1 (SPIR-V codegen needs no physical GPU); run in
-# arcaine-dev-run-* to exercise on the BMG G31. Numerical validation vs the HF
-# reference is Phase 6; this is the milestone-2 build/run smoke.
-add_executable(qwen_kernels_selfcheck src/qwen_kernels_selfcheck.cpp)
-target_compile_options(qwen_kernels_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_kernels_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_kernels_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen_kernels_selfcheck PRIVATE DNNL::dnnl)
-
-# diffusion_attn_selfcheck: numerical self-check for the DiffusionGemma attention
-# leaf kernels (fused RMSNorm+RoPE pow/table/fused, masked softmax span/branchy)
-# in attention_kernels.hpp. Header-only deps (engine/buffer/arena); links only
-# oneDNN. Build in arcaine-dev-1 (SPIR-V codegen needs no GPU); run in
-# arcaine-dev-run-* to exercise on the BMG G31.
-add_executable(diffusion_attn_selfcheck src/diffusion_attn_selfcheck.cpp)
-target_compile_options(diffusion_attn_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_attn_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_libraries(diffusion_attn_selfcheck PRIVATE DNNL::dnnl)
-
-# qwen_attn_selfcheck: milestone-3 build/run smoke for the Qwen full-attention
-# forward (modeling/qwen3_5_moe/attention.hpp). Loads one full-attn layer's real
-# NVFP4 + BF16(+1) weights straight from the checkpoint (no MoE / no QwenWeights)
-# and runs qwen_full_attention_forward on a synthetic hidden, checking finiteness,
-# determinism, and zero-input->zero-output; exercises both prefill and decode
-# paths. Build in arcaine-dev-1 (SPIR-V codegen needs no GPU); run in
-# arcaine-dev-run-* with ARCAINE_QWEN_MODEL_DIR=<qwen checkpoint dir> (and
-# optional ARCAINE_QWEN_ATTN_LAYER=<full-attn idx, default 3>). Numerical
-# validation vs HF is Phase 6 (deferred).
-add_executable(qwen_attn_selfcheck
-    src/qwen_attn_selfcheck.cpp
-    src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp)
-target_compile_options(qwen_attn_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_attn_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_attn_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen_attn_selfcheck PRIVATE DNNL::dnnl)
-
-# qwen_moe_selfcheck: milestone-4 build/run smoke for the Qwen MoE block forward
-# (modeling/qwen3_5_moe/moe.hpp). Loads one layer's full MoE block (router BF16,
-# 256 routed NVFP4 experts, shared NVFP4 expert, shared_expert_gate BF16) from the
-# checkpoint and runs qwen_moe_forward on a synthetic hidden, checking finiteness,
-# determinism, nonzeroness, and zero-input->zero-output; exercises prefill + decode.
-# Build in arcaine-dev-1; run in arcaine-dev-run-* with
-# ARCAINE_QWEN_MODEL_DIR=<qwen checkpoint dir> (optional ARCAINE_QWEN_MOE_LAYER=<idx>).
-add_executable(qwen_moe_selfcheck
-    src/qwen_moe_selfcheck.cpp
-    src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp)
-target_compile_options(qwen_moe_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_moe_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_moe_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen_moe_selfcheck PRIVATE DNNL::dnnl)
-
-# qwen_deltanet_selfcheck: milestone-5 build/run smoke for the Qwen Gated DeltaNet
-# (modeling/qwen3_5_moe/gated_deltanet.hpp). Loads one linear-attn layer's real
-# BF16 (in_proj_qkv/z/a/b, conv1d, A_log, dt_bias, norm) + NVFP4 (out_proj)
-# weights from the checkpoint and runs qwen_linear_attn_forward on a synthetic
-# hidden, checking prefill finite/deterministic/nonzero/zero-in->zero-out, decode
-# finite/deterministic, AND prefill(N)[last] == prefill(N-1)+decode equivalence
-# (cross-validates host chunked vs device recurrent core). Build in arcaine-dev-1;
-# run in arcaine-dev-run-* with ARCAINE_QWEN_MODEL_DIR=<qwen checkpoint dir>
-# (optional ARCAINE_QWEN_DELTANET_LAYER=<linear-attn idx, default 0>).
-add_executable(qwen_deltanet_selfcheck
-    src/qwen_deltanet_selfcheck.cpp
-    src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp)
-target_compile_options(qwen_deltanet_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_deltanet_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_deltanet_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen_deltanet_selfcheck PRIVATE DNNL::dnnl)
-
-# qwen_forward_selfcheck: milestone-6 end-to-end forward-loop smoke. Constructs a
-# layer-capped QwenModel (ARCAINE_QWEN_MAX_LAYERS, default 4 here) and drives
-# forward_tokens directly with synthetic token ids (bypassing the BPE tokenizer,
-# which still has the null-bos_token bug). Checks logits size/finite/nonzero/
-# not-degenerate/deterministic, decode finite, and reset_cache reproducibility.
-# Links the full COMMON+ARCH sources (same as gemma4 minus main.cpp) so all
-# transitive deps (chat_template/tokenizer/image_proc/audio_proc + registrars)
-# resolve; needs the spirv-ext option (nvfp4.hpp) and onnxruntime/soxr (audio deps).
-add_executable(qwen_forward_selfcheck src/qwen_forward_selfcheck.cpp ${COMMON_SRCS} ${ARCH_SRCS})
-target_compile_options(qwen_forward_selfcheck PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_forward_selfcheck PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(qwen_forward_selfcheck PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(qwen_forward_selfcheck PRIVATE DNNL::dnnl soxr onnxruntime)
-set_target_properties(qwen_forward_selfcheck PROPERTIES
-    BUILD_RPATH "${ORT_DIR}/lib"
-    INSTALL_RPATH "${ORT_DIR}/lib")
-
-# ---------------------------------------------------------------------------
-add_executable(nvfp4_roofline_bench src/nvfp4_roofline_bench.cpp)
-target_compile_options(nvfp4_roofline_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_roofline_bench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_roofline_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(nvfp4_roofline_bench PRIVATE DNNL::dnnl)
-
-# ---------------------------------------------------------------------------
-# Phase 0, Probe 1 — oneDNN batched f4_e2m1 matmul feasibility (host-side).
-# SYCL + oneDNN only; needs the engine singleton.
-add_executable(nvfp4_batched_probe src/nvfp4_batched_probe.cpp)
-target_compile_options(nvfp4_batched_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_batched_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_libraries(nvfp4_batched_probe PRIVATE DNNL::dnnl)
-
-# ---------------------------------------------------------------------------
-# Phase 1 numerical-correctness probe for matmul_nvfp4_packed_batched.
-# Hand-verifiable deterministic case (all-1.0 A, K-contiguous 2.0/even-k W).
-# Includes nvfp4.hpp (DPAS intrinsics) => needs the spirv-ext link option.
-add_executable(nvfp4_batched_check src/nvfp4_batched_check.cpp)
-target_compile_options(nvfp4_batched_check PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_batched_check PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_batched_check PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(nvfp4_batched_check PRIVATE DNNL::dnnl)
-
-# ---------------------------------------------------------------------------
-# Phase 0 (graph-capture) probe — is dnnl::matmul::execute() capture-safe
-# inside a SYCL command_graph recording? Tests matmul_nvfp4_packed and
-# matmul_nvfp4_packed_batched: direct vs captured-graph vs replay, bit-exact.
-# Includes nvfp4.hpp (DPAS intrinsics) => needs the spirv-ext link option.
-# Run: ZE_AFFINITY_MASK=0 ./build/nvfp4_graph_capture_probe [GC_M/K/N/B env]
-add_executable(nvfp4_graph_capture_probe src/nvfp4_graph_capture_probe.cpp src/common/gpu/nvfp4_session.cpp)
-target_compile_options(nvfp4_graph_capture_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_graph_capture_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_graph_capture_probe PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(nvfp4_graph_capture_probe PRIVATE DNNL::dnnl)
-
-# ---------------------------------------------------------------------------
-# xe2 DPAS capture probe — is the __spirv_SubgroupMatrixMultiplyAccumulateINTEL
-# grouped-rows kernel (matmul_nvfp4_grouped_rows_xe2) capture-safe inside a SYCL
-# command_graph on BMG G31? Tests direct vs captured-graph vs replay + the
-# decisive replay3 input-mutation re-execution test. Scalar sibling run as a
-# control. Includes nvfp4.hpp (DPAS intrinsics) => needs the spirv-ext link opt.
-# Run: ZE_AFFINITY_MASK=0 ./build/nvfp4_xe2_capture_probe [XE2_M/K/N/E env]
-add_executable(nvfp4_xe2_capture_probe src/nvfp4_xe2_capture_probe.cpp src/common/gpu/nvfp4_session.cpp)
-target_compile_options(nvfp4_xe2_capture_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_xe2_capture_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_xe2_capture_probe PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(nvfp4_xe2_capture_probe PRIVATE DNNL::dnnl)
-
-# ---------------------------------------------------------------------------
-# Phase 0, Probe 2 — hand-rolled Intel block-2D-load primitive (device-side).
-# Uses __builtin_IB_subgroup_createBlock2DAddressPayload + lsc_load_block2d.ugm
-# inline-asm. The spirv-ext link option is required for the Xe subgroup builtins,
-# matching nvfp4_roofline_bench / diffusion_bench above.
-add_executable(nvfp4_blockload_probe src/nvfp4_blockload_probe.cpp)
-target_compile_options(nvfp4_blockload_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_blockload_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_blockload_probe PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(nvfp4_blockload_probe PRIVATE DNNL::dnnl)
-
-# Phase-2 probe: esimd::dpas operand/layout determination for the full-ESIMD
-# xe2v3 kernel (lsc_load_2d + esimd::dpas). Mirrors the blockload probe.
-add_executable(nvfp4_dpas_probe src/nvfp4_dpas_probe.cpp)
-target_compile_options(nvfp4_dpas_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_dpas_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_libraries(nvfp4_dpas_probe PRIVATE DNNL::dnnl)
-
-# Phase-2 probe: determine esimd::dpas operand-distribution semantics across the
-# 16-lane subgroup (per-lane independent vs. N-distributed) by giving lanes
-# DIFFERENT A/B. Decides the lane->work mapping for the full-ESIMD xe2v3 kernel.
-add_executable(nvfp4_dpas_dist_probe src/nvfp4_dpas_dist_probe.cpp)
-target_compile_options(nvfp4_dpas_dist_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_dpas_dist_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_libraries(nvfp4_dpas_dist_probe PRIVATE DNNL::dnnl)
-
-# Phase-2 probe: validate vectorized (ESIMD simd) arithmetic e2m1/e4m3 dequant vs
-# the scalar LUT/fast paths. Uses only esimd::simd ops (convert/merge/operators),
-# no SPIRV intrinsic.
-add_executable(nvfp4_vec_dequant_probe src/nvfp4_vec_dequant_probe.cpp)
-target_compile_options(nvfp4_vec_dequant_probe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(nvfp4_vec_dequant_probe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_libraries(nvfp4_vec_dequant_probe PRIVATE DNNL::dnnl)

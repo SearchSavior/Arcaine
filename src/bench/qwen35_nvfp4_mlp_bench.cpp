@@ -1,3 +1,14 @@
+// Qwen3.5 dense MLP kernel benchmark. Loads one real NVFP4 layer and benchmarks
+// only gate/up -> SwiGLU -> down, never inference. ARCAINE_QWEN35_NVFP4_DPAS=0/1
+// selects the oneDNN baseline or Xe2 DPAS path. Registered as `qwen35-nvfp4-mlp`
+// in the unified kernel_bench binary.
+//
+// Run:
+//   ./build/kernel_bench qwen35-nvfp4-mlp [opts]
+
+#include "common/bench/registry.hpp"
+#include "common/bench/util.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -14,25 +25,12 @@
 #include "common/io/quant_loader.hpp"
 #include "modeling/qwen3_5_moe/kernels.hpp"
 
+using arcaine::bench::aggregate;
+using arcaine::bench::parse_int_csv;
+using arcaine::bench::split_csv;
+using arcaine::bench::Stat;
+
 namespace {
-
-std::vector<std::string> split_csv(const std::string& value) {
-    std::vector<std::string> result;
-    size_t begin = 0;
-    while (begin <= value.size()) {
-        size_t end = value.find(',', begin);
-        if (end == std::string::npos) end = value.size();
-        if (end > begin) result.push_back(value.substr(begin, end - begin));
-        begin = end + 1;
-    }
-    return result;
-}
-
-std::vector<int> parse_int_csv(const std::string& value) {
-    std::vector<int> result;
-    for (const std::string& token : split_csv(value)) result.push_back(std::stoi(token));
-    return result;
-}
 
 enum class Kernel { Onednn, OnednnFusedPack, Xe2Dpas, EsimdDecode };
 
@@ -57,24 +55,6 @@ Kernel select_kernel(const std::string& kernel) {
     return selected;
 }
 
-struct Stat {
-    double mean = 0.0;
-    double sd = 0.0;
-};
-
-Stat aggregate(const std::vector<double>& values) {
-    Stat stat;
-    if (values.empty()) return stat;
-    for (double value : values) stat.mean += value;
-    stat.mean /= values.size();
-    if (values.size() > 1) {
-        for (double value : values)
-            stat.sd += (value - stat.mean) * (value - stat.mean);
-        stat.sd = std::sqrt(stat.sd / (values.size() - 1));
-    }
-    return stat;
-}
-
 void usage(const char* program) {
     std::fprintf(stderr,
         "Usage: %s --model <dir> [options]\n"
@@ -90,9 +70,7 @@ void usage(const char* program) {
         program);
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string model = "/workspace/models/unsloth_Qwen3.6-27B-NVFP4";
     std::string p_csv = "512";
@@ -301,3 +279,10 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
+}  // namespace
+
+REGISTER_BENCH("qwen35-nvfp4-mlp",
+    "Qwen3.5 dense MLP gate/up->SwiGLU->down (oneDNN / fused-pack / xe2-dpas / esimd-decode)",
+    run)
+

@@ -6,6 +6,14 @@
 //   2) expert weighted-combine -> dual postnorm at seq=256, H=2816, top-k=8.
 //
 // The fused paths are guarded by the same environment variables as inference.
+// Registered as `diffusion-int4-fusion` in the unified kernel_bench binary.
+//
+// Run (env-gated; see code):
+//   ./build/kernel_bench diffusion-int4-fusion [opts]
+
+#include "common/bench/registry.hpp"
+#include "common/bench/util.hpp"
+
 #include "common/gpu/buffer.hpp"
 #include "common/gpu/engine.hpp"
 #include "common/gpu/ops.hpp"
@@ -22,6 +30,8 @@
 #include <string>
 #include <vector>
 
+using arcaine::bench::elapsed_ms;
+
 namespace {
 
 constexpr int kSeq = 256;
@@ -34,17 +44,6 @@ constexpr float kEps = 1e-6f;
 bf16 pattern(size_t i, float scale, float bias = 0.0f) {
     int v = (int)((i * 17 + 13) % 101) - 50;
     return float_to_bf16(bias + scale * (float)v);
-}
-
-template <typename Fn>
-double elapsed_ms(sycl::queue& q, int iterations, const Fn& fn) {
-    q.wait();
-    auto start = std::chrono::steady_clock::now();
-    for (int i = 0; i < iterations; ++i) fn();
-    q.wait();
-    auto end = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::milli>(end - start).count() /
-           (double)iterations;
 }
 
 void baseline_expert_combine(sycl::queue& q,
@@ -284,9 +283,7 @@ void bench_selfcond_add_norm(GpuEngine& ctx, int iterations) {
         throw std::runtime_error("self-conditioning add+norm fusion is not bit-exact");
 }
 
-} // namespace
-
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     int iterations = 20;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -324,3 +321,10 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
+}  // namespace
+
+REGISTER_BENCH("diffusion-int4-fusion",
+    "DiffusionGemma INT4-AWQ dense gate/up + expert postnorm + selfcond add/norm",
+    run)
+

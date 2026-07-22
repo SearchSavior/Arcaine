@@ -1,3 +1,13 @@
+// Qwen3.5 M=1 DeltaNet decode-fusion benchmark. Compares the exact unfused
+// conv/norm/gate/recurrent sequence with the fused ESIMD kernel. Registered as
+// `qwen35-delta-decode-fusion` in the unified kernel_bench binary.
+//
+// Run:
+//   ./build/kernel_bench qwen35-delta-decode-fusion [opts]
+
+#include "common/bench/registry.hpp"
+#include "common/bench/util.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -12,27 +22,16 @@
 #include "common/kernels/elementwise.hpp"
 #include "modeling/qwen3_5/kernels.hpp"
 
+using arcaine::bench::aggregate;
+using arcaine::bench::Stat;
+
 namespace {
-struct Stat { double mean = 0.0, sd = 0.0; };
-Stat aggregate(const std::vector<double>& values) {
-    Stat result;
-    for (double value : values) result.mean += value;
-    result.mean /= values.size();
-    if (values.size() > 1) {
-        for (double value : values)
-            result.sd += (value - result.mean) * (value - result.mean);
-        result.sd = std::sqrt(result.sd / (values.size() - 1));
-    }
-    return result;
-}
 void usage(const char* program) {
     std::fprintf(stderr,
         "Usage: %s [--p 1] [--n N] [--w N] [--r N] [--device N]\n",
         program);
 }
-}  // namespace
-
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     int prompt = 1, tokens = 32, warmup = 1, runs = 5;
     std::string device;
     for (int i = 1; i < argc; ++i) {
@@ -184,3 +183,10 @@ int main(int argc, char** argv) {
     measure("fused-esimd", fused);
     return 0;
 }
+
+}  // namespace
+
+REGISTER_BENCH("qwen35-delta-decode-fusion",
+    "Qwen3.5 M=1 DeltaNet decode-fusion (unfused vs fused ESIMD)",
+    run)
+

@@ -99,7 +99,7 @@ lengths, is:
 
 ```bash
 docker exec arcaine-dev-run-5283f9726339 bash -lc \
-  'cd /workspace && ./build/bench \
+  'cd /workspace && ./build/arcaine_mbench \
   --model /workspace/models/unsloth_Qwen3.6-27B-NVFP4 \
   --p 512,1024,2048,4096 --n 32 --w 1 --r 1 -d 0,512,1024'
 ```

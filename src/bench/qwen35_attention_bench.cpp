@@ -1,3 +1,13 @@
+// Qwen3.5 full-attention kernel benchmark. Compares the scalar online-softmax
+// baseline with subgroup and XMX/DPAS paths at 24Q/4KV/D256. Registered as
+// `qwen35-attention` in the unified kernel_bench binary.
+//
+// Run:
+//   ./build/kernel_bench qwen35-attention [opts]
+
+#include "common/bench/registry.hpp"
+#include "common/bench/util.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -13,39 +23,12 @@
 #include "common/gpu/engine.hpp"
 #include "modeling/qwen3_5/kernels.hpp"
 
+using arcaine::bench::aggregate;
+using arcaine::bench::parse_int_csv;
+using arcaine::bench::split_csv;
+using arcaine::bench::Stat;
+
 namespace {
-
-std::vector<std::string> split_csv(const std::string& value) {
-    std::vector<std::string> result;
-    size_t begin = 0;
-    while (begin <= value.size()) {
-        size_t end = value.find(',', begin);
-        if (end == std::string::npos) end = value.size();
-        if (end > begin) result.push_back(value.substr(begin, end - begin));
-        begin = end + 1;
-    }
-    return result;
-}
-
-std::vector<int> parse_int_csv(const std::string& value) {
-    std::vector<int> result;
-    for (const auto& token : split_csv(value)) result.push_back(std::stoi(token));
-    return result;
-}
-
-struct Stat { double mean = 0.0, sd = 0.0; };
-
-Stat aggregate(const std::vector<double>& values) {
-    Stat stat;
-    for (double value : values) stat.mean += value;
-    stat.mean /= values.size();
-    if (values.size() > 1) {
-        for (double value : values)
-            stat.sd += (value - stat.mean) * (value - stat.mean);
-        stat.sd = std::sqrt(stat.sd / (values.size() - 1));
-    }
-    return stat;
-}
 
 void usage(const char* program) {
     std::fprintf(stderr,
@@ -59,9 +42,7 @@ void usage(const char* program) {
         program);
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     std::string p_csv = "128,512";
     std::string d_csv = "0,512,1024";
     std::string kernels_csv = "baseline,xmx";
@@ -182,3 +163,9 @@ int main(int argc, char** argv) {
     for (int depth : depths) benchmark_cell("decode", 1, depth);
     return 0;
 }
+
+}  // namespace
+
+REGISTER_BENCH("qwen35-attention",
+    "Qwen3.5 full-attention baseline/subgroup/xmx at 24Q/4KV/D256", run)
+
