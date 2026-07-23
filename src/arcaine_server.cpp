@@ -629,6 +629,8 @@ json chat_response(const std::string& id, const ChatRequest& chat,
     };
     if (!parsed.tool_calls.empty())
         message["tool_calls"] = tool_calls_json(parsed.tool_calls);
+    if (!parsed.reasoning.empty())
+        message["reasoning_content"] = parsed.reasoning;
 
     return {
         {"id", id},
@@ -755,6 +757,7 @@ void handle_non_streaming(const ChatRequest& chat, const std::vector<int>& promp
         {"finish_reason", finish_reason},
         {"raw_model_text", app.tokenizer.decode_raw(generated)},
         {"public_content", parsed.content},
+        {"reasoning", parsed.reasoning},
         {"tool_calls", tool_calls_json(parsed.tool_calls)},
         {"response", response},
     });
@@ -789,6 +792,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
 
             std::vector<int> emitted_ids;
             std::string emitted_content;
+            std::string emitted_reasoning;
 
             // Prefix-diff freshly parsed content against what we already
             // streamed; on a non-prefix change re-emit the whole string,
@@ -840,6 +844,12 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     ok = write_sse(sink, chat_completion_chunk(
                         id, created, chat.model, {{"content", content_delta}}));
                 }
+                std::string reasoning_delta =
+                    channel_delta(parsed.reasoning, emitted_reasoning);
+                if (!reasoning_delta.empty()) {
+                    ok = write_sse(sink, chat_completion_chunk(
+                        id, created, chat.model, {{"reasoning_content", reasoning_delta}}));
+                }
             };
 
             try {
@@ -855,12 +865,15 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     ParsedAssistantOutput parsed =
                         parse_assistant_output(app.tokenizer.decode_raw(generated));
                     emitted_ids = generated;
+                    emitted_reasoning = parsed.reasoning;
                     json delta = json::object();
                     if (!parsed.tool_calls.empty()) {
                         delta["tool_calls"] = tool_calls_json(parsed.tool_calls);
                     } else if (!parsed.content.empty()) {
                         delta["content"] = parsed.content;
                     }
+                    if (!parsed.reasoning.empty())
+                        delta["reasoning_content"] = parsed.reasoning;
                     if (!delta.empty()) {
                         ok = write_sse(sink, chat_completion_chunk(
                             id, created, chat.model, std::move(delta)));
@@ -871,9 +884,12 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     emitted_ids = generated;
                     ParsedAssistantOutput parsed =
                         parse_assistant_output(app.tokenizer.decode_raw(emitted_ids));
+                    emitted_reasoning = parsed.reasoning;
                     json delta = json::object();
                     if (!parsed.content.empty())
                         delta["content"] = parsed.content;
+                    if (!parsed.reasoning.empty())
+                        delta["reasoning_content"] = parsed.reasoning;
                     if (!delta.empty()) {
                         ok = write_sse(sink, chat_completion_chunk(
                             id, created, chat.model, std::move(delta)));
@@ -919,7 +935,9 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     {"finish_reason", finish_reason},
                     {"raw_model_text", app.tokenizer.decode_raw(generated)},
                     {"public_content", final_parsed.content},
+                    {"reasoning", final_parsed.reasoning},
                     {"emitted_content", emitted_content},
+                    {"emitted_reasoning", emitted_reasoning},
                     {"tool_calls", tool_calls_json(final_parsed.tool_calls)},
                     {"final_delta", final_delta},
                     {"final_chunk", chat_completion_chunk(
@@ -993,6 +1011,7 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
             // Last parsed.content we emitted; used for prefix-diffing the next
             // parsed.content to extract the delta.
             std::string emitted_content;
+            std::string emitted_reasoning;
 
             auto channel_delta = [](const std::string& full, std::string& emitted) -> std::string {
                 std::string delta;
@@ -1056,6 +1075,12 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                             ok = write_sse(sink, chat_completion_chunk(
                                 id, created, chat.model, {{"content", content_delta}}));
                         }
+                        std::string reasoning_delta =
+                            channel_delta(parsed.reasoning, emitted_reasoning);
+                        if (!reasoning_delta.empty()) {
+                            ok = write_sse(sink, chat_completion_chunk(
+                                id, created, chat.model, {{"reasoning_content", reasoning_delta}}));
+                        }
                     }
 
                     std::vector<int> step_tok{next};
@@ -1091,6 +1116,8 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                     } else if (!final_parsed.content.empty()) {
                         delta["content"] = final_parsed.content;
                     }
+                    if (!final_parsed.reasoning.empty())
+                        delta["reasoning_content"] = final_parsed.reasoning;
                     if (!delta.empty()) {
                         ok = write_sse(sink, chat_completion_chunk(
                             id, created, chat.model, std::move(delta)));
@@ -1129,7 +1156,9 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                     {"finish_reason", finish_reason},
                     {"raw_model_text", final_raw},
                     {"public_content", final_parsed.content},
+                    {"reasoning", final_parsed.reasoning},
                     {"emitted_content", emitted_content},
+                    {"emitted_reasoning", emitted_reasoning},
                     {"tool_calls", tool_calls_json(final_parsed.tool_calls)},
                     {"final_delta", final_delta},
                     {"final_chunk", chat_completion_chunk(

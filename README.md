@@ -82,9 +82,6 @@ cmake --build build -j"$(nproc)"
 Doing the build makes a few binaries which all accept `--help`.
 
 
-Host requirements: Linux, Intel GPU, `i915`/`xe` driver, `/dev/dri` present,
-user in `render` group.
-
 ## OpenAI-compatible API server
 
 `diffusion_server` loads one DiffusionGemma model and serves `GET /v1/models`
@@ -92,7 +89,7 @@ and `POST /v1/chat/completions`. Authentication is disabled by default; set
 `ARCAINE_API_KEY` to require `Authorization: Bearer <key>`.
 
 ```bash
-ARCAINE_API_KEY=local ./build/diffusion_server \
+ARCAINE_API_KEY=local ./build/arcaine_server \
   --model models/diffusiongemma-26B-A4B-it-AWQ-INT4 \
   --served-model-name diffusiongemma-26B-A4B-it-NVFP4 \
   --host 0.0.0.0 \

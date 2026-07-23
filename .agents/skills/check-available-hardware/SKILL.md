@@ -12,7 +12,7 @@ Check available resources available on the current host, and get a report on the
 ## How to use
 
 ```
-./get_device_props
+cd /workspace && ./.agents/skills/check-available-hardware/get_device_props
 ```
 
 ## Restrictions

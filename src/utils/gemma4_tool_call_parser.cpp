@@ -283,10 +283,18 @@ void erase_all(std::string& text, const std::string& needle) {
         text.erase(pos, needle.size());
 }
 
-void strip_gemma_channels(std::string& content) {
+void strip_gemma_channels(std::string& content, std::string& reasoning) {
     const std::string channel_start = "<|channel>";
     const std::string thought_start = "<|channel>thought\n";
     const std::string channel_end = "<channel|>";
+
+    auto append_reasoning = [&](const std::string& body) {
+        std::string piece = trim_copy(body);
+        if (!piece.empty()) {
+            if (!reasoning.empty()) reasoning.push_back('\n');
+            reasoning += piece;
+        }
+    };
 
     while (true) {
         size_t s = content.find(thought_start);
@@ -297,11 +305,14 @@ void strip_gemma_channels(std::string& content) {
         if (e == std::string::npos ||
             (next_channel != std::string::npos && next_channel < e)) {
             if (next_channel == std::string::npos) {
+                append_reasoning(content.substr(body));
                 content.erase(s);
                 break;
             }
+            append_reasoning(content.substr(body, next_channel - body));
             content.erase(s, next_channel - s);
         } else {
+            append_reasoning(content.substr(body, e - body));
             content.erase(s, e + channel_end.size() - s);
         }
     }
@@ -348,7 +359,7 @@ ParsedAssistantOutput parse_assistant_output(const std::string& raw_text) {
         search = s;
     }
 
-    strip_gemma_channels(content);
+    strip_gemma_channels(content, out.reasoning);
 
     erase_all(content, "<turn|>");
     erase_all(content, "<|tool_response>");
