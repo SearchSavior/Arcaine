@@ -47,6 +47,10 @@ struct DiffDenseMLP {
     DiffLinearWeight gate_proj;  // BF16 path: (2112, 2816)
     DiffLinearWeight up_proj;    // BF16 path: (2112, 2816)
     DiffLinearWeight down_proj;  // BF16 or NVFP4 equivalent
+    // AWQ checkpoint keeps the shared MLP in BF16/F16.  Optional gate+up row
+    // concatenation turns its two same-input GEMMs into one (2*intermediate,N)
+    // GEMM. Populated only under DIFF_INT4_FUSE_DENSE_GATE_UP.
+    GpuBuffer<bf16> gate_up_proj_bf16;
     Nvfp4Linear gate_up_proj_fp4; // NVFP4 fused gate/up: (2*2112, 2816)
 };
 
@@ -67,6 +71,47 @@ struct DiffExpertShard {
     std::vector<Q8Linear>    down_proj_q8;      // Q8_0: local experts, each (H, moe_intermediate)
     Q8BatchedLinear          gate_up_proj_q8_batch;
     Q8BatchedLinear          down_proj_q8_batch;
+
+    // Persistent device pointer tables for the NVFP4 gpu-layout expert path
+    // (run_shard_nvfp4_gpu_layout). The grouped-GEMM kernels take, per expert,
+    // device pointers to that expert's packed weights/scales/dst-scale + the
+    // per-expert input_global_scale. These are STABLE across denoising steps
+    // (expert weights never move), so they are uploaded ONCE (at load, outside
+    // any session) and reused every step -- the per-step host->device upload
+    // the path used to do (upload_alloc, with a q.memcpy().wait()) cannot be
+    // captured by a SYCL command_graph (the host source vector would dangle at
+    // replay time). Built by ensure_expert_pointer_tables_raw() for the default
+    // non-coalesced (raw weight_packed) case; the coalesced (xe2) case is built
+    // lazily and is not session-capture-safe without a warmup. See
+    // nvfp4_wholestep_capture_findings.md.
+    GpuBuffer<const uint8_t*> pt_gate_w;
+    GpuBuffer<const uint8_t*> pt_gate_s;
+    GpuBuffer<const float*>   pt_gate_dst;
+    GpuBuffer<float>          pt_gate_input;
+    GpuBuffer<const uint8_t*> pt_down_w;
+    GpuBuffer<const uint8_t*> pt_down_s;
+    GpuBuffer<const float*>   pt_down_dst;
+    GpuBuffer<float>          pt_down_input;
+    bool                      pt_raw_built = false;
+    // Coalesced (xe2 DPAS) variant: same scale/dst/input tables as pt_* above
+    // (those point to per-expert scale/dst/input which are layout-independent),
+    // but the weight pointers point to the coalesced weight buffers (created
+    // once by nvfp4_coalesced_weight, cached on each Nvfp4Linear). Built once
+    // at load so the xe2 path's per-step pointer-table upload is eliminated
+    // and the path is SYCL-graph-capturable. See pt_raw_built.
+    GpuBuffer<const uint8_t*> pt_gate_w_coal;
+    GpuBuffer<const uint8_t*> pt_down_w_coal;
+    bool                      pt_coal_built = false;
+
+    // Persistent raw pointer tables for the native grouped INT4-AWQ DPAS MoE
+    // path.  Int4Linear stores N-major packed s4 rows and [K/group,N] BF16
+    // scales; the grouped kernel follows these pointers directly, avoiding a
+    // per-denoising-step host upload of the local expert vector.
+    GpuBuffer<const uint8_t*> pt_int4_gate_w;
+    GpuBuffer<const bf16*>    pt_int4_gate_s;
+    GpuBuffer<const uint8_t*> pt_int4_down_w;
+    GpuBuffer<const bf16*>    pt_int4_down_s;
+    bool                      pt_int4_built = false;
 };
 
 // Sparse MoE (128 experts, top-8, per-expert intermediate 704). Router weights

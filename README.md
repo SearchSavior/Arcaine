@@ -36,9 +36,13 @@ These are cobbled together but define the codepath taken at inference time; Arca
 
 ## Supported Models
 
-- DiffusionGemma [BF16](https://huggingface.co/google/diffusiongemma-26B-A4B-it)/[NVFP4](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-NVFP4)/[W4A16](https://huggingface.co/pixelkaiser/diffusiongemma-26B-A4B-it-AWQ-MLP-W4A16-G64-S32-L1024)
+- DiffusionGemma [BF16](https://huggingface.co/google/diffusiongemma-26B-A4B-it)/[NVFP4](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-NVFP4)/[INT4-AWQ](https://huggingface.co/cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4)
 
 - Gemma4-12B [BF16](https://huggingface.co/google/gemma-4-12B-it)
+
+- Unsloth Qwen3.6-27B [NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4)
+
+- Qwen AgentWorld-35B-A3B [NVFP4](https://huggingface.co/Frosty40/Qwen-AgentWorld-35B-A3B-NVFP4)
 
 
 ## Container setup
@@ -47,7 +51,7 @@ These are cobbled together but define the codepath taken at inference time; Arca
 export RENDER_GID=$(getent group render | cut -d: -f3)
 docker compose build
 docker compose run --rm --service-ports \
-  -v /mnt/Ironwolf-4TB/Projects/arcana/models:/workspace/models \
+  -v /mnt/Ironwolf-4TB/Models/Arcaine/:/workspace/models \
   dev   # interactive shell in /workspace
 ```
 
@@ -89,7 +93,7 @@ and `POST /v1/chat/completions`. Authentication is disabled by default; set
 
 ```bash
 ARCAINE_API_KEY=local ./build/diffusion_server \
-  --model models/diffusiongemma-26B-A4B-it-NVFP4 \
+  --model models/diffusiongemma-26B-A4B-it-AWQ-INT4 \
   --served-model-name diffusiongemma-26B-A4B-it-NVFP4 \
   --host 0.0.0.0 \
   --port 7461

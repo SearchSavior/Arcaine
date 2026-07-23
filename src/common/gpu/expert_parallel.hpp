@@ -8,7 +8,7 @@
 // but the benchmark tool overrides it at runtime via set_nvfp4_kernel() so it
 // can sweep kernels in one process (no model reload). (A DPAS/XMX kernel was
 // also explored and removed; see docs/artifacts/.)
-enum class Nvfp4Kernel { Default, Hybrid, Custom };
+enum class Nvfp4Kernel { Default, Hybrid, Custom, GroupedDpas };
 void set_nvfp4_kernel(Nvfp4Kernel kernel);
 const char* nvfp4_kernel_name(Nvfp4Kernel kernel);
 
@@ -19,6 +19,20 @@ struct ExpertProfileLabels {
     const char* geglu_pack;
     const char* down_mm;
     const char* combine;
+};
+
+// Optional terminal fusion for the single-GPU INT4 expert path.  The expert
+// runner owns the expert-sorted output and route-slot map, so it is the only
+// layer that can fold weighted combine directly into DiffusionGemma's dual
+// postnorm without materializing a seq*hidden MoE tensor.
+struct ExpertPostnormFusion {
+    const bf16* mlp_out = nullptr;
+    const bf16* mlp_norm_weight = nullptr;
+    const bf16* moe_norm_weight = nullptr;
+    const bf16* combine_norm_weight = nullptr;
+    bf16* hidden = nullptr;
+    float layer_scalar = 1.0f;
+    float rms_eps = 1e-6f;
 };
 
 inline const ExpertProfileLabels& expert_profile_labels(bool is_encoder, bool is_full) {
@@ -69,6 +83,19 @@ void expert_parallel_forward(
     const std::vector<float>& weight,
     const ExpertProfileLabels& prof);
 
+// Returns true when the terminal combine+postnorm was executed.  It is
+// intentionally restricted to one local INT4 shard covering every expert;
+// multi-GPU/sharded execution retains the ordinary reduction path.
+bool expert_parallel_forward_int4_fused_postnorm(
+    GpuEngine& owner,
+    const DiffMoE& moe,
+    const bf16* expert_in,
+    int seq, int H, int E, int top_k, int moe_intermediate,
+    const int* idx_dev,
+    const float* weight_dev,
+    const ExpertPostnormFusion& fusion,
+    const ExpertProfileLabels& prof);
+
 void expert_parallel_forward(
     GpuEngine& owner,
     const DiffMoE& moe,
@@ -78,3 +105,27 @@ void expert_parallel_forward(
     const int* idx_dev,
     const float* weight_dev,
     const ExpertProfileLabels& prof);
+
+// Build (idempotent) the persistent raw-weight pointer tables for an NVFP4
+// expert shard -- the per-expert device pointers + input_global_scales the
+// grouped-GEMM kernels read. Call once at load (outside any session); the
+// tables are then reused every denoising step without a host->device upload.
+// No-op for non-NVFP4 shards. See DiffExpertShard::pt_*.
+void ensure_expert_pointer_tables_raw(DiffExpertShard& shard, GpuEngine& ctx);
+
+// Build the persistent COALESCED (xe2 DPAS) weight pointer tables for an NVFP4
+// shard, once at load. Pre-warms nvfp4_dequant_lut + nvfp4_coalesced_weight per
+// expert (which cache on first call and return stable USM ptrs thereafter), then
+// uploads the coalesced weight ptr table to pt_gate_w_coal/pt_down_w_coal. The
+// scale/dst/input tables (pt_gate_s etc.) are shared with the raw tables and are
+// NOT rebuilt. This eliminates the xe2 path's per-step pointer-table upload +
+// the lazy nvfp4_coalesced_weight ctx.queue.wait(), making the xe2 DPAS path
+// SYCL-graph-capturable. Requires the raw tables to be built first. No-op for
+// non-NVFP4 shards. See DiffExpertShard::pt_*_coal.
+void ensure_expert_pointer_tables_coalesced(DiffExpertShard& shard, GpuEngine& ctx,
+                                             int moe_intermediate, int hidden_size);
+
+// Build persistent raw packed-weight / BF16-scale tables for the INT4-AWQ
+// grouped DPAS MoE path.  The tables are load-time state so a decode step does
+// not need to upload a host vector of per-expert addresses.
+void ensure_int4_expert_pointer_tables(DiffExpertShard& shard, GpuEngine& ctx);

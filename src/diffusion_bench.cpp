@@ -43,8 +43,9 @@ namespace {
 Nvfp4Kernel parse_kernel(const std::string& s) {
     if (s == "default") return Nvfp4Kernel::Default;
     if (s == "hybrid")  return Nvfp4Kernel::Hybrid;
-    if (s == "custom")  return Nvfp4Kernel::Custom;
-    throw std::runtime_error("unknown kernel '" + s + "' (use: default, hybrid, custom)");
+    if (s == "custom") return Nvfp4Kernel::Custom;
+    if (s == "grouped-dpas" || s == "dpas" || s == "geglu-pack") return Nvfp4Kernel::GroupedDpas;
+    throw std::runtime_error("unknown kernel '" + s + "' (use: default, hybrid, custom, grouped-dpas)");
 }
 
 std::vector<std::string> split_csv(const std::string& s) {
@@ -167,13 +168,13 @@ void print_bench_result(TokenizerBridge& tokenizer,
 void usage(const char* p) {
     std::fprintf(stderr,
         "Usage: %s --model <dir> [options]\n"
-        "  -p <csv>          prompt token counts to sweep   (default: 512)\n"
-        "  -n <csv>          new-token counts to sweep       (default: 128)\n"
+        "  -p, --p <csv>     prompt token counts to sweep   (default: 512)\n"
+        "  -n, --n <csv>     new-token counts to sweep       (default: 128)\n"
         "                    NOTE: block diffusion generates whole 256-token canvases,\n"
         "                    so -n sets the block count ceil(n/256); n<=256 = 1 block.\n"
         "  -ds <N>           denoising steps                 (default: 48)\n"
-        "  -w <N>            warmup runs per cell            (default: 1)\n"
-        "  -r <N>            timed runs per cell             (default: 5)\n"
+        "  -w, --w <N>       warmup runs per cell            (default: 1)\n"
+        "  -r, --r <N>       timed runs per cell             (default: 5)\n"
         "  --kernels <csv>   expert kernels: default,hybrid,custom  (default: hybrid)\n"
         "  --layers <spec>   layer placement: auto, single, split:N, ranges:N,N,..., gpus:N\n"
         "  --experts <spec>  expert placement: auto, layer-owner, replicate, shard, ranges:N,N,..., gpus:N\n"
@@ -198,6 +199,11 @@ int main(int argc, char** argv) {
     bool print_result = false;
     bool device_index_set = false;
     DiffPlacementOptions placement;
+    bool force_full_canvas = [] {
+        const char* e = std::getenv("DIFF_BENCH_FORCE_FULL_CANVAS");
+        return e && std::strcmp(e, "0") && std::strcmp(e, "off") &&
+               std::strcmp(e, "false") && std::strcmp(e, "no");
+    }();
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -207,11 +213,11 @@ int main(int argc, char** argv) {
                 return argv[++i]; };
             if      (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
             else if (a == "--model")   model_dir = next();
-            else if (a == "-p")        p_csv = next();
-            else if (a == "-n")        n_csv = next();
+            else if (a == "-p" || a == "--p") p_csv = next();
+            else if (a == "-n" || a == "--n") n_csv = next();
             else if (a == "-ds")       ds = std::stoi(next());
-            else if (a == "-w")        warmup = std::stoi(next());
-            else if (a == "-r")        runs = std::stoi(next());
+            else if (a == "-w" || a == "--w") warmup = std::stoi(next());
+            else if (a == "-r" || a == "--r") runs = std::stoi(next());
             else if (a == "--kernels") kernels = next();
             else if (a == "--layers")  apply_layers_spec(next(), placement);
             else if (a == "--experts") apply_experts_spec(next(), placement);
@@ -245,6 +251,8 @@ int main(int argc, char** argv) {
         std::printf("[bench] matrix: kernels={%s} p={%s} n={%s} ds=%d | warmup=%d runs=%d | "
                     "cells=%zu\n", kernels.c_str(), p_csv.c_str(), n_csv.c_str(), ds,
                     warmup, runs, kernel_list.size() * p_list.size() * n_list.size());
+        std::printf("[bench] EOS commit trimming: %s\n",
+                    force_full_canvas ? "disabled (full canvas counted)" : "enabled");
 
         double kv_gb       = model.kv_cache_bytes() / (1024.0 * 1024.0 * 1024.0);
         double kv_mb_per_t = model.kv_cache_bytes_per_token() / (1024.0 * 1024.0);
@@ -272,11 +280,13 @@ int main(int argc, char** argv) {
                     // so the reported stddev is pure timing jitter (not content
                     // variation in EOS / output-token counts).
                     for (int w = 0; w < warmup; ++w)
-                        model.generate(prompt, n, ds, seed, false);
+                        model.generate(prompt, n, ds, seed, false, nullptr,
+                                       force_full_canvas);
 
                     std::vector<double> pre, dec, canvas, fwd; double tpf = 0, pass = 0;
                     for (int r = 0; r < runs; ++r) {
-                        std::vector<int> out = model.generate(prompt, n, ds, seed, false);
+                        std::vector<int> out = model.generate(
+                            prompt, n, ds, seed, false, nullptr, force_full_canvas);
                         const DiffPerfStats& s = model.stats();
                         double output_tps = output_tps_for(s);
                         double tok_per_fwd = tokens_per_forward_for(s);

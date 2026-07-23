@@ -4,7 +4,9 @@
 #include "loader.hpp"
 #include "self_conditioning.hpp"
 #include "fusions/logits.hpp"
+#include "fusions/int4_awq.hpp"
 #include "../../common/gpu/engine.hpp"
+#include "../../common/gpu/nvfp4.hpp"
 #include "../../common/kernels/embedding.hpp"
 #include <algorithm>
 #include <cmath>
@@ -86,9 +88,28 @@ static SoftNextCfg soft_next_cfg() {
     return cfg;
 }
 
+// Hot-path sampler-kernel AB knobs (default off -> original device kernels).
+bool diff_use_online_softmax() {
+    static bool v = std::getenv("DIFF_ONLINE_SOFTMAX") != nullptr; return v;
+}
+bool diff_use_gumbel_sample() {
+    static bool v = std::getenv("DIFF_GUMBEL_MAX") != nullptr; return v;
+}
+bool diff_use_stop_fix() {
+    static bool v = std::getenv("DIFF_STOP_FIX") != nullptr; return v;
+}
+
 DiffusionGemmaModel::DiffusionGemmaModel(const std::string& model_dir, int max_seq_len, DiffPlacementOptions placement, bool print_placement) {
     cfg_ = DiffConfig::from_dir(model_dir);
     int L = cfg_.text.num_hidden_layers;
+
+    if (cfg_.is_int4_quantized()) {
+        std::printf("[model] INT4-AWQ fusions: dense-gate-up=%s, "
+                    "expert-postnorm=%s, selfcond-add-norm=%s\n",
+                    diff_int4_fuse_dense_gate_up_enabled() ? "on" : "off",
+                    diff_int4_fuse_expert_postnorm_enabled() ? "on" : "off",
+                    diff_int4_fuse_selfcond_add_norm_enabled() ? "on" : "off");
+    }
 
     DiffPlacementOptions resolved_placement = resolve_diffusion_placement(cfg_, placement);
     split_layer_ = resolve_diffusion_split_layer(cfg_, resolved_placement);
@@ -193,7 +214,8 @@ void DiffusionGemmaModel::decode_forward(
     const int32_t* ids, const bf16* soft_or_null, int enc_len, int seq,
     float temp, const float* u_dev,
     int32_t* argmax_dev, float* entropy_dev, int32_t* denoiser_dev,
-    GpuBuffer<bf16>& soft_next, bool want_soft_next)
+    GpuBuffer<bf16>& soft_next, bool want_soft_next,
+    uint64_t rng_seed, uint32_t rng_block, uint32_t rng_step)
 {
     int H = cfg_.text.hidden_size;
     int L = cfg_.text.num_hidden_layers;
@@ -212,12 +234,32 @@ void DiffusionGemmaModel::decode_forward(
           embedding_lookup(q0, w_.embed_tokens.data(), ids, hidden.data(),
                            seq, H, embed_scale_);
       self_conditioning_forward(ctx0, w_.self_cond, hidden.data(), soft_or_null,
-                                seq, H, cfg_.text.intermediate_size, cfg_.text.rms_norm_eps); }
+                                seq, H, cfg_.text.intermediate_size,
+                                cfg_.text.rms_norm_eps, cfg_.is_int4_quantized()); }
 
     // Decoder layers (bidirectional, read-only encoder KV).
-    for (int l = 0; l < split_layer_; ++l)
-        diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
-                           seq, enc_len, cfg_.text, /*is_encoder=*/false);
+    //
+    // Whole-step SYCL graph capture: each decoder layer's attention→MoE kernel
+    // sequence is captured as one command_graph keyed by (layer, is_sliding), then
+    // replayed on every subsequent denoising step. The Nvfp4GraphSession
+    // registers itself in the global active-session map on begin(), so every
+    // downstream guard (session-conditional waits in profile/expert_parallel/
+    // matmul_nvfp4, and run_shard's forced gpu_layout dispatch) activates
+    // automatically via nvfp4_session_recording(q) — no pointer threading needed.
+    // Gate: DIFF_NVFP4_SYCL_GRAPH (unset = eager, no capture). AB knob for perf.
+    // Single-GPU scope: split_layer_==L so this loop runs every layer on ctx0;
+    // the multi-GPU ctx1 loop below is untouched (stays on existing per-kernel
+    // capture). Workspace address stability across steps is verified in Phase 4.
+    for (int l = 0; l < split_layer_; ++l) {
+        Nvfp4GraphSession session;
+        Nvfp4SyclGraphKey key = nvfp4_step_key(q0, l, /*is_sliding=*/!w_.layers[l].is_full,
+                                               /*denoise_step=*/0);
+        if (session.begin(q0, key)) {
+            diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
+                               seq, enc_len, cfg_.text, /*is_encoder=*/false);
+            session.end_and_replay();
+        }
+    }
 
     if (split_layer_ < L) {
         auto& ctx1 = GpuEngine::get(1);
@@ -251,10 +293,23 @@ void DiffusionGemmaModel::decode_forward(
     diffarena::Alloc<bf16> probs_bf16;
     if (need_probs) probs_bf16 = ar0.alloc<bf16>((size_t)seq * V);
     { DIFF_PROF(q0, "lm.softmax_sample");
-      fused_logits_head(q0, logits_bf16.data(),
-                        cfg_.text.final_logit_softcapping, 1.0f / temp,
-                        u_dev, need_probs ? probs_bf16.data() : nullptr,
-                        argmax_dev, entropy_dev, denoiser_dev, seq, V); }
+      bf16* probs = need_probs ? probs_bf16.data() : nullptr;
+      // AB knobs (default off -> 3-pass inverse-CDF kernel).
+      //   DIFF_GUMBEL_MAX    : online softmax + Gumbel-max sample (1-2 passes).
+      //   DIFF_ONLINE_SOFTMAX: online softmax Pass1+2 merge (2 passes, inverse-CDF sample).
+      if (diff_use_gumbel_sample())
+          fused_logits_head_gumbel(q0, logits_bf16.data(),
+                  cfg_.text.final_logit_softcapping, 1.0f / temp,
+                  rng_seed, rng_block, rng_step, probs,
+                  argmax_dev, entropy_dev, denoiser_dev, seq, V);
+      else if (diff_use_online_softmax())
+          fused_logits_head_online(q0, logits_bf16.data(),
+                  cfg_.text.final_logit_softcapping, 1.0f / temp, u_dev, probs,
+                  argmax_dev, entropy_dev, denoiser_dev, seq, V);
+      else
+          fused_logits_head(q0, logits_bf16.data(),
+                  cfg_.text.final_logit_softcapping, 1.0f / temp, u_dev, probs,
+                  argmax_dev, entropy_dev, denoiser_dev, seq, V); }
 
     // TopK soft_next reads the same logits for its selection — extract before
     // the logits buffer is released.
@@ -319,7 +374,8 @@ void DiffusionGemmaModel::decode_step(
     const std::vector<int>& canvas_ids, const bf16* soft_or_null, int enc_len,
     float temp, std::vector<int>& argmax, std::vector<float>& entropy,
     std::vector<int>& denoiser, GpuBuffer<bf16>& soft_next, std::mt19937& rng,
-    bool want_soft_next)
+    bool want_soft_next,
+    uint64_t rng_seed, uint32_t rng_block, uint32_t rng_step)
 {
     int seq = (int)canvas_ids.size();
     auto& q0 = GpuEngine::get(0).queue;
@@ -334,7 +390,7 @@ void DiffusionGemmaModel::decode_step(
 
     decode_forward(ids_dev.data(), soft_or_null, enc_len, seq, temp, u_dev.data(),
                    amax_dev.data(), ent_dev.data(), deno_dev.data(),
-                   soft_next, want_soft_next);
+                   soft_next, want_soft_next, rng_seed, rng_block, rng_step);
 
     argmax.resize(seq); entropy.resize(seq); denoiser.resize(seq);
     { DIFF_PROF(q0, "lm.download");

@@ -2,11 +2,16 @@
 #include <dnnl.hpp>
 #include <dnnl_sycl.hpp>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/graph/command_graph.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
+#include <initializer_list>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <cstdlib>
@@ -14,13 +19,19 @@
 #include <string>
 #include "buffer.hpp"
 #include "engine.hpp"
-
 #ifndef DIFF_DPAS_INTRINSIC_DECL
 #define DIFF_DPAS_INTRINSIC_DECL
 using diff_dpas_v8s = short __attribute__((ext_vector_type(8)));
 using diff_dpas_v8i = int   __attribute__((ext_vector_type(8)));
 using diff_dpas_v8f = float __attribute__((ext_vector_type(8)));
-
+// __spirv_SubgroupMatrixMultiplyAccumulateINTEL has no host definition (it's a
+// SPIRV intrinsic materialized only under __SYCL_DEVICE_ONLY__). The #else
+// stub exists so host-side translation units that pull in this header compile,
+// never run. Suppress the bogus -Wundefined-inline on the host stub.
+#if defined(__clang__) || defined(__INTEL_CLANG_COMPILER)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+#endif
 SYCL_EXTERNAL inline diff_dpas_v8f __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
     int KDim, diff_dpas_v8s A, diff_dpas_v8i B, diff_dpas_v8f C, int Operands)
 #ifdef __SYCL_DEVICE_ONLY__
@@ -28,10 +39,11 @@ SYCL_EXTERNAL inline diff_dpas_v8f __spirv_SubgroupMatrixMultiplyAccumulateINTEL
 #else
     { return diff_dpas_v8f{}; }
 #endif
+#if defined(__clang__) || defined(__INTEL_CLANG_COMPILER)
+#pragma clang diagnostic pop
 #endif
-
+#endif
 static constexpr int kNvfp4DpasBF16 = 0x3000;
-
 struct Nvfp4Linear {
     int in_features = 0;
     int out_features = 0;
@@ -51,12 +63,9 @@ struct Nvfp4Linear {
     // [n/16][k/16][16 lanes][8 packed bytes].
     mutable GpuBuffer<uint8_t> weight_coal;
     mutable int weight_coal_gpu = -1;
-
     bool empty() const { return weight_packed.empty(); }
 };
-
 enum class Nvfp4WeightLayout { Raw = 0, Any = 1 };
-
 inline Nvfp4WeightLayout nvfp4_weight_layout() {
     static Nvfp4WeightLayout layout = [] {
         const char* env = std::getenv("DIFF_NVFP4_WEIGHT_LAYOUT");
@@ -67,19 +76,381 @@ inline Nvfp4WeightLayout nvfp4_weight_layout() {
     }();
     return layout;
 }
-
 inline bool nvfp4_verbose() {
     static bool enabled = std::getenv("DIFF_NVFP4_VERBOSE") != nullptr;
     return enabled;
 }
+inline bool nvfp4_sycl_graph_enabled() {
+    static bool enabled = [] {
+        const char* env = std::getenv("DIFF_NVFP4_SYCL_GRAPH");
+        return env && std::strcmp(env, "0") && std::strcmp(env, "off") &&
+               std::strcmp(env, "false") && std::strcmp(env, "no");
+    }();
+    return enabled;
+}
+inline size_t nvfp4_sycl_graph_cache_limit() {
+    static size_t limit = [] {
+        const char* env = std::getenv("DIFF_NVFP4_SYCL_GRAPH_CACHE_LIMIT");
+        if (!env) return size_t{512};
+        char* end = nullptr;
+        unsigned long parsed = std::strtoul(env, &end, 10);
+        return end != env && parsed > 0 ? static_cast<size_t>(parsed) : size_t{512};
+    }();
+    return limit;
+}
+struct Nvfp4SyclGraphKey {
+    const sycl::queue* queue = nullptr;
+    int kind = 0;
+    std::vector<uintptr_t> args;
+    bool operator==(const Nvfp4SyclGraphKey& other) const {
+        return queue == other.queue && kind == other.kind && args == other.args;
+    }
+};
+struct Nvfp4SyclGraphKeyHash {
+    size_t operator()(const Nvfp4SyclGraphKey& key) const {
+        size_t hash = std::hash<const sycl::queue*>{}(key.queue);
+        auto mix = [&](uintptr_t value) {
+            hash ^= std::hash<uintptr_t>{}(value) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        };
+        mix(static_cast<uintptr_t>(key.kind));
+        for (uintptr_t value : key.args) mix(value);
+        return hash;
+    }
+};
+struct Nvfp4SyclGraphEntry {
+    using Modifiable = sycl::ext::oneapi::experimental::command_graph<>;
+    using Executable = sycl::ext::oneapi::experimental::command_graph<
+        sycl::ext::oneapi::experimental::graph_state::executable>;
+    std::unique_ptr<Modifiable> graph;
+    std::unique_ptr<Executable> executable;
+    bool unavailable = false;
+};
+struct Nvfp4SyclGraphCache {
+    std::mutex mutex;
+    std::unordered_map<Nvfp4SyclGraphKey, Nvfp4SyclGraphEntry,
+                       Nvfp4SyclGraphKeyHash> entries;
+    size_t captures = 0;
+    size_t replays = 0;
+    size_t fallbacks = 0;
+    size_t capacity_bypasses = 0;
+};
+inline Nvfp4SyclGraphCache& nvfp4_sycl_graph_cache() {
+    static Nvfp4SyclGraphCache cache;
+    return cache;
+}
+inline uintptr_t nvfp4_sycl_graph_float_key(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
 
+// ---------------------------------------------------------------------------
+// Nvfp4GraphSession
+//
+// The per-call micro-graph cache below (nvfp4_sycl_graph_submit) captures and
+// replays ONE kernel at a time, keyed by that kernel's own buffer pointers.
+// That's fine for amortizing a single pack/matmul launch, but a denoising
+// step calls many of these in sequence (attention -> router -> gather/pack ->
+// grouped GEMM -> combine), and today each still gets its own
+// begin_recording/end_recording/finalize and its own q.ext_oneapi_graph()
+// dispatch. A session instead lets a caller open ONE graph, have every kernel
+// in the step record into it (including attention kernels defined outside
+// this file), and replay the whole step with a single graph launch -- which
+// is the piece that actually removes host round-trips between kernels within
+// a step, not just between repeated steps.
+//
+// Usage:
+//   Nvfp4GraphSession session;
+//   if (session.begin(q, step_key)) {
+//       attn_forward(..., &session);
+//       moe_forward(..., &session);
+//       session.end_and_replay();
+//   } else {
+//       // cache hit: session.begin() already replayed the cached graph.
+//   }
+//
+// Layer types are static per DiffusionGemma config (layer_types is fixed at
+// model-build time), so the sequence of kernels captured for a given
+// (layer_index, is_sliding) step_key never changes shape across replays --
+// this is what makes whole-step capture safe to cache and replay verbatim,
+// the same way the per-kernel cache below already relies on stable shapes.
+// Queue-keyed registry of *actively recording* sessions. nvfp4_sycl_graph_submit()
+// consults this as a backstop: when a session is recording on a queue, ANY
+// per-kernel micro-capture attempt on that queue would call begin_recording on
+// an already-recording queue, which throws (intel-llvm graph_impl.cpp:2238) and
+// would poison the per-kernel cache (entry marked `unavailable` forever).
+// The registry lets such call sites stand down to a bare submit() -- which the
+// active session's recording captures as a node -- even when the caller didn't
+// receive an explicit session pointer (e.g. the dense-MLP pack_bf16_to_nvfp4
+// and the MoE Xe-pack paths, which thread through matmul_nvfp4 / expert_parallel
+// without an explicit session argument). Explicit session threading (Phases 1-2)
+// remains the preferred fast path; this registry is the correctness backstop.
+struct Nvfp4GraphSession;
+inline std::mutex& nvfp4_session_registry_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::unordered_map<const sycl::queue*, Nvfp4GraphSession*>&
+nvfp4_session_registry() {
+    static std::unordered_map<const sycl::queue*, Nvfp4GraphSession*> r;
+    return r;
+}
+// Returns the session currently recording on `q`, or nullptr if none. Called
+// on the hot path of nvfp4_sycl_graph_submit; the map is normally empty when no
+// session is active, so the lookup is a fast miss.
+inline Nvfp4GraphSession* nvfp4_active_session(const sycl::queue& q) {
+    std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
+    auto it = nvfp4_session_registry().find(&q);
+    return it == nvfp4_session_registry().end() ? nullptr : it->second;
+}
+// True iff a Nvfp4GraphSession is currently recording on `q`. Forward-declarable
+// (no Nvfp4GraphSession definition needed) so lightweight headers such as
+// utils/profile.hpp can call it without including nvfp4.hpp's DPAS intrinsics.
+// Used to skip queue waits during recording (q.wait()/stream.wait() throw on a
+// recording queue: "wait cannot be called for a queue which is recording to a
+// command graph").
+//
+// NOTE: declared here, defined out-of-line in common/gpu/expert_parallel.cpp.
+// It must NOT be `inline`: a TU that only forward-declares it (e.g. profile.cpp)
+// emits an external reference; an `inline` definition is only emitted as
+// linkonce_odr by TUs that include this header and use it, and if all such uses
+// are inlined away there is no standalone symbol to satisfy that reference.
+bool nvfp4_session_recording(const sycl::queue& q);
+struct Nvfp4GraphSession {
+    using Modifiable = sycl::ext::oneapi::experimental::command_graph<>;
+    using Executable = sycl::ext::oneapi::experimental::command_graph<
+        sycl::ext::oneapi::experimental::graph_state::executable>;
+
+    sycl::queue* queue_ = nullptr;
+    std::unique_ptr<Modifiable> graph_;
+    bool recording_ = false;
+    // True once begin() has opened a *new* recording that the caller must
+    // populate and close with end_and_replay(). False if begin() found a
+    // cached executable and already replayed it (nothing left to record).
+    bool needs_recording_ = false;
+
+    // True while this session is actively recording -- kernels submitted via
+    // nvfp4_sycl_graph_submit() check this and skip their own micro-graph
+    // capture, just enqueuing directly so they land inside the session graph.
+    bool active() const { return recording_; }
+
+    // Returns true if the caller must record the step's kernels (cache miss);
+    // false if a cached graph was found and already replayed (cache hit).
+    bool begin(sycl::queue& q, const Nvfp4SyclGraphKey& step_key) {
+        queue_ = &q;
+        if (!nvfp4_sycl_graph_enabled()) {
+            needs_recording_ = false;
+            recording_ = false;
+            return true;  // graphs disabled: caller runs kernels eagerly every time
+        }
+        auto& cache = nvfp4_sycl_graph_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto found = cache.entries.find(step_key);
+        if (found != cache.entries.end() && found->second.executable) {
+            ++cache.replays;
+            q.ext_oneapi_graph(*found->second.executable);
+            needs_recording_ = false;
+            recording_ = false;
+            return false;
+        }
+        // Either not present, or present-but-unavailable (previous capture
+        // failed) -- try recording fresh. Reserve/replace the slot now so a
+        // racing session doesn't also try to record the same key.
+        if (found == cache.entries.end() &&
+            cache.entries.size() >= nvfp4_sycl_graph_cache_limit()) {
+            ++cache.capacity_bypasses;
+            needs_recording_ = false;
+            recording_ = false;
+            return true;  // caller runs kernels eagerly, no capture this time
+        }
+        key_ = step_key;
+        // assume_buffer_outlives_graph: oneDNN's SYCL interop may internally use
+        // sycl::buffer for some primitives (e.g. non-batched matmul_bf16). SYCL
+        // throws "Cannot use buffers in a graph without ... assume_buffer_outlives_graph"
+        // if a buffer-accessor is recorded into a graph lacking this property. All
+        // persistent data (weights, KV cache, arena workspaces) is USM and outlives
+        // the graph; the property is the documented oneDNN-interop capture enabler.
+        graph_ = std::make_unique<Modifiable>(q,
+            sycl::property_list{
+                sycl::ext::oneapi::experimental::property::graph::assume_buffer_outlives_graph{}});
+        try {
+            graph_->begin_recording(q);
+        } catch (const std::exception& error) {
+            graph_.reset();
+            needs_recording_ = false;
+            recording_ = false;
+            if (nvfp4_verbose())
+                std::fprintf(stderr, "[nvfp4-graph] session capture disabled: %s\n",
+                             error.what());
+            return true;  // caller runs kernels eagerly this time
+        }
+        recording_ = true;
+        needs_recording_ = true;
+        {
+            std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
+            nvfp4_session_registry()[&q] = this;
+        }
+        return true;
+    }
+
+    // Closes recording, finalizes, caches, and replays the freshly-captured
+    // graph. Call exactly once, after the caller has submitted every kernel
+    // for the step, only when begin() returned true AND active() is true
+    // (i.e. begin() did not already replay a cached hit).
+    void end_and_replay() {
+        if (!recording_) return;  // begin() already replayed a cached graph
+        auto& cache = nvfp4_sycl_graph_cache();
+        // Unregister from the active-session registry now that recording has
+        // ended, so nvfp4_sycl_graph_submit stops standing down for this queue.
+        {
+            std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
+            nvfp4_session_registry().erase(queue_);
+        }
+        try {
+            graph_->end_recording(*queue_);
+            recording_ = false;
+            auto executable = std::make_unique<Executable>(graph_->finalize());
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            Nvfp4SyclGraphEntry entry;
+            entry.graph = std::move(graph_);
+            entry.executable = std::move(executable);
+            ++cache.captures;
+            queue_->ext_oneapi_graph(*entry.executable);
+            cache.entries[key_] = std::move(entry);
+        } catch (const std::exception& error) {
+            if (recording_) {
+                try { graph_->end_recording(*queue_); } catch (...) {}
+                recording_ = false;
+            }
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            ++cache.fallbacks;
+            Nvfp4SyclGraphEntry entry;
+            entry.unavailable = true;
+            cache.entries[key_] = std::move(entry);
+            if (nvfp4_verbose())
+                std::fprintf(stderr, "[nvfp4-graph] session finalize failed: %s\n",
+                             error.what());
+            // Kernels already ran eagerly on queue_ during recording attempts
+            // in SYCL graph semantics recording still enqueues work, so no
+            // separate re-run is needed here; the step's results are correct,
+            // only the *caching* of it for next time failed.
+        }
+    }
+
+    Nvfp4SyclGraphKey key_;
+};
+
+// Builds a step-level cache key from a layer index and its (static) attention
+// kind, so sliding-window layers and global layers -- which submit different
+// kernel sequences -- are never conflated into the same cached graph even
+// though both are "one decoder layer step" at the call site.
+inline Nvfp4SyclGraphKey nvfp4_step_key(const sycl::queue& q, int layer_index,
+                                       bool is_sliding, int denoise_step) {
+    // denoise_step is intentionally NOT part of the key for the *replay*
+    // path -- the kernel sequence for "decoder layer L, sliding" is identical
+    // on every denoising step, so one capture at step 0 should serve all
+    // subsequent steps. It's accepted here only so callers that want
+    // per-step keys (e.g. while validating that shapes truly don't change
+    // across steps) can opt into it via kind, without changing this
+    // function's signature.
+    (void)denoise_step;
+    Nvfp4SyclGraphKey key;
+    key.queue = &q;
+    key.kind = 1000 + layer_index * 2 + (is_sliding ? 0 : 1);
+    return key;
+}
+
+template <class Submit>
+inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
+                                    std::initializer_list<uintptr_t> args,
+                                    Submit&& submit,
+                                    Nvfp4GraphSession* session = nullptr) {
+    if (session && session->active()) {
+        // An outer Nvfp4GraphSession is already recording this step's graph;
+        // just enqueue -- it gets captured as part of that larger graph
+        // rather than owning its own begin/end/finalize here.
+        submit();
+        return;
+    }
+    if (Nvfp4GraphSession* active = nvfp4_active_session(q)) {
+        // Backstop: a session is recording on this queue but the caller didn't
+        // carry an explicit session pointer (e.g. dense-MLP pack_bf16_to_nvfp4
+        // via matmul_nvfp4, or MoE pack paths via expert_parallel). Stand down
+        // the same way -- a bare submit() is captured as a node of the active
+        // session's graph. Without this, the begin_recording() below would
+        // throw on the already-recording queue and poison this per-kernel
+        // cache entry (unavailable forever).
+        (void)active;
+        submit();
+        return;
+    }
+    if (!nvfp4_sycl_graph_enabled()) {
+        submit();
+        return;
+    }
+    Nvfp4SyclGraphKey key{&q, kind, args};
+    auto& cache = nvfp4_sycl_graph_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto found = cache.entries.find(key);
+    if (found != cache.entries.end()) {
+        if (found->second.executable) {
+            ++cache.replays;
+            q.ext_oneapi_graph(*found->second.executable);
+            return;
+        }
+        ++cache.fallbacks;
+        submit();
+        return;
+    }
+    if (cache.entries.size() >= nvfp4_sycl_graph_cache_limit()) {
+        ++cache.capacity_bypasses;
+        submit();
+        return;
+    }
+    auto [it, inserted] = cache.entries.emplace(std::move(key), Nvfp4SyclGraphEntry{});
+    auto& entry = it->second;
+    bool recording = false;
+    try {
+        entry.graph = std::make_unique<Nvfp4SyclGraphEntry::Modifiable>(q);
+        entry.graph->begin_recording(q);
+        recording = true;
+        submit();
+        entry.graph->end_recording(q);
+        recording = false;
+        entry.executable = std::make_unique<Nvfp4SyclGraphEntry::Executable>(entry.graph->finalize());
+        ++cache.captures;
+        q.ext_oneapi_graph(*entry.executable);
+    } catch (const std::exception& error) {
+        if (recording) {
+            try {
+                entry.graph->end_recording(q);
+            } catch (...) {
+            }
+        }
+        entry.graph.reset();
+        entry.executable.reset();
+        entry.unavailable = true;
+        ++cache.fallbacks;
+        if (nvfp4_verbose())
+            std::fprintf(stderr, "[nvfp4-graph] capture disabled: %s\n", error.what());
+        submit();
+    }
+}
+inline void nvfp4_sycl_graph_report() {
+    if (!nvfp4_sycl_graph_enabled()) return;
+    auto& cache = nvfp4_sycl_graph_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    std::fprintf(stderr,
+                 "[nvfp4-graph] captures=%zu replays=%zu fallbacks=%zu cache-bypasses=%zu entries=%zu\n",
+                 cache.captures, cache.replays, cache.fallbacks,
+                 cache.capacity_bypasses, cache.entries.size());
+}
 struct Nvfp4MatmulKey {
     int gpu, M, K, N, layout;
     bool operator==(const Nvfp4MatmulKey& o) const {
         return gpu == o.gpu && M == o.M && K == o.K && N == o.N && layout == o.layout;
     }
 };
-
 struct Nvfp4MatmulKeyHash {
     size_t operator()(const Nvfp4MatmulKey& k) const {
         size_t h = std::hash<int>{}(k.gpu);
@@ -90,12 +461,10 @@ struct Nvfp4MatmulKeyHash {
         return h;
     }
 };
-
 struct Nvfp4MatmulEntry {
     dnnl::matmul primitive;
     dnnl::memory::desc weights_md;
 };
-
 inline float nvfp4_e4m3_to_float(uint8_t bits) {
     if (bits == 0) return 0.0f;
     float sign = (bits & 0x80) ? -1.0f : 1.0f;
@@ -106,28 +475,23 @@ inline float nvfp4_e4m3_to_float(uint8_t bits) {
         : (1.0f + mant / 8.0f) * sycl::exp2((float)exp - 7.0f);
     return sign * v;
 }
-
 inline uint8_t nvfp4_encode_e4m3_positive(float x) {
     if (!(x > 0.0f)) return 0;
     if (x >= 448.0f) return 0x7e;
-
     constexpr float kSubStep = 0.001953125f;      // 2^-9
     constexpr float kNormalMin = 0.015625f;       // 2^-6
     constexpr float kSubNormalCut = 0.0146484375f; // midpoint between 7*2^-9 and 2^-6
-
     if (x < kSubNormalCut) {
         int mant = (int)sycl::floor(x / kSubStep + 0.5f);
         if (mant <= 0) return 0;
         if (mant > 7) mant = 7;
         return (uint8_t)mant;
     }
-
     float efloat = sycl::floor(sycl::log2(sycl::fmax(x, kNormalMin)));
     int actual_exp = (int)efloat;
     if (actual_exp < -6) actual_exp = -6;
     int exp = actual_exp + 7;
     if (exp > 15) return 0x7e;
-
     float step = sycl::exp2((float)actual_exp - 3.0f);
     int mant = (int)sycl::floor(x / step - 8.0f + 0.5f);
     if (mant < 0) mant = 0;
@@ -139,11 +503,9 @@ inline uint8_t nvfp4_encode_e4m3_positive(float x) {
     if (exp == 15 && mant > 6) return 0x7e;
     return (uint8_t)((exp << 3) | mant);
 }
-
 inline uint8_t nvfp4_encode_e2m1(float x) {
     uint8_t sign = 0;
     if (x < 0.0f) { sign = 0x8; x = -x; }
-
     uint8_t code = 0;
     if (x < 0.25f) code = 0;          // 0
     else if (x < 0.75f) code = 1;     // 0.5
@@ -155,7 +517,6 @@ inline uint8_t nvfp4_encode_e2m1(float x) {
     else code = 7;                    // 6
     return sign | code;
 }
-
 inline void pack_bf16_to_nvfp4(
     sycl::queue& q,
     const bf16* src,
@@ -163,22 +524,26 @@ inline void pack_bf16_to_nvfp4(
     uint8_t* scales,
     int M,
     int K,
-    float input_global_scale)
+    float input_global_scale,
+    Nvfp4GraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("NVFP4 activation K must be divisible by 16");
     int G = K / 16;
+    nvfp4_sycl_graph_submit(q, 1, {
+        reinterpret_cast<uintptr_t>(src), reinterpret_cast<uintptr_t>(packed),
+        reinterpret_cast<uintptr_t>(scales), static_cast<uintptr_t>(M),
+        static_cast<uintptr_t>(K), nvfp4_sycl_graph_float_key(input_global_scale)
+    }, [&] {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<2>(M, G), [=](sycl::id<2> id) {
             int m = (int)id[0];
             int g = (int)id[1];
             int k0 = g * 16;
-
             float max_abs = 0.0f;
             for (int i = 0; i < 16; ++i) {
                 float v = bf16_to_float(src[(size_t)m * K + k0 + i]);
                 max_abs = sycl::fmax(max_abs, sycl::fabs(v));
             }
-
             uint8_t scale_bits = 0;
             float scale = 0.0f;
             if (max_abs > 0.0f) {
@@ -187,7 +552,6 @@ inline void pack_bf16_to_nvfp4(
                 scale = nvfp4_e4m3_to_float(scale_bits);
             }
             scales[(size_t)m * G + g] = scale_bits;
-
             for (int i = 0; i < 16; i += 2) {
                 uint8_t lo = 0, hi = 0;
                 if (scale > 0.0f) {
@@ -202,8 +566,60 @@ inline void pack_bf16_to_nvfp4(
             }
         });
     });
+    }, session);
 }
 
+// Dense SwiGLU followed by NVFP4 activation packing. This preserves the BF16
+// boundary of the unfused sequence (gate/up BF16 -> SwiGLU BF16 -> pack) while
+// eliminating the compact BF16 activation round-trip and one kernel launch.
+inline void swiglu_pack_nvfp4(
+    sycl::queue& queue, const bf16* gate_up, int M, int intermediate,
+    float input_global_scale, uint8_t* packed, uint8_t* scales) {
+    if (intermediate % 16 != 0)
+        throw std::runtime_error(
+            "fused SwiGLU NVFP4 pack requires intermediate divisible by 16");
+    int groups = intermediate / 16;
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::range<2>((size_t)M, (size_t)groups),
+            [=](sycl::id<2> id) {
+                int row = static_cast<int>(id[0]);
+                int group = static_cast<int>(id[1]);
+                int k0 = group * 16;
+                const bf16* source = gate_up + (size_t)row * 2 * intermediate;
+                float values[16];
+                float maximum = 0.0f;
+                for (int i = 0; i < 16; ++i) {
+                    float gate = bf16_to_float(source[k0 + i]);
+                    float up = bf16_to_float(source[intermediate + k0 + i]);
+                    float value = gate / (1.0f + sycl::exp(-gate)) * up;
+                    value = bf16_to_float(float_to_bf16(value));
+                    values[i] = value;
+                    maximum = sycl::fmax(maximum, sycl::fabs(value));
+                }
+                uint8_t scale_bits = 0;
+                float scale = 0.0f;
+                if (maximum > 0.0f) {
+                    scale_bits = nvfp4_encode_e4m3_positive(
+                        maximum * input_global_scale / 6.0f);
+                    scale = nvfp4_e4m3_to_float(scale_bits);
+                }
+                scales[(size_t)row * groups + group] = scale_bits;
+                uint8_t* destination =
+                    packed + (size_t)row * (intermediate / 2) + k0 / 2;
+                for (int i = 0; i < 16; i += 2) {
+                    uint8_t low = 0, high = 0;
+                    if (scale > 0.0f) {
+                        low = nvfp4_encode_e2m1(
+                            values[i] * input_global_scale / scale);
+                        high = nvfp4_encode_e2m1(
+                            values[i + 1] * input_global_scale / scale);
+                    }
+                    destination[i / 2] = low | (high << 4);
+                }
+            });
+    });
+}
 inline Nvfp4MatmulEntry& nvfp4_matmul_entry(GpuEngine& ctx, int M, int K, int N) {
     static std::unordered_map<Nvfp4MatmulKey, Nvfp4MatmulEntry, Nvfp4MatmulKeyHash> cache;
     Nvfp4WeightLayout layout = nvfp4_weight_layout();
@@ -241,13 +657,11 @@ inline Nvfp4MatmulEntry& nvfp4_matmul_entry(GpuEngine& ctx, int M, int K, int N)
     }
     return it->second;
 }
-
 inline const uint8_t* nvfp4_weight_data(const Nvfp4Linear& W,
                                         const dnnl::memory::desc& weights_md,
                                         int K, int N, GpuEngine& ctx) {
     if (nvfp4_weight_layout() == Nvfp4WeightLayout::Raw)
         return W.weight_packed.data();
-
     size_t bytes = weights_md.get_size();
     if (W.weight_any.empty() || W.weight_any_bytes != bytes || W.weight_any_gpu != ctx.index) {
         using dt = dnnl::memory::data_type;
@@ -267,7 +681,6 @@ inline const uint8_t* nvfp4_weight_data(const Nvfp4Linear& W,
     }
     return W.weight_any.data();
 }
-
 inline void matmul_nvfp4_packed(
     const uint8_t* A_packed,
     const uint8_t* A_scale,
@@ -283,10 +696,8 @@ inline void matmul_nvfp4_packed(
         throw std::runtime_error("matmul_nvfp4_packed: K must be divisible by 16");
     if (W.dst_scale.empty())
         throw std::runtime_error("matmul_nvfp4_packed: missing persistent destination scale");
-
     int N = W.out_features;
     int G = K / 16;
-
     using dt = dnnl::memory::data_type;
     using tag = dnnl::memory::format_tag;
     auto src_md = dnnl::memory::desc({M, K}, dt::f4_e2m1, tag::ab);
@@ -294,10 +705,8 @@ inline void matmul_nvfp4_packed(
     auto src_scales_md = dnnl::memory::desc({M, G}, dt::f8_e4m3, tag::ab);
     auto weight_scales_md = dnnl::memory::desc({G, N}, dt::f8_e4m3, tag::ab);
     auto dst_scale_md = dnnl::memory::desc({1}, dt::f32, tag::a);
-
     auto& entry = nvfp4_matmul_entry(ctx, M, K, N);
     const uint8_t* weight_data = nvfp4_weight_data(W, entry.weights_md, K, N, ctx);
-
     entry.primitive.execute(ctx.stream, {
         {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
             src_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
@@ -318,14 +727,13 @@ inline void matmul_nvfp4_packed(
             dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
 }
-
 // ---------------------------------------------------------------------------
 // Batched NVFP4 GEMM (Direction B, Phase 1).
 //
 // oneDNN batched f4_e2m1 matmul. Validated by Probe 1 (nvfp4_batched_probe):
 //   - src scales     [B,M,G] f8_e4m3, mask=7, groups{1,1,16}
 //   - weight scales  [B,G,N] f8_e4m3, mask=7, groups{1,16,1}   (batched; the
-//     shared [G,N] layout is REJECTED by oneDNN at execute — do not use it)
+//     shared [G,N] layout is REJECTED by oneDNN at execute -- do not use it)
 //   - dst scale      [1]     f32,    mask=0 (shared across the batch)
 // Weights are fed in the raw per-expert layout (each [N,K] f4, K-contiguous,
 // matching the single kernel's tag::ba on {K,N}). Concatenating E experts
@@ -333,14 +741,12 @@ inline void matmul_nvfp4_packed(
 // tag::acb (B slow, N mid, K fast). No reorder / no Any-layout path (the bench
 // builds the batched buffer directly from the per-expert packed weights).
 // ---------------------------------------------------------------------------
-
 struct Nvfp4BatchedMatmulKey {
     int gpu, B, M, K, N;
     bool operator==(const Nvfp4BatchedMatmulKey& o) const {
         return gpu == o.gpu && B == o.B && M == o.M && K == o.K && N == o.N;
     }
 };
-
 struct Nvfp4BatchedMatmulKeyHash {
     size_t operator()(const Nvfp4BatchedMatmulKey& k) const {
         size_t h = std::hash<int>{}(k.gpu);
@@ -351,12 +757,10 @@ struct Nvfp4BatchedMatmulKeyHash {
         return h;
     }
 };
-
 struct Nvfp4BatchedMatmulEntry {
     dnnl::matmul primitive;
     dnnl::memory::desc weights_md;
 };
-
 inline Nvfp4BatchedMatmulEntry& nvfp4_matmul_batched_entry(
     GpuEngine& ctx, int B, int M, int K, int N)
 {
@@ -393,7 +797,6 @@ inline Nvfp4BatchedMatmulEntry& nvfp4_matmul_batched_entry(
     }
     return it->second;
 }
-
 inline void matmul_nvfp4_packed_batched(
     const uint8_t* A_packed,    // [B, M, K] f4_e2m1 (tag::abc, K contiguous)
     const uint8_t* A_scale,     // [B, M, G] f8_e4m3 (tag::abc, G contiguous)
@@ -407,7 +810,6 @@ inline void matmul_nvfp4_packed_batched(
     if (K % 16 != 0)
         throw std::runtime_error("matmul_nvfp4_packed_batched: K must be divisible by 16");
     int G = K / 16;
-
     using dt = dnnl::memory::data_type;
     using tag = dnnl::memory::format_tag;
     auto src_md         = dnnl::memory::desc({B, M, K}, dt::f4_e2m1, tag::abc);
@@ -415,7 +817,6 @@ inline void matmul_nvfp4_packed_batched(
     auto src_scales_md  = dnnl::memory::desc({B, M, G}, dt::f8_e4m3, tag::abc);
     auto w_scales_md    = dnnl::memory::desc({B, G, N}, dt::f8_e4m3, tag::abc);
     auto dst_scale_md   = dnnl::memory::desc({1},       dt::f32,     tag::a);
-
     auto& entry = nvfp4_matmul_batched_entry(ctx, B, M, K, N);
     entry.primitive.execute(ctx.stream, {
         {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
@@ -437,34 +838,46 @@ inline void matmul_nvfp4_packed_batched(
             dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
 }
-
 inline void matmul_nvfp4(
     const bf16* A,
     int M,
     int K,
     const Nvfp4Linear& W,
     bf16* C,
-    GpuEngine& ctx = GpuEngine::get(0))
+    GpuEngine& ctx = GpuEngine::get(0),
+    uint8_t* A_packed_buf = nullptr,
+    uint8_t* A_scale_buf = nullptr)
 {
     if (W.in_features != K)
         throw std::runtime_error("matmul_nvfp4: K does not match weight shape");
     if (K % 16 != 0)
         throw std::runtime_error("matmul_nvfp4: K must be divisible by 16");
-
     int G = K / 16;
     auto& q = ctx.queue;
-
+    // When caller-provided (stable, arena-backed) workspaces are passed, use
+    // them directly: no per-call sycl::malloc_device (which would be truly
+    // freed at scope exit and so dangle at graph-replay time) and no
+    // ctx.stream.wait() (the in-order queue serializes the pack before the
+    // matmul, and the workspace is owned by the caller so there is no
+    // use-after-free on free). This makes matmul_nvfp4 safe to capture inside a
+    // Nvfp4GraphSession. Without caller workspaces, fall back to the original
+    // transient-GpuBuffer + synchronous-wait behavior (unchanged for existing
+    // callers that don't opt in).
+    if (A_packed_buf && A_scale_buf) {
+        pack_bf16_to_nvfp4(q, A, A_packed_buf, A_scale_buf, M, K,
+                           W.input_global_scale);
+        matmul_nvfp4_packed(A_packed_buf, A_scale_buf, M, K, W, C, ctx);
+        return;
+    }
     GpuBuffer<uint8_t> A_packed((size_t)M * K / 2, q);
     GpuBuffer<uint8_t> A_scale((size_t)M * G, q);
     pack_bf16_to_nvfp4(q, A, A_packed.data(), A_scale.data(), M, K,
                        W.input_global_scale);
     matmul_nvfp4_packed(A_packed.data(), A_scale.data(), M, K, W, C, ctx);
-
     // A_packed/A_scale are temporary workspaces owned by this call. Keep the
     // execution synchronous until callers pass reusable workspaces explicitly.
-    ctx.stream.wait();
+    if (!nvfp4_session_recording(q)) ctx.stream.wait();
 }
-
 inline float nvfp4_e2m1_to_float(uint8_t bits) {
     float mag = 0.0f;
     switch (bits & 0x07) {
@@ -479,7 +892,6 @@ inline float nvfp4_e2m1_to_float(uint8_t bits) {
     }
     return (bits & 0x08) ? -mag : mag;
 }
-
 inline float nvfp4_e4m3_fast(uint8_t b) {
     uint32_t exp = (b >> 3) & 0x0f;
     uint32_t mant = b & 0x07;
@@ -492,13 +904,11 @@ inline float nvfp4_e4m3_fast(uint8_t b) {
     __builtin_memcpy(&out, &bits, 4);
     return out;
 }
-
 inline float nvfp4_e2m1_fast(uint8_t bits) {
     const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     return (bits & 8) ? -mag[bits & 7] : mag[bits & 7];
 }
-
-// Vectorized (ESIMD simd) arithmetic e2m1 dequant — no LUT, no scalar loop.
+// Vectorized (ESIMD simd) arithmetic e2m1 dequant -- no LUT, no scalar loop.
 // Validated bit-exact vs nvfp4_e2m1_fast by src/nvfp4_vec_dequant_probe.cpp.
 // nib holds 4-bit e2m1 codes (0..15); returns the dequanted float values.
 namespace esimd_vec {
@@ -520,8 +930,7 @@ inline esimd_local::simd<float, N> e2m1(esimd_local::simd<uint16_t, N> nib) {
     val.merge(-absval, s != esimd_local::simd<uint16_t, N>(0));
     return val;
 }
-
-// Vectorized (ESIMD simd) arithmetic e4m3 dequant — bit-exact vs nvfp4_e4m3_fast.
+// Vectorized (ESIMD simd) arithmetic e4m3 dequant -- bit-exact vs nvfp4_e4m3_fast.
 // b holds 8-bit e4m3 codes (0..255); returns the dequanted float values.
 // Normal: 2^(exp-7)*(1+mant/8); subnormal (exp==0): mant*2^-9 (= (mant/8)*2^-6).
 // Uses float(1<<exp)/128 instead of exp2() to stay bit-exact and avoid negative-shift UB.
@@ -544,6 +953,209 @@ inline esimd_local::simd<float, N> e4m3(esimd_local::simd<uint16_t, N> b) {
 }
 }  // namespace esimd_vec
 
+namespace nvfp4_decode_esimd {
+
+namespace esimd = sycl::ext::intel::esimd;
+using native_bf16 = sycl::ext::oneapi::bfloat16;
+
+ESIMD_INLINE float e4m3_scale(const uint8_t* scales, size_t index) {
+    uint16_t code = scales[index];
+    uint16_t exponent = (code >> 3) & 15;
+    uint16_t mantissa = code & 7;
+    float magnitude;
+    if (exponent == 0) {
+        magnitude = static_cast<float>(mantissa) * (1.0f / 512.0f);
+    } else {
+        magnitude = static_cast<float>(uint16_t{1} << exponent) *
+                    (1.0f / 128.0f) *
+                    (1.0f + static_cast<float>(mantissa) * (1.0f / 8.0f));
+    }
+    return (code & 128) ? -magnitude : magnitude;
+}
+
+ESIMD_INLINE float reduce64(esimd::simd<float, 64> values) {
+    values.select<32, 1>(0) += values.select<32, 1>(32);
+    values.select<16, 1>(0) += values.select<16, 1>(16);
+    values.select<8, 1>(0) += values.select<8, 1>(8);
+    values.select<4, 1>(0) += values.select<4, 1>(4);
+    values.select<2, 1>(0) += values.select<2, 1>(2);
+    return values[0] + values[1];
+}
+
+}  // namespace nvfp4_decode_esimd
+
+// M=1 decode GEMV over the checkpoint's native W4A4 layout. One ESIMD
+// work-item owns one output row and streams packed E2M1 activations/weights in
+// 128-value blocks. Activation scales are E4M3 [K/16], weight scales are E4M3
+// [K/16,N], and accumulation is FP32.
+inline void matmul_nvfp4_decode_gemv_esimd(
+    const uint8_t* input_packed, const uint8_t* input_scales, int K,
+    const Nvfp4Linear& weights, bf16* output,
+    GpuEngine& context = GpuEngine::get(0)) {
+    if (weights.in_features != K || K % 128 != 0)
+        throw std::runtime_error(
+            "NVFP4 decode GEMV requires a matching K divisible by 128");
+    int N = weights.out_features;
+    const uint8_t* packed = weights.weight_packed.data();
+    const uint8_t* scales = weights.weight_scale.data();
+    float inverse_destination_scale =
+        1.0f / (weights.input_global_scale * weights.weight_global_scale);
+    auto& queue = context.queue;
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>((size_t)N, size_t{1}),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                namespace esimd = sycl::ext::intel::esimd;
+                using native_bf16 = sycl::ext::oneapi::bfloat16;
+                int n = static_cast<int>(item.get_group(0));
+                const uint8_t* weight_row = packed + (size_t)n * (K / 2);
+                esimd::simd<float, 64> even_accumulator = 0.0f;
+                esimd::simd<float, 64> odd_accumulator = 0.0f;
+
+                for (int k = 0; k < K; k += 128) {
+                    esimd::simd<uint8_t, 64> input_raw =
+                        esimd::block_load<uint8_t, 64>(input_packed + k / 2);
+                    esimd::simd<uint16_t, 64> input_wide =
+                        esimd::convert<uint16_t>(input_raw);
+                    esimd::simd<float, 64> input_even =
+                        esimd_vec::e2m1<64>(input_wide & uint16_t{15});
+                    esimd::simd<float, 64> input_odd =
+                        esimd_vec::e2m1<64>((input_wide >> 4) & uint16_t{15});
+                    esimd::simd<uint8_t, 64> raw =
+                        esimd::block_load<uint8_t, 64>(weight_row + k / 2);
+                    esimd::simd<uint16_t, 64> widened =
+                        esimd::convert<uint16_t>(raw);
+                    esimd::simd<float, 64> weight_even =
+                        esimd_vec::e2m1<64>(widened & uint16_t{15});
+                    esimd::simd<float, 64> weight_odd =
+                        esimd_vec::e2m1<64>((widened >> 4) & uint16_t{15});
+                    esimd::simd<float, 64> scale_vector;
+#pragma unroll
+                    for (int group = 0; group < 8; ++group) {
+                        int scale_group = k / 16 + group;
+                        float input_scale = nvfp4_decode_esimd::e4m3_scale(
+                            input_scales, scale_group);
+                        float weight_scale = nvfp4_decode_esimd::e4m3_scale(
+                            scales, (size_t)scale_group * N + n);
+                        scale_vector.template select<8, 1>(group * 8) =
+                            input_scale * weight_scale;
+                    }
+                    scale_vector *= inverse_destination_scale;
+                    even_accumulator += input_even * weight_even * scale_vector;
+                    odd_accumulator += input_odd * weight_odd * scale_vector;
+                }
+
+                float result = nvfp4_decode_esimd::reduce64(even_accumulator) +
+                               nvfp4_decode_esimd::reduce64(odd_accumulator);
+                auto* native_output = reinterpret_cast<native_bf16*>(output + n);
+                esimd::block_store<native_bf16, 1>(
+                    native_output, esimd::simd<native_bf16, 1>(result));
+            });
+    });
+}
+
+// Fused gate/up GEMV and SwiGLU for M=1. Each work-item owns one intermediate
+// channel, accumulates its paired gate and up rows while loading the BF16 input
+// once, and writes only the compact activated vector consumed by down_proj.
+inline void matmul_nvfp4_decode_swiglu_esimd(
+    const uint8_t* input_packed, const uint8_t* input_scales, int K,
+    const Nvfp4Linear& gate_up,
+    bf16* activation, int intermediate,
+    GpuEngine& context = GpuEngine::get(0)) {
+    if (gate_up.in_features != K || gate_up.out_features != 2 * intermediate ||
+        K % 128 != 0)
+        throw std::runtime_error(
+            "NVFP4 decode SwiGLU requires paired gate/up and K divisible by 128");
+    int N = gate_up.out_features;
+    const uint8_t* packed = gate_up.weight_packed.data();
+    const uint8_t* scales = gate_up.weight_scale.data();
+    float inverse_destination_scale =
+        1.0f / (gate_up.input_global_scale * gate_up.weight_global_scale);
+    auto& queue = context.queue;
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>((size_t)intermediate, size_t{1}),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                namespace esimd = sycl::ext::intel::esimd;
+                using native_bf16 = sycl::ext::oneapi::bfloat16;
+                int n = static_cast<int>(item.get_group(0));
+                const uint8_t* gate_row = packed + (size_t)n * (K / 2);
+                const uint8_t* up_row =
+                    packed + (size_t)(intermediate + n) * (K / 2);
+                esimd::simd<float, 64> gate_even = 0.0f, gate_odd = 0.0f;
+                esimd::simd<float, 64> up_even = 0.0f, up_odd = 0.0f;
+
+                for (int k = 0; k < K; k += 128) {
+                    esimd::simd<uint8_t, 64> input_raw =
+                        esimd::block_load<uint8_t, 64>(input_packed + k / 2);
+                    esimd::simd<uint16_t, 64> input_wide =
+                        esimd::convert<uint16_t>(input_raw);
+                    esimd::simd<float, 64> input_even =
+                        esimd_vec::e2m1<64>(input_wide & uint16_t{15});
+                    esimd::simd<float, 64> input_odd =
+                        esimd_vec::e2m1<64>((input_wide >> 4) & uint16_t{15});
+                    esimd::simd<uint8_t, 64> gate_raw =
+                        esimd::block_load<uint8_t, 64>(gate_row + k / 2);
+                    esimd::simd<uint8_t, 64> up_raw =
+                        esimd::block_load<uint8_t, 64>(up_row + k / 2);
+                    esimd::simd<uint16_t, 64> gate_wide =
+                        esimd::convert<uint16_t>(gate_raw);
+                    esimd::simd<uint16_t, 64> up_wide =
+                        esimd::convert<uint16_t>(up_raw);
+                    esimd::simd<float, 64> gate_weight_even =
+                        esimd_vec::e2m1<64>(gate_wide & uint16_t{15});
+                    esimd::simd<float, 64> gate_weight_odd =
+                        esimd_vec::e2m1<64>((gate_wide >> 4) & uint16_t{15});
+                    esimd::simd<float, 64> up_weight_even =
+                        esimd_vec::e2m1<64>(up_wide & uint16_t{15});
+                    esimd::simd<float, 64> up_weight_odd =
+                        esimd_vec::e2m1<64>((up_wide >> 4) & uint16_t{15});
+                    esimd::simd<float, 64> gate_scales, up_scales;
+#pragma unroll
+                    for (int group = 0; group < 8; ++group) {
+                        int scale_group = k / 16 + group;
+                        size_t scale_base = (size_t)scale_group * N;
+                        float input_scale = nvfp4_decode_esimd::e4m3_scale(
+                            input_scales, scale_group);
+                        float gate_scale = nvfp4_decode_esimd::e4m3_scale(
+                            scales, scale_base + n);
+                        float up_scale = nvfp4_decode_esimd::e4m3_scale(
+                            scales, scale_base + intermediate + n);
+                        gate_scales.template select<8, 1>(group * 8) =
+                            input_scale * gate_scale;
+                        up_scales.template select<8, 1>(group * 8) =
+                            input_scale * up_scale;
+                    }
+                    gate_scales *= inverse_destination_scale;
+                    up_scales *= inverse_destination_scale;
+                    gate_even += input_even * gate_weight_even * gate_scales;
+                    gate_odd += input_odd * gate_weight_odd * gate_scales;
+                    up_even += input_even * up_weight_even * up_scales;
+                    up_odd += input_odd * up_weight_odd * up_scales;
+                }
+
+                float gate_value = nvfp4_decode_esimd::reduce64(gate_even) +
+                                   nvfp4_decode_esimd::reduce64(gate_odd);
+                float up_value = nvfp4_decode_esimd::reduce64(up_even) +
+                                 nvfp4_decode_esimd::reduce64(up_odd);
+                esimd::simd<float, 2> projected;
+                projected[0] = gate_value;
+                projected[1] = up_value;
+                esimd::simd<native_bf16, 2> projected_bf16 = projected;
+                esimd::simd<float, 2> rounded = projected_bf16;
+                gate_value = rounded[0];
+                up_value = rounded[1];
+                float sigmoid = 1.0f / (1.0f +
+                    esimd::exp(esimd::simd<float, 8>(-gate_value))[0]);
+                float result = gate_value * sigmoid * up_value;
+                auto* native_output =
+                    reinterpret_cast<native_bf16*>(activation + n);
+                esimd::block_store<native_bf16, 1>(
+                    native_output, esimd::simd<native_bf16, 1>(result));
+            });
+    });
+}
+
 inline int nvfp4_dpas_ksplit_factor(int m_tiles, int k_tiles, int n_tiles) {
     static int target = [] {
         const char* env = std::getenv("DIFF_NVFP4_DPAS_OCC");
@@ -557,7 +1169,6 @@ inline int nvfp4_dpas_ksplit_factor(int m_tiles, int k_tiles, int n_tiles) {
     if (ks > 32) ks = 32;
     return ks;
 }
-
 inline const uint16_t* nvfp4_dequant_lut(GpuEngine& ctx) {
     static std::vector<GpuBuffer<uint16_t>>* luts =
         new std::vector<GpuBuffer<uint16_t>>(GpuEngine::count());
@@ -574,7 +1185,6 @@ inline const uint16_t* nvfp4_dequant_lut(GpuEngine& ctx) {
     }
     return buf.data();
 }
-
 inline const uint8_t* nvfp4_coalesced_weight(const Nvfp4Linear& W,
                                              int K,
                                              int N,
@@ -601,7 +1211,6 @@ inline const uint8_t* nvfp4_coalesced_weight(const Nvfp4Linear& W,
     ctx.queue.wait();
     return dst;
 }
-
 inline diff_dpas_v8i nvfp4_dequant_b_coal(const uint8_t* wcoal,
                                           const uint16_t* lut,
                                           const uint8_t* wscale,
@@ -622,7 +1231,6 @@ inline diff_dpas_v8i nvfp4_dequant_b_coal(const uint8_t* wcoal,
     }
     return b;
 }
-
 inline void pack_bf16_to_nvfp4_grouped(
     sycl::queue& q,
     const bf16* src,
@@ -632,10 +1240,17 @@ inline void pack_bf16_to_nvfp4_grouped(
     int rows,
     const float* input_global_scale,
     uint8_t* packed,
-    uint8_t* scales)
+    uint8_t* scales,
+    Nvfp4GraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("grouped NVFP4 activation K must be divisible by 16");
     int G = K / 16;
+    nvfp4_sycl_graph_submit(q, 2, {
+        reinterpret_cast<uintptr_t>(src), reinterpret_cast<uintptr_t>(row_slot),
+        reinterpret_cast<uintptr_t>(row_expert), reinterpret_cast<uintptr_t>(input_global_scale),
+        reinterpret_cast<uintptr_t>(packed), reinterpret_cast<uintptr_t>(scales),
+        static_cast<uintptr_t>(K), static_cast<uintptr_t>(rows)
+    }, [&] {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<2>((size_t)rows, (size_t)G), [=](sycl::id<2> id) {
             int r = (int)id[0];
@@ -647,13 +1262,11 @@ inline void pack_bf16_to_nvfp4_grouped(
             uint8_t* packed_row = packed + (size_t)slot * (K / 2);
             uint8_t* scale_row = scales + (size_t)slot * G;
             float input_scale = input_global_scale[expert];
-
             float max_abs = 0.0f;
             for (int i = 0; i < 16; ++i) {
                 float v = bf16_to_float(src_row[k0 + i]);
                 max_abs = sycl::fmax(max_abs, sycl::fabs(v));
             }
-
             uint8_t scale_bits = 0;
             float scale = 0.0f;
             if (max_abs > 0.0f) {
@@ -662,7 +1275,6 @@ inline void pack_bf16_to_nvfp4_grouped(
                 scale = nvfp4_e4m3_to_float(scale_bits);
             }
             scale_row[g] = scale_bits;
-
             for (int i = 0; i < 16; i += 2) {
                 uint8_t lo = 0, hi = 0;
                 if (scale > 0.0f) {
@@ -675,8 +1287,177 @@ inline void pack_bf16_to_nvfp4_grouped(
             }
         });
     });
+    }, session);
 }
-
+// Fuse GeGLU (gate_up -> act) with the down-projection input pack (act -> nvfp4).
+// Eliminates the bf16 `act` intermediate and one kernel launch. Bit-exact with
+// the unfused sequence (geglu_strided_grouped + pack_bf16_to_nvfp4_grouped):
+// the geglu float result is rounded through bf16 (write->read round-trip)
+// before the identical per-16-group quant math.
+inline void geglu_pack_nvfp4_grouped(
+    sycl::queue& q,
+    const bf16* gate_up,          // [total_rows, 2*inter]  (gate | up), indexed by row_slot
+    int inter,
+    const int32_t* row_slot,      // [rows] -> slot offset in [0, total_rows)
+    const int32_t* row_expert,    // [rows] -> expert id (for input_global_scale)
+    int rows,
+    const float* input_global_scale,  // [num_experts] (down proj's per-expert input scale)
+    uint8_t* packed,              // [total_rows, inter/2]
+    uint8_t* scales,              // [total_rows, inter/16]
+    Nvfp4GraphSession* session = nullptr)
+{
+    if (inter % 16 != 0)
+        throw std::runtime_error("geglu_pack_nvfp4_grouped: inter must be divisible by 16");
+    constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
+    constexpr float COEF = 0.044715f;
+    int G = inter / 16;
+    nvfp4_sycl_graph_submit(q, 3, {
+        reinterpret_cast<uintptr_t>(gate_up), reinterpret_cast<uintptr_t>(row_slot),
+        reinterpret_cast<uintptr_t>(row_expert), reinterpret_cast<uintptr_t>(input_global_scale),
+        reinterpret_cast<uintptr_t>(packed), reinterpret_cast<uintptr_t>(scales),
+        static_cast<uintptr_t>(inter), static_cast<uintptr_t>(rows)
+    }, [&] {
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t)rows, (size_t)G), [=](sycl::id<2> id) {
+            int r = (int)id[0];
+            int g = (int)id[1];
+            int slot = row_slot[r];
+            int expert = row_expert[r];
+            int k0 = g * 16;
+            const bf16* row = gate_up + (size_t)slot * 2 * inter;
+            uint8_t* packed_row = packed + (size_t)slot * (inter / 2);
+            uint8_t* scale_row = scales + (size_t)slot * G;
+            float input_scale = input_global_scale[expert];
+            float vals[16];
+            float max_abs = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                float gg = bf16_to_float(row[k0 + i]);
+                float uu = bf16_to_float(row[inter + k0 + i]);
+                float inner = SQRT_2_OVER_PI * (gg + COEF * gg * gg * gg);
+                // Round-trip through bf16 matches the unfused write->read exactly.
+                float v = bf16_to_float(float_to_bf16(0.5f * gg * (1.0f + sycl::tanh(inner)) * uu));
+                vals[i] = v;
+                max_abs = sycl::fmax(max_abs, sycl::fabs(v));
+            }
+            uint8_t scale_bits = 0;
+            float scale = 0.0f;
+            if (max_abs > 0.0f) {
+                float raw_scale = max_abs * input_scale / 6.0f;
+                scale_bits = nvfp4_encode_e4m3_positive(raw_scale);
+                scale = nvfp4_e4m3_to_float(scale_bits);
+            }
+            scale_row[g] = scale_bits;
+            for (int i = 0; i < 16; i += 2) {
+                uint8_t lo = 0, hi = 0;
+                if (scale > 0.0f) {
+                    float v0 = vals[i] * input_scale / scale;
+                    float v1 = vals[i + 1] * input_scale / scale;
+                    lo = nvfp4_encode_e2m1(v0);
+                    hi = nvfp4_encode_e2m1(v1);
+                }
+                packed_row[(k0 + i) / 2] = lo | (hi << 4);
+            }
+        });
+    });
+    }, session);
+}
+// Fuse the hidden-state scatter with the gate/up-projection input pack.
+// Replaces: scatter hidden->Xe (bf16) + pack_bf16_to_nvfp4_grouped(Xe,...).
+// Iterates source assignments a in [0, A_all); for each valid a (slot >= 0),
+// gathers 16 bf16 hidden values for token (a / top_k) and packs them straight
+// to nvfp4 at slot[a]. Padding bucket rows (rounded rows beyond count[e],
+// which no valid a maps to) are NOT written here -- caller must memset
+// `packed`/`scales` to 0 first, which matches the unfused behavior (Xe is
+// memset to 0, so pack produces zeros for those rows).
+//
+// Device-routes mode only: relies on `slot` being the atomic-computed dest
+// slot per source assignment (0xFFFFFFFF/-1 for invalid assignments).
+inline void scatter_pack_nvfp4_grouped(
+    sycl::queue& q,
+    const bf16* hidden,          // [seq, H]
+    int H,
+    const int32_t* slot,         // [A_all] dest slot per source assignment
+    const int32_t* idx_dev,      // [A_all] expert id per source assignment
+    int first_expert,
+    const float* input_global_scale,  // [num_experts] (gate/up proj's per-expert input scale)
+    int A_all,
+    int top_k,
+    uint8_t* packed,             // [total_rows, H/2]
+    uint8_t* scales,             // [total_rows, H/16]
+    Nvfp4GraphSession* session = nullptr)
+{
+    if (H % 16 != 0)
+        throw std::runtime_error("scatter_pack_nvfp4_grouped: H must be divisible by 16");
+    int G = H / 16;
+    nvfp4_sycl_graph_submit(q, 4, {
+        reinterpret_cast<uintptr_t>(hidden), reinterpret_cast<uintptr_t>(slot),
+        reinterpret_cast<uintptr_t>(idx_dev), reinterpret_cast<uintptr_t>(input_global_scale),
+        reinterpret_cast<uintptr_t>(packed), reinterpret_cast<uintptr_t>(scales),
+        static_cast<uintptr_t>(H), static_cast<uintptr_t>(first_expert),
+        static_cast<uintptr_t>(A_all), static_cast<uintptr_t>(top_k)
+    }, [&] {
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t)A_all, (size_t)G), [=](sycl::id<2> id) {
+            int a = (int)id[0];
+            int g = (int)id[1];
+            int s = slot[a];
+            if (s < 0) return;                 // invalid assignment (slot init 0xFF)
+            int expert = idx_dev[a] - first_expert;
+            if (expert < 0) return;            // safety (slot<0 check above covers this)
+            int token = a / top_k;
+            int k0 = g * 16;
+            const bf16* src_row = hidden + (size_t)token * H;
+            uint8_t* packed_row = packed + (size_t)s * (H / 2);
+            uint8_t* scale_row = scales + (size_t)s * G;
+            float input_scale = input_global_scale[expert];
+            float max_abs = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                float v = bf16_to_float(src_row[k0 + i]);
+                max_abs = sycl::fmax(max_abs, sycl::fabs(v));
+            }
+            uint8_t scale_bits = 0;
+            float scale = 0.0f;
+            if (max_abs > 0.0f) {
+                float raw_scale = max_abs * input_scale / 6.0f;
+                scale_bits = nvfp4_encode_e4m3_positive(raw_scale);
+                scale = nvfp4_e4m3_to_float(scale_bits);
+            }
+            scale_row[g] = scale_bits;
+            for (int i = 0; i < 16; i += 2) {
+                uint8_t lo = 0, hi = 0;
+                if (scale > 0.0f) {
+                    float v0 = bf16_to_float(src_row[k0 + i]) * input_scale / scale;
+                    float v1 = bf16_to_float(src_row[k0 + i + 1]) * input_scale / scale;
+                    lo = nvfp4_encode_e2m1(v0);
+                    hi = nvfp4_encode_e2m1(v1);
+                }
+                packed_row[(k0 + i) / 2] = lo | (hi << 4);
+            }
+        });
+    });
+    }, session);
+}
+// ---------------------------------------------------------------------------
+// Grouped-GEMM entry points (custom scalar / DPAS gateup-geglu-pack / Xe2).
+// These submit raw sycl kernels via q.submit (no oneDNN primitive, no per-kernel
+// nvfp4_sycl_graph_submit wrapper). Session-awareness (Phase 2): each accepts a
+// trailing `session` pointer for API consistency with the pack functions and so
+// the orchestrator (Phase 3) can pass an active Nvfp4GraphSession through the
+// MoE call chain. They are NOT individually wrapped in nvfp4_sycl_graph_submit
+// (task Phase-2 option a) because:
+//   * Under an active session recording, bare q.submit calls are captured
+//     automatically as graph nodes (the canonical SYCL graph capture path;
+//     oneDNN primitives were separately confirmed capture-safe in Phase 0).
+//   * Wrapping them (option b) for per-kernel micro-caching on the no-session
+//     path is deferred: it requires (1) per-kernel capture+replay validation of
+//     these DPAS/custom ESIMD kernels (Phase 0 tested oneDNN only) and (2) the
+//     Phase-4 confirmation that the arena yields stable USM offsets across
+//     denoising steps (the existing pack micro-cache's captures=512/replays=4651
+//     ratio is empirical evidence this holds for the fixed-shape path). The
+//     `session` argument is therefore accepted but not yet consumed here; the
+//     registry backstop in nvfp4_sycl_graph_submit already protects any nested
+//     per-kernel capture from conflicting with an active session.
+// ---------------------------------------------------------------------------
 inline void matmul_nvfp4_grouped_custom(
     sycl::queue& q,
     const uint8_t* A_packed,
@@ -689,7 +1470,8 @@ inline void matmul_nvfp4_grouped_custom(
     const uint8_t* const* W_scale_by_expert,
     const float* const* dst_scale_by_expert,
     int N,
-    bf16* C)
+    bf16* C,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("grouped NVFP4 matmul K must be divisible by 16");
     int G = K / 16;
@@ -706,7 +1488,6 @@ inline void matmul_nvfp4_grouped_custom(
             const uint8_t* ws = W_scale_by_expert[expert];
             float inv_dst = 1.0f / dst_scale_by_expert[expert][0];
             float acc = 0.0f;
-
             for (int g = 0; g < G; ++g) {
                 float a_scale = nvfp4_e4m3_to_float(as_row[g]);
                 float w_scale = nvfp4_e4m3_to_float(ws[(size_t)g * N + n]);
@@ -727,7 +1508,6 @@ inline void matmul_nvfp4_grouped_custom(
         });
     });
 }
-
 inline void pack_bf16_to_nvfp4_grouped_rows(
     sycl::queue& q,
     const bf16* src,
@@ -736,29 +1516,33 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
     int max_rows,
     const float* input_global_scale,
     uint8_t* packed,
-    uint8_t* scales)
+    uint8_t* scales,
+    Nvfp4GraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("counted grouped NVFP4 activation K must be divisible by 16");
     int G = K / 16;
+    nvfp4_sycl_graph_submit(q, 5, {
+        reinterpret_cast<uintptr_t>(src), reinterpret_cast<uintptr_t>(row_expert),
+        reinterpret_cast<uintptr_t>(input_global_scale), reinterpret_cast<uintptr_t>(packed),
+        reinterpret_cast<uintptr_t>(scales), static_cast<uintptr_t>(K),
+        static_cast<uintptr_t>(max_rows)
+    }, [&] {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<2>((size_t)max_rows, (size_t)G), [=](sycl::id<2> id) {
             int row = (int)id[0];
             int g = (int)id[1];
             int expert = row_expert[row];
             if (expert < 0) return;
-
             int k0 = g * 16;
             const bf16* src_row = src + (size_t)row * K;
             uint8_t* packed_row = packed + (size_t)row * (K / 2);
             uint8_t* scale_row = scales + (size_t)row * G;
             float input_scale = input_global_scale[expert];
-
             float max_abs = 0.0f;
             for (int i = 0; i < 16; ++i) {
                 float v = bf16_to_float(src_row[k0 + i]);
                 max_abs = sycl::fmax(max_abs, sycl::fabs(v));
             }
-
             uint8_t scale_bits = 0;
             float scale = 0.0f;
             if (max_abs > 0.0f) {
@@ -767,7 +1551,6 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
                 scale = nvfp4_e4m3_to_float(scale_bits);
             }
             scale_row[g] = scale_bits;
-
             for (int i = 0; i < 16; i += 2) {
                 uint8_t lo = 0, hi = 0;
                 if (scale > 0.0f) {
@@ -780,8 +1563,179 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
             }
         });
     });
+    }, session);
 }
-
+// ============================================================================
+// Grouped DPAS gate/up + GeGLU + down-pack fused kernel.
+//
+// One custom grouped-DPAS kernel that replaces, in the hybrid path:
+//   (1) the per-expert oneDNN gate/up GEMM loop  -> `gu` [rows, 2*inter] bf16
+//   (2) geglu_strided_grouped                     -> `act` [rows, inter] bf16
+//   (3) pack_bf16_to_nvfp4_grouped               -> `act_packed`/`act_scale`
+// The `gu` and `act` bf16 intermediates are eliminated entirely; the GeGLU
+// result is packed straight to nvfp4 in the epilogue.
+//
+// Layout (matches the hybrid branch's compute_slot/compute_expert arrays,
+// built per-expert in 8-row-aligned runs so every 8-row m-tile shares one
+// expert):
+//   A_packed/A_scale : xe_packed/xe_scale at slot = row_slot[r]  (the scattered
+//                      hidden state, already nvfp4-packed by scatter+pack).
+//   W_coal_by_expert : nvfp4_coalesced_weight(gate_up_proj_fp4[e], H, 2*inter)
+//                      -- coalesced [2*inter, K] per expert (cached on the linear).
+//   W_scale_by_expert: gate_up_proj_fp4[e].weight_scale  ([G=K/16, 2*inter])
+//   dst_scale        : gate_up_proj_fp4[e].dst_scale ([1] f32)
+//   down_input_global_scale : down_proj_fp4[e].input_global_scale (for the pack)
+//
+// Grid: nd_range<2>({mtiles*KS, inter}, {KS, 16})  -- one WG per (8-row m-tile,
+// gate group g in [0, inter/16)). KS threads split K; 16 lanes own the 16
+// columns of the gate/up tile. Gate (cols ng..ng+15) and up (cols inter+ng..)
+// share the SAME a_tile (one input load, two DPAS -- llm-scaler gate+up fusion).
+// After SLM K-reduce, (s==0, lane==0) does GeGLU+pack for the 8 rows of group g.
+//
+// Selection: DIFF_NVFP4_EXPERT_KERNEL=grouped-dpas (new codepath; the hybrid
+// oneDNN loop remains the default and is untouched).
+// ============================================================================
+inline void matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,          // xe_packed [total_rows, H/2]
+    const uint8_t* A_scale,          // xe_scale  [total_rows, H/16]
+    int H,                            // K (in_features of gate/up)
+    const int32_t* row_slot,         // compute_slot [rows] -> slot offset
+    const int32_t* row_expert,       // compute_expert [rows] -> expert id
+    int rows,
+    const uint8_t* const* W_coal_by_expert,    // [localE] coalesced [2*inter, K]
+    const uint8_t* const* W_scale_by_expert,   // [localE] [G=K/16, 2*inter]
+    const float* const* dst_scale_by_expert,    // [localE] [1]
+    int inter,
+    const float* down_input_global_scale,      // [localE] down proj input scale
+    uint8_t* act_packed,              // [total_rows, inter/2]
+    uint8_t* act_scale,              // [total_rows, inter/16]
+    Nvfp4GraphSession* /*session*/ = nullptr)
+{
+    if (H % 16 != 0 || inter % 16 != 0)
+        throw std::runtime_error("grouped-dpas gateup: H and inter must be divisible by 16");
+    if (rows <= 0) return;
+    auto& q = ctx.queue;
+    int halfK = H / 2;
+    int ktiles = H / 16;
+    int mtiles = (rows + 7) / 8;
+    int G_inter = inter / 16;
+    int Ngu = 2 * inter;                 // gate|up out_features
+    int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, G_inter / 16);
+    const uint16_t* lut = nvfp4_dequant_lut(ctx);
+    q.submit([&](sycl::handler& h) {
+        // SLM holds two accumulators (gate, up): KS threads * 8 rows * 16 lanes.
+        sycl::local_accessor<float, 1> slm((size_t)2 * KS * 8 * 16, h);
+        float* slm_g = slm.get_pointer();
+        float* slm_u = slm_g + (size_t)KS * 8 * 16;
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)mtiles * KS, (size_t)inter),
+                              sycl::range<2>((size_t)KS, 16)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int m0   = (int)it.get_group(0) * 8;
+                int s    = (int)it.get_local_id(0);
+                int lane = (int)it.get_local_id(1);
+                int g    = (int)it.get_group(1);          // gate group index
+                int ng   = g * 16;
+                int gate_n = ng;                          // gate cols [ng, ng+16)
+                int up_n   = inter + ng;                  // up   cols [inter+ng, ...)
+                int r0    = m0;
+                int expert = (r0 < rows) ? row_expert[r0] : -1;
+                diff_dpas_v8f cg = {0,0,0,0,0,0,0,0};
+                diff_dpas_v8f cu = {0,0,0,0,0,0,0,0};
+                if (expert >= 0) {
+                    const uint8_t* wcoal = W_coal_by_expert[expert];
+                    const uint8_t* wscale = W_scale_by_expert[expert];
+                    for (int kt = s; kt < ktiles; kt += KS) {
+                        // Gate and up B-tiles (two coalesced dequants, same K-tile).
+                        diff_dpas_v8i bg = nvfp4_dequant_b_coal(
+                            wcoal, lut, wscale, gate_n, lane, kt, H, Ngu);
+                        diff_dpas_v8i bu = nvfp4_dequant_b_coal(
+                            wcoal, lut, wscale, up_n, lane, kt, H, Ngu);
+                        // A-tile: computed ONCE, shared by gate and up DPAS.
+                        int k0 = kt * 16;
+                        int kk = k0 + lane;
+                        diff_dpas_v8s a;
+                        for (int m = 0; m < 8; ++m) {
+                            int r = r0 + m;
+                            uint16_t av = 0;
+                            if (r < rows && row_expert[r] == expert) {
+                                uint8_t byte = A_packed[(size_t)row_slot[r] * halfK + kk / 2];
+                                uint8_t nib = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
+                                av = float_to_bf16(
+                                    nvfp4_e2m1_fast(nib) *
+                                    nvfp4_e4m3_fast(A_scale[(size_t)row_slot[r] * ktiles + kt]));
+                            }
+                            a[m] = (short)av;
+                        }
+                        cg = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                            16, a, bg, cg, kNvfp4DpasBF16);
+                        cu = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                            16, a, bu, cu, kNvfp4DpasBF16);
+                    }
+                }
+                // Stash partials (gate + up) for the K-split reduction.
+                for (int m = 0; m < 8; ++m) {
+                    slm_g[(size_t)(s * 8 + m) * 16 + lane] = cg[m];
+                    slm_u[(size_t)(s * 8 + m) * 16 + lane] = cu[m];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                // Epilogue: one thread (s==0, lane==0) reduces K, GeGLUs, and
+                // packs group g for the 8 rows. Pack needs all 16 GeGLU values
+                // per row (max_abs over the group), so a single thread does it
+                // rather than the 16-lane parallel write used by the plain GEMM.
+                if (s == 0 && lane == 0 && expert >= 0) {
+                    float inv_dst = 1.0f / dst_scale_by_expert[expert][0];
+                    float down_in_scale = down_input_global_scale[expert];
+                    constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
+                    constexpr float COEF = 0.044715f;
+                    for (int m = 0; m < 8; ++m) {
+                        int r = r0 + m;
+                        if (r >= rows || row_expert[r] != expert) continue;
+                        int slot = row_slot[r];
+                        float vals[16];
+                        float max_abs = 0.0f;
+                        for (int i = 0; i < 16; ++i) {
+                            float gg = 0.0f, uu = 0.0f;
+                            for (int ss = 0; ss < KS; ++ss) {
+                                gg += slm_g[(size_t)(ss * 8 + m) * 16 + i];
+                                uu += slm_u[(size_t)(ss * 8 + m) * 16 + i];
+                            }
+                            gg *= inv_dst;
+                            uu *= inv_dst;
+                            float inner = SQRT_2_OVER_PI * (gg + COEF * gg * gg * gg);
+                            // Round-trip through bf16 matches the unfused path
+                            // (gu bf16 -> geglu reads bf16).
+                            float v = bf16_to_float(float_to_bf16(
+                                0.5f * gg * (1.0f + sycl::tanh(inner)) * uu));
+                            vals[i] = v;
+                            max_abs = sycl::fmax(max_abs, sycl::fabs(v));
+                        }
+                        uint8_t scale_bits = 0;
+                        float scale = 0.0f;
+                        if (max_abs > 0.0f) {
+                            float raw_scale = max_abs * down_in_scale / 6.0f;
+                            scale_bits = nvfp4_encode_e4m3_positive(raw_scale);
+                            scale = nvfp4_e4m3_to_float(scale_bits);
+                        }
+                        act_scale[(size_t)slot * G_inter + g] = scale_bits;
+                        uint8_t* packed_row = act_packed + (size_t)slot * (inter / 2);
+                        int k0 = ng;
+                        for (int i = 0; i < 16; i += 2) {
+                            uint8_t lo = 0, hi = 0;
+                            if (scale > 0.0f) {
+                                float v0 = vals[i] * down_in_scale / scale;
+                                float v1 = vals[i + 1] * down_in_scale / scale;
+                                lo = nvfp4_encode_e2m1(v0);
+                                hi = nvfp4_encode_e2m1(v1);
+                            }
+                            packed_row[(k0 + i) / 2] = lo | (hi << 4);
+                        }
+                    }
+                }
+            });
+    });
+}
 inline void matmul_nvfp4_grouped_rows_custom(
     sycl::queue& q,
     const uint8_t* A_packed,
@@ -793,7 +1747,8 @@ inline void matmul_nvfp4_grouped_rows_custom(
     const uint8_t* const* W_scale_by_expert,
     const float* const* dst_scale_by_expert,
     int N,
-    bf16* C)
+    bf16* C,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("counted grouped NVFP4 matmul K must be divisible by 16");
     int G = K / 16;
@@ -804,14 +1759,12 @@ inline void matmul_nvfp4_grouped_rows_custom(
             int n = (int)id[1];
             int expert = row_expert[row];
             if (expert < 0) return;
-
             const uint8_t* a_row = A_packed + (size_t)row * halfK;
             const uint8_t* as_row = A_scale + (size_t)row * G;
             const uint8_t* w = W_packed_by_expert[expert];
             const uint8_t* ws = W_scale_by_expert[expert];
             float inv_dst = 1.0f / dst_scale_by_expert[expert][0];
             float acc = 0.0f;
-
             for (int g = 0; g < G; ++g) {
                 float a_scale = nvfp4_e4m3_to_float(as_row[g]);
                 float w_scale = nvfp4_e4m3_to_float(ws[(size_t)g * N + n]);
@@ -832,7 +1785,6 @@ inline void matmul_nvfp4_grouped_rows_custom(
         });
     });
 }
-
 inline void matmul_nvfp4_grouped_rows_xe2(
     GpuEngine& ctx,
     const uint8_t* A_packed,
@@ -844,12 +1796,12 @@ inline void matmul_nvfp4_grouped_rows_xe2(
     const uint8_t* const* W_scale_by_expert,
     const float* const* dst_scale_by_expert,
     int N,
-    bf16* C)
+    bf16* C,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0 || N % 16 != 0)
         throw std::runtime_error("xe2 grouped NVFP4 matmul requires K%16 and N%16");
     if (max_rows <= 0) return;
-
     auto& q = ctx.queue;
     int halfK = K / 2;
     int ktiles = K / 16;
@@ -857,7 +1809,6 @@ inline void matmul_nvfp4_grouped_rows_xe2(
     int ntiles = N / 16;
     int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, ntiles);
     const uint16_t* lut = nvfp4_dequant_lut(ctx);
-
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm((size_t)KS * 8 * 16, h);
         h.parallel_for(
@@ -869,7 +1820,6 @@ inline void matmul_nvfp4_grouped_rows_xe2(
                 int lane = (int)it.get_local_id(1);
                 int n = (int)it.get_group(1) * 16 + lane;
                 int expert = (m0 < max_rows) ? row_expert[m0] : -1;
-
                 diff_dpas_v8f c = {0, 0, 0, 0, 0, 0, 0, 0};
                 if (expert >= 0) {
                     const uint8_t* wcoal = W_coal_by_expert[expert];
@@ -896,11 +1846,9 @@ inline void matmul_nvfp4_grouped_rows_xe2(
                             16, a, b, c, kNvfp4DpasBF16);
                     }
                 }
-
                 for (int m = 0; m < 8; ++m)
                     slm[(size_t)(s * 8 + m) * 16 + lane] = c[m];
                 it.barrier(sycl::access::fence_space::local_space);
-
                 if (s == 0 && expert >= 0) {
                     float inv_dst = 1.0f / dst_scale_by_expert[expert][0];
                     for (int m = 0; m < 8; ++m) {
@@ -916,100 +1864,212 @@ inline void matmul_nvfp4_grouped_rows_xe2(
     });
 }
 
-// xe2v2: per-expert DPAS grouped NVFP4 GEMM, aligned to the xe2 idiom.
-// Replaces the k-split + SLM-reduction + global-LUT dequant of the v1 xe2
-// kernel with a single-subgroup, register-blocked-M design (cf. the q8
-// grouped-expert kernel): one work-group per (expert, N/16 tile), BLK M-tiles
-// resident in registers, B dequanted once per k-step and reused across BLK
-// rows, arithmetic e2m1*e4m3 dequant (no lookup table, no global traffic).
-// Per-expert work-groups make the row->expert mapping exact (no tile straddles
-// into another expert's weights), so correctness does not rely on per-expert row
-// padding. Gated by DIFF_NVFP4_GROUPED_GEMM=xe2v2 for A/B vs hybrid/oneDNN.
-inline void matmul_nvfp4_grouped_rows_xe2_v2(
+// Dense counterpart of matmul_nvfp4_grouped_rows_xe2. This keeps the
+// checkpoint and activations packed as NVFP4, dequantizes 16-wide K tiles to
+// BF16 registers, and feeds the Xe2 subgroup DPAS intrinsic. It is deliberately
+// a separate entry point: architecture code selects it through a descriptive
+// environment variable so the oneDNN path remains available for A/B checks.
+inline void matmul_nvfp4_packed_xe2(
     GpuEngine& ctx,
     const uint8_t* A_packed,
     const uint8_t* A_scale,
+    int M,
     int K,
-    const int32_t* expert_offsets,
-    const int32_t* rows_per_expert,
-    int localE,
-    const uint8_t* const* W_packed_by_expert,
-    const uint8_t* const* W_scale_by_expert,
-    const float* const* dst_scale_by_expert,
-    int N,
-    bf16* C)
-{
+    const Nvfp4Linear& W,
+    bf16* C) {
+    int N = W.out_features;
+    if (W.in_features != K)
+        throw std::runtime_error("matmul_nvfp4_packed_xe2: K does not match weight shape");
     if (K % 16 != 0 || N % 16 != 0)
-        throw std::runtime_error("xe2v2 grouped NVFP4 matmul requires K%16 and N%16");
-    if (localE <= 0) return;
-    constexpr int BLK = 4;
+        throw std::runtime_error("matmul_nvfp4_packed_xe2 requires K%16 and N%16");
+    if (M <= 0) return;
+
     auto& q = ctx.queue;
     int halfK = K / 2;
     int ktiles = K / 16;
+    int mtiles = (M + 7) / 8;
     int ntiles = N / 16;
+    int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, ntiles);
+    const uint16_t* lut = nvfp4_dequant_lut(ctx);
+    const uint8_t* wcoal = nvfp4_coalesced_weight(W, K, N, ctx);
+    const uint8_t* wscale = W.weight_scale.data();
+    const float* dst_scale = W.dst_scale.data();
 
     q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm((size_t)KS * 8 * 16, h);
         h.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)ntiles * 16),
-                              sycl::range<2>(1, 16)),
+            sycl::nd_range<2>(sycl::range<2>((size_t)mtiles * KS, (size_t)N),
+                              sycl::range<2>((size_t)KS, (size_t)16)),
             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                int e = (int)it.get_group(0);
-                int lane = (int)it.get_local_id(1);
-                int n = (int)it.get_group(1) * 16 + lane;
-                int offset = expert_offsets[e];
-                int count = rows_per_expert[e];
-                if (count <= 0) return;
-                int mt = (count + 7) / 8;
-
-                const uint8_t* w = W_packed_by_expert[e];
-                const uint8_t* ws = W_scale_by_expert[e];
-                const uint8_t* wrow_base = w + (size_t)n * halfK;
-                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
-
-                for (int tile0 = 0; tile0 < mt; tile0 += BLK) {
-                    diff_dpas_v8f c[BLK];
-                    for (int t = 0; t < BLK; ++t) c[t] = diff_dpas_v8f{0, 0, 0, 0, 0, 0, 0, 0};
-                    for (int kt = 0; kt < ktiles; ++kt) {
-                        int k0 = kt * 16;
-                        float wscale = nvfp4_e4m3_fast(ws[(size_t)kt * N + n]);
-                        const uint8_t* wrow = wrow_base + k0 / 2;
-                        diff_dpas_v8i b;
-                        for (int j = 0; j < 8; ++j) {
-                            uint8_t by = wrow[j];
-                            uint16_t lo = float_to_bf16(nvfp4_e2m1_fast(by & 0x0f) * wscale);
-                            uint16_t hi = float_to_bf16(nvfp4_e2m1_fast(by >> 4) * wscale);
-                            b[j] = (int)((uint32_t)lo | ((uint32_t)hi << 16));
+                int m0 = static_cast<int>(it.get_group(0)) * 8;
+                int s = static_cast<int>(it.get_local_id(0));
+                int lane = static_cast<int>(it.get_local_id(1));
+                int n = static_cast<int>(it.get_group(1)) * 16 + lane;
+                diff_dpas_v8f accum = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (int kt = s; kt < ktiles; kt += KS) {
+                    diff_dpas_v8i b = nvfp4_dequant_b_coal(
+                        wcoal, lut, wscale, n, lane, kt, K, N);
+                    int kk = kt * 16 + lane;
+                    diff_dpas_v8s a;
+                    for (int m = 0; m < 8; ++m) {
+                        int row = m0 + m;
+                        uint16_t av = 0;
+                        if (row < M) {
+                            uint8_t byte = A_packed[(size_t)row * halfK + kk / 2];
+                            uint8_t nib = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
+                            av = float_to_bf16(
+                                nvfp4_e2m1_fast(nib) *
+                                nvfp4_e4m3_fast(A_scale[(size_t)row * ktiles + kt]));
                         }
-                        int kk = k0 + lane;
-                        for (int t = 0; t < BLK; ++t) {
-                            int tile = tile0 + t;
-                            if (tile >= mt) break;  // uniform across the subgroup
-                            int m0 = offset + tile * 8;
-                            diff_dpas_v8s a;
-                            for (int m = 0; m < 8; ++m) {
-                                int row = m0 + m;
-                                uint16_t av = 0;
-                                if ((row - offset) < count) {
-                                    uint8_t byte = A_packed[(size_t)row * halfK + kk / 2];
-                                    uint8_t nib = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
-                                    av = float_to_bf16(
-                                        nvfp4_e2m1_fast(nib) *
-                                        nvfp4_e4m3_fast(A_scale[(size_t)row * ktiles + kt]));
-                                }
-                                a[m] = (short)av;
-                            }
-                            c[t] = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
-                                16, a, b, c[t], kNvfp4DpasBF16);
-                        }
+                        a[m] = static_cast<short>(av);
                     }
-                    for (int t = 0; t < BLK; ++t) {
-                        int tile = tile0 + t;
-                        if (tile >= mt) break;
-                        int m0 = offset + tile * 8;
-                        for (int m = 0; m < 8; ++m) {
-                            int row = m0 + m;
-                            if ((row - offset) < count)
-                                C[(size_t)row * N + n] = float_to_bf16(c[t][m] * inv_dst);
+                    accum = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                        16, a, b, accum, kNvfp4DpasBF16);
+                }
+                for (int m = 0; m < 8; ++m)
+                    slm[(size_t)(s * 8 + m) * 16 + lane] = accum[m];
+                it.barrier(sycl::access::fence_space::local_space);
+                if (s == 0) {
+                    float inv_dst = 1.0f / dst_scale[0];
+                    for (int m = 0; m < 8; ++m) {
+                        int row = m0 + m;
+                        if (row >= M) continue;
+                        float sum = 0.0f;
+                        for (int ss = 0; ss < KS; ++ss)
+                            sum += slm[(size_t)(ss * 8 + m) * 16 + lane];
+                        C[(size_t)row * N + n] = float_to_bf16(sum * inv_dst);
+                    }
+                }
+            });
+    });
+}
+
+// Fused dense gate/up DPAS + SwiGLU + NVFP4 pack for the following down
+// projection. Gate and up occupy the two halves of W_gate_up's output rows.
+// The input activation tile is loaded once and shared by both DPAS operations.
+inline void matmul_nvfp4_swiglu_pack_xe2(
+    GpuEngine& ctx,
+    const uint8_t* A_packed,
+    const uint8_t* A_scale,
+    int M,
+    int K,
+    const Nvfp4Linear& W_gate_up,
+    const Nvfp4Linear& W_down,
+    uint8_t* out_packed,
+    uint8_t* out_scale) {
+    if (W_gate_up.in_features != K || W_gate_up.out_features % 2 != 0)
+        throw std::runtime_error("matmul_nvfp4_swiglu_pack_xe2: invalid gate/up shape");
+    int inter = W_gate_up.out_features / 2;
+    if (W_down.in_features != inter)
+        throw std::runtime_error("matmul_nvfp4_swiglu_pack_xe2: down K mismatch");
+    if (K % 16 != 0 || inter % 16 != 0)
+        throw std::runtime_error("matmul_nvfp4_swiglu_pack_xe2 requires K/inter divisible by 16");
+    if (M <= 0) return;
+
+    auto& q = ctx.queue;
+    int halfK = K / 2;
+    int ktiles = K / 16;
+    int mtiles = (M + 7) / 8;
+    int groups = inter / 16;
+    int KS = nvfp4_dpas_ksplit_factor(mtiles, ktiles, groups);
+    const uint16_t* lut = nvfp4_dequant_lut(ctx);
+    const uint8_t* wcoal = nvfp4_coalesced_weight(
+        W_gate_up, K, W_gate_up.out_features, ctx);
+    const uint8_t* wscale = W_gate_up.weight_scale.data();
+    const float* gate_up_dst_scale = W_gate_up.dst_scale.data();
+    float down_input_global_scale = W_down.input_global_scale;
+    int Ngu = W_gate_up.out_features;
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm((size_t)2 * KS * 8 * 16, h);
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t)mtiles * KS, (size_t)inter),
+                              sycl::range<2>((size_t)KS, (size_t)16)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                int m0 = static_cast<int>(it.get_group(0)) * 8;
+                int split = static_cast<int>(it.get_local_id(0));
+                int lane = static_cast<int>(it.get_local_id(1));
+                int group = static_cast<int>(it.get_group(1));
+                int n0 = group * 16;
+                diff_dpas_v8f gate_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                diff_dpas_v8f up_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (int kt = split; kt < ktiles; kt += KS) {
+                    diff_dpas_v8i gate_b = nvfp4_dequant_b_coal(
+                        wcoal, lut, wscale, n0, lane, kt, K, Ngu);
+                    diff_dpas_v8i up_b = nvfp4_dequant_b_coal(
+                        wcoal, lut, wscale, inter + n0, lane, kt, K, Ngu);
+                    int kk = kt * 16 + lane;
+                    diff_dpas_v8s a;
+                    for (int m = 0; m < 8; ++m) {
+                        int row = m0 + m;
+                        uint16_t av = 0;
+                        if (row < M) {
+                            uint8_t byte = A_packed[(size_t)row * halfK + kk / 2];
+                            uint8_t nib = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
+                            av = float_to_bf16(
+                                nvfp4_e2m1_fast(nib) *
+                                nvfp4_e4m3_fast(A_scale[(size_t)row * ktiles + kt]));
+                        }
+                        a[m] = static_cast<short>(av);
+                    }
+                    gate_acc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                        16, a, gate_b, gate_acc, kNvfp4DpasBF16);
+                    up_acc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                        16, a, up_b, up_acc, kNvfp4DpasBF16);
+                }
+
+                size_t plane = (size_t)KS * 8 * 16;
+                for (int m = 0; m < 8; ++m) {
+                    size_t at = (size_t)(split * 8 + m) * 16 + lane;
+                    slm[at] = gate_acc[m];
+                    slm[plane + at] = up_acc[m];
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                if (split == 0 && lane == 0) {
+                    float inv_dst = 1.0f / gate_up_dst_scale[0];
+                    for (int m = 0; m < 8; ++m) {
+                        int row = m0 + m;
+                        if (row >= M) continue;
+                        float values[16];
+                        float max_abs = 0.0f;
+                        for (int i = 0; i < 16; ++i) {
+                            float gate = 0.0f;
+                            float up = 0.0f;
+                            for (int s = 0; s < KS; ++s) {
+                                size_t at = (size_t)(s * 8 + m) * 16 + i;
+                                gate += slm[at];
+                                up += slm[plane + at];
+                            }
+                            gate *= inv_dst;
+                            up *= inv_dst;
+                            // Match the unfused BF16 boundary before SwiGLU.
+                            gate = bf16_to_float(float_to_bf16(gate));
+                            up = bf16_to_float(float_to_bf16(up));
+                            float value = gate / (1.0f + sycl::exp(-gate)) * up;
+                            value = bf16_to_float(float_to_bf16(value));
+                            values[i] = value;
+                            max_abs = sycl::fmax(max_abs, sycl::fabs(value));
+                        }
+                        uint8_t scale_bits = 0;
+                        float scale = 0.0f;
+                        if (max_abs > 0.0f) {
+                            scale_bits = nvfp4_encode_e4m3_positive(
+                                max_abs * down_input_global_scale / 6.0f);
+                            scale = nvfp4_e4m3_fast(scale_bits);
+                        }
+                        out_scale[(size_t)row * groups + group] = scale_bits;
+                        uint8_t* packed_row = out_packed + (size_t)row * (inter / 2);
+                        for (int i = 0; i < 16; i += 2) {
+                            uint8_t lo = 0;
+                            uint8_t hi = 0;
+                            if (scale > 0.0f) {
+                                lo = nvfp4_encode_e2m1(
+                                    values[i] * down_input_global_scale / scale);
+                                hi = nvfp4_encode_e2m1(
+                                    values[i + 1] * down_input_global_scale / scale);
+                            }
+                            packed_row[(n0 + i) / 2] = lo | (hi << 4);
                         }
                     }
                 }
@@ -1017,786 +2077,19 @@ inline void matmul_nvfp4_grouped_rows_xe2_v2(
     });
 }
 
-// xe2v3: block-loaded B via ESIMD lsc_load_2d + ESIMD xmx::dpas (FULL ESIMD — no
-// SPIRV __spirv_SubgroupMatrixMultiplyAccumulateINTEL, whose spir64 codegen would
-// clash with ESIMD's genx64 codegen and fail at link/runtime). One work-group per
-// (expert, n-tile), 16 lanes. dpas is PER-LANE REPLICATED (each lane holds the
-// full 8x16 result tile), so the 16 lanes parallelise across m-tiles: lane l owns
-// m-tile (tile0+l), all sharing the same replicated block-loaded B. B is fetched
-// from the coalesced layout [n/16][k/16][16][8] with one lsc_load_2d per (n_tile,
-// k_tile). Arithmetic e2m1*e4m3 dequant (no global LUT).
-//   B VNNI layout (validated by src/nvfp4_dpas_probe.cpp, layout L2):
-//     B[(kp*N + n)*2 + kparity], kp=k/2, kparity 0=even(low nibble)/1=odd(high).
-//   A row-major [M,K]: A[m*K+k];  C row-major [M,N]: C[m*N+n].
-inline void matmul_nvfp4_grouped_rows_xe2_v3(
-    GpuEngine& ctx,
-    const uint8_t* A_packed,
-    const uint8_t* A_scale,
+inline void matmul_nvfp4_xe2(
+    const bf16* A,
+    int M,
     int K,
-    const int32_t* expert_offsets,
-    const int32_t* rows_per_expert,
-    int localE,
-    const uint8_t* const* W_coal_by_expert,
-    const uint8_t* const* W_scale_by_expert,
-    const float* const* dst_scale_by_expert,
-    int N,
-    bf16* C)
-{
-    if (K % 16 != 0 || N % 16 != 0)
-        throw std::runtime_error("xe2v3 grouped NVFP4 matmul requires K%16 and N%16");
-    if (localE <= 0) return;
-    namespace esimd = sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
-    namespace esimd_x = sycl::ext::intel::experimental::esimd;
-    using bf16_t = sycl::ext::oneapi::bfloat16;
-    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
-    constexpr int TN = 16;  // dpas N (cols) per tile  = ExecutionSize
-    constexpr int TK = 16;  // dpas K (contraction)    = SystolicDepth * OpsPerChannel
-    constexpr int LANES = 16;
-    constexpr int BW = 8;   // n-row width in bytes (TK/2 nibble-pairs)
-    // Block-load geometry: lsc_load_2d has a minimum pitch of 16 bytes, so an
-    // 8-byte-wide row cannot be loaded at pitch 8 (the HW rounds pitch up to 16,
-    // reading every other n-row). Load 16-byte rows x 8 rows instead (pitch 16 ==
-    // contiguous for the 128-byte slab). Each register row r holds TWO 8-byte
-    // n-rows: col 0..7 -> n=2r, col 8..15 -> n=2r+1. (Isolate probe: a=b=c=0.)
-    constexpr int LBW = 16;
-    constexpr int LBH = 8;
-    auto& q = ctx.queue;
-    int halfK = K / 2;
-    int ktiles = K / TK;
-    int ntiles = N / TN;
-
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)ntiles * LANES),
-                              sycl::range<2>(1, LANES)),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                int e = (int)it.get_group(0);
-                int lane = (int)it.get_local_id(1);
-                int nt = (int)it.get_group(1);
-                int offset = expert_offsets[e];
-                int count = rows_per_expert[e];
-                if (count <= 0) return;
-                int mt = (count + TM - 1) / TM;
-
-                const uint8_t* wcoal = W_coal_by_expert[e];
-                const uint8_t* ws = W_scale_by_expert[e];
-                // base of this n_tile's coalesced region: [n_tile][k_tile][16][8],
-                // each (n_tile, k_tile) slab is 128 contiguous bytes (16 rows x 8).
-                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
-                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
-
-                for (int tile0 = 0; tile0 < mt; tile0 += LANES) {
-                    int m_tile = tile0 + lane;        // each lane owns one m-tile
-                    bool active = (m_tile < mt);
-                    esimd::simd<float, TM * TN> c(0.0f);
-                    for (int kt = 0; kt < ktiles; ++kt) {
-                        // --- B: block-load (n_tile, k_tile) slab (replicated) ---
-                        // LBW=16, LBH=8: register row r -> n=2r (col0..7), n=2r+1
-                        // (col8..15); each byte holds k=2kp (low) & k=2kp+1 (high).
-                        auto v = esimd_x::lsc_load_2d<uint8_t, LBW, LBH, /*NBlocks*/1,
-                                                       /*Transposed*/false,
-                                                       /*Transformed*/false>(
-                            wcoal_nt + (size_t)kt * 128,
-                            LBW - 1, LBH - 1, LBW - 1, 0, 0);
-                        // Replicated load: every lane holds the full slab. Dequant to
-                        // VNNI layout L2: b[(kp*N+n)*2 + kparity], kparity 0=even
-                        // (low nibble), 1=odd (high nibble). Validated by dpas probe.
-                        esimd::simd<bf16_t, TK * TN> b;
-                        #pragma unroll
-                        for (int r = 0; r < LBH; ++r) {
-                            #pragma unroll
-                            for (int c = 0; c < LBW; ++c) {
-                                int n = (c < BW) ? 2 * r : 2 * r + 1;
-                                int kp = c & (BW - 1);
-                                uint8_t byte = v[r * LBW + c];
-                                float wscale =
-                                    nvfp4_e4m3_fast(ws[(size_t)kt * N + nt * TN + n]);
-                                float lo = nvfp4_e2m1_fast(byte & 0x0f) * wscale;
-                                float hi = nvfp4_e2m1_fast(byte >> 4) * wscale;
-                                b[(kp * TN + n) * 2 + 0] = bf16_t(lo);
-                                b[(kp * TN + n) * 2 + 1] = bf16_t(hi);
-                            }
-                        }
-                        // --- A: this lane's m-tile, row-major [TM, TK] ---
-                        esimd::simd<bf16_t, TM * TK> a;
-                        #pragma unroll
-                        for (int m = 0; m < TM; ++m) {
-                            int row = offset + m_tile * TM + m;
-                            bool ok = active && ((row - offset) < count);
-                            if (ok) {
-                                float ascale =
-                                    nvfp4_e4m3_fast(A_scale[(size_t)row * ktiles + kt]);
-                                #pragma unroll
-                                for (int k = 0; k < TK; ++k) {
-                                uint8_t byte = A_packed[(size_t)row * halfK + (kt * TK + k) / 2];
-                                uint8_t nib = (k & 1) ? ((byte >> 4) & 0x0f)
-                                                      : (byte & 0x0f);
-                                    a[m * TK + k] =
-                                        bf16_t(nvfp4_e2m1_fast(nib) * ascale);
-                                }
-                            } else {
-                                #pragma unroll
-                                for (int k = 0; k < TK; ++k) a[m * TK + k] = bf16_t(0.0f);
-                            }
-                        }
-                        // --- C += A @ B (dpas: Result = C + A*B; B is VNNI) ---
-                        c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
-                    }
-                    // --- store this lane's 8x16 result tile ---
-                    if (active) {
-                        #pragma unroll
-                        for (int m = 0; m < TM; ++m) {
-                            int row = offset + m_tile * TM + m;
-                            if ((row - offset) >= count) continue;
-                            #pragma unroll
-                            for (int n = 0; n < TN; ++n)
-                                C[(size_t)row * N + nt * TN + n] =
-                                    float_to_bf16(c[m * TN + n] * inv_dst);
-                        }
-                    }
-                }
-            });
-    });
-}
-
-// xe2v4: vectorized-dequant rewrite of v3. Same launch geometry and lane->m-tile
-// mapping (one WG per (expert, n-tile), 16 lanes, B block-loaded+replicated, lanes
-// split the m-tiles), but the e2m1/e4m3 dequant is vectorized over ESIMD simd ops
-// instead of per-byte scalar loops — the dominant cost in v3. B is transposed
-// (n-outer -> kp-outer) via 8 strided selects to match dpas VNNI layout L2 (the
-// only layout the dpas probe accepted). The block-load register linear order
-// equals the flat slab order: v[i]=byte(n=i/8, kp=i%8), so the transpose is a
-// 16x8 -> 8x16 matrix transpose (kp/n field swap), not a gather.
-inline void matmul_nvfp4_grouped_rows_xe2_v4(
-    GpuEngine& ctx,
-    const uint8_t* A_packed,
-    const uint8_t* A_scale,
-    int K,
-    const int32_t* expert_offsets,
-    const int32_t* rows_per_expert,
-    int localE,
-    const uint8_t* const* W_coal_by_expert,
-    const uint8_t* const* W_scale_by_expert,
-    const float* const* dst_scale_by_expert,
-    int N,
-    bf16* C)
-{
-    if (K % 16 != 0 || N % 16 != 0)
-        throw std::runtime_error("xe2v4 grouped NVFP4 matmul requires K%16 and N%16");
-    if (localE <= 0) return;
-    namespace esimd = sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
-    namespace esimd_x = sycl::ext::intel::experimental::esimd;
-    using bf16_t = sycl::ext::oneapi::bfloat16;
-    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
-    constexpr int TN = 16;  // dpas N (cols) per tile  = ExecutionSize
-    constexpr int TK = 16;  // dpas K (contraction)    = SystolicDepth * OpsPerChannel
-    constexpr int LANES = 16;
-    constexpr int LBW = 16;  // block-load width (bytes); pitch==width => contiguous 128B
-    constexpr int LBH = 8;   // block-load height (rows)
-    auto& q = ctx.queue;
-    int halfK = K / 2;
-    int ktiles = K / TK;
-    int ntiles = N / TN;
-
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)ntiles * LANES),
-                              sycl::range<2>(1, LANES)),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                int e = (int)it.get_group(0);
-                int lane = (int)it.get_local_id(1);
-                int nt = (int)it.get_group(1);
-                int offset = expert_offsets[e];
-                int count = rows_per_expert[e];
-                if (count <= 0) return;
-                int mt = (count + TM - 1) / TM;
-
-                const uint8_t* wcoal = W_coal_by_expert[e];
-                const uint8_t* ws = W_scale_by_expert[e];
-                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
-                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
-
-                for (int tile0 = 0; tile0 < mt; tile0 += LANES) {
-                    int m_tile = tile0 + lane;        // each lane owns one m-tile
-                    bool active = (m_tile < mt);
-                    esimd::simd<float, TM * TN> c(0.0f);
-                    for (int kt = 0; kt < ktiles; ++kt) {
-                        // --- B: block-load the (n_tile,k_tile) slab (replicated) ---
-                        auto v = esimd_x::lsc_load_2d<uint8_t, LBW, LBH, /*NBlocks*/1,
-                                                       /*Transposed*/false,
-                                                       /*Transformed*/false>(
-                            wcoal_nt + (size_t)kt * 128,
-                            LBW - 1, LBH - 1, LBW - 1, 0, 0);
-                        // Transpose n-outer -> kp-outer: bt[kp*16+n] = v[n*8+kp].
-                        esimd::simd<uint8_t, 128> bt;
-                        #pragma unroll
-                        for (int kp = 0; kp < 8; ++kp)
-                            bt.select<16, 1>(kp * 16) = v.select<16, 8>(kp);
-                        // Dequant the 16 e4m3 weight scales for this n-tile
-                        // (contiguous in memory) via a single vectorized load+dequant.
-                        auto wscale_raw = esimd::block_load<uint8_t, 16>(
-                            ws + (size_t)kt * N + (size_t)nt * TN);
-                        auto wscale_deq = esimd_vec::e4m3<16>(
-                            esimd::convert<uint16_t>(wscale_raw));
-                        // Replicate to 128: scale[kp*16+n] = wscale_deq[n].
-                        esimd::simd<float, 128> scale;
-                        #pragma unroll
-                        for (int kp = 0; kp < 8; ++kp)
-                            scale.select<16, 1>(kp * 16) = wscale_deq;
-                        // Dequant lo/hi nibbles, scale, convert to bf16, interleave
-                        // into VNNI L2: b[(kp*16+n)*2+kparity]. Process lo then hi so
-                        // both float tiles are not live simultaneously.
-                        esimd::simd<bf16_t, TK * TN> b;
-                        {
-                            auto lo_nib = esimd::convert<uint16_t>(
-                                bt & esimd::simd<uint8_t, 128>(0x0f));
-                            auto lo_f = esimd_vec::e2m1<128>(lo_nib) * scale;
-                            b.select<128, 2>(0) = esimd::convert<bf16_t>(lo_f);
-                        }
-                        {
-                            auto hi_nib = esimd::convert<uint16_t>(
-                                bt >> 4);
-                            auto hi_f = esimd_vec::e2m1<128>(hi_nib) * scale;
-                            b.select<128, 2>(1) = esimd::convert<bf16_t>(hi_f);
-                        }
-                        // --- A: this lane's m-tile, 8 rows x 8 bytes (row-major) ---
-                        esimd::simd<bf16_t, TM * TK> a;
-                        if (active) {
-                            esimd::simd<uint8_t, 64> abytes;
-                            esimd::simd<uint8_t, TM> ascale_raw(0);
-                            #pragma unroll
-                            for (int m = 0; m < TM; ++m) {
-                                int row = offset + m_tile * TM + m;
-                                bool ok = (row - offset) < count;
-                                int safe_row = ok ? row : offset;
-                                const uint8_t* rp = A_packed +
-                                    (size_t)safe_row * halfK + (size_t)kt * (TK / 2);
-                                abytes.select<8, 1>(m * 8) =
-                                    esimd::block_load<uint8_t, 8>(rp);
-                                if (ok) ascale_raw[m] =
-                                    A_scale[(size_t)safe_row * ktiles + kt];
-                            }
-                            // Vectorized e4m3 dequant of the 8 row scales.
-                        auto ascale_deq = esimd_vec::e4m3<TM>(
-                            esimd::convert<uint16_t>(ascale_raw));
-                        // Replicate per-row scale to 64: ascale_vec[m*8+j]=ascale_deq[m].
-                        esimd::simd<float, 64> ascale_vec;
-                        #pragma unroll
-                        for (int m = 0; m < TM; ++m)
-                            ascale_vec.select<8, 1>(m * 8) =
-                                esimd::simd<float, 8>(ascale_deq[m]);
-                        {
-                            auto lo_nib = esimd::convert<uint16_t>(
-                                abytes & esimd::simd<uint8_t, 64>(0x0f));
-                            auto lo_f = esimd_vec::e2m1<64>(lo_nib) * ascale_vec;
-                            a.select<64, 2>(0) = esimd::convert<bf16_t>(lo_f);
-                        }
-                        {
-                            auto hi_nib = esimd::convert<uint16_t>(
-                                abytes >> 4);
-                            auto hi_f = esimd_vec::e2m1<64>(hi_nib) * ascale_vec;
-                            a.select<64, 2>(1) = esimd::convert<bf16_t>(hi_f);
-                        }
-                        } else {
-                            a = esimd::simd<bf16_t, TM * TK>(bf16_t(0.0f));
-                        }
-                        // --- C += A @ B (dpas: Result = C + A*B; B is VNNI) ---
-                        c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
-                    }
-                    // --- store this lane's 8x16 result tile ---
-                    if (active) {
-                        #pragma unroll
-                        for (int m = 0; m < TM; ++m) {
-                            int row = offset + m_tile * TM + m;
-                            if ((row - offset) >= count) continue;
-                            #pragma unroll
-                            for (int n = 0; n < TN; ++n)
-                                C[(size_t)row * N + nt * TN + n] =
-                                    float_to_bf16(c[m * TN + n] * inv_dst);
-                        }
-                    }
-                }
-            });
-    });
-}
-
-// v5: same full-ESIMD (block_load + xmx::dpas) kernel as v4, but lanes own
-// N-tiles instead of M-tiles. v4 wasted 50-94% of dpas calls because ESIMD
-// subgroups are lockstep: all 16 lanes ran the full kt-loop even when only
-// 1-8 M-tiles were active (MoE, small mt). By making each lane own one
-// N-tile (ntiles=88 >= 16 -> all 16 lanes busy), dpas calls drop 14.7x at
-// p=512. Roles swap vs v4: A is now SHARED across lanes (one M-tile, loaded
-// redundantly/coalesced) and B is PER-LANE (each lane's own N-tile, loaded
-// from the coalesced weight layout via a contiguous 128B block_load). The
-// dequant arithmetic is identical to v4; only the load site + loop nesting
-// differ. The M-tile dimension becomes an inner sequential loop (was the
-// lane-parallel tile0 loop in v4).
-inline void matmul_nvfp4_grouped_rows_xe2_v5(
-    GpuEngine& ctx,
-    const uint8_t* A_packed,
-    const uint8_t* A_scale,
-    int K,
-    const int32_t* expert_offsets,
-    const int32_t* rows_per_expert,
-    int localE,
-    const uint8_t* const* W_coal_by_expert,
-    const uint8_t* const* W_scale_by_expert,
-    const float* const* dst_scale_by_expert,
-    int N,
-    bf16* C)
-{
-    if (K % 16 != 0 || N % 16 != 0)
-        throw std::runtime_error("xe2v5 grouped NVFP4 matmul requires K%16 and N%16");
-    if (localE <= 0) return;
-    namespace esimd = sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
-    using bf16_t = sycl::ext::oneapi::bfloat16;
-    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
-    constexpr int TN = 16;  // dpas N (cols) per tile  = ExecutionSize
-    constexpr int TK = 16;  // dpas K (contraction)    = SystolicDepth * OpsPerChannel
-    constexpr int LANES = 16;
-    auto& q = ctx.queue;
-    int halfK = K / 2;
-    int ktiles = K / TK;
-    int ntiles = N / TN;
-    int nchunks = (ntiles + LANES - 1) / LANES;
-
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)nchunks * LANES),
-                              sycl::range<2>(1, LANES)),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                int e = (int)it.get_group(0);
-                int lane = (int)it.get_local_id(1);
-                int nt_chunk = (int)it.get_group(1);
-                int nt = nt_chunk * LANES + lane;       // this lane's N-tile
-                int offset = expert_offsets[e];
-                int count = rows_per_expert[e];
-                if (count <= 0) return;
-                int mt = (count + TM - 1) / TM;
-                if (nt >= ntiles) return;               // tail lanes of last chunk
-
-                const uint8_t* wcoal = W_coal_by_expert[e];
-                const uint8_t* ws = W_scale_by_expert[e];
-                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
-                const uint8_t* ws_nt = ws + (size_t)nt * TN;
-                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
-
-                for (int m_tile = 0; m_tile < mt; ++m_tile) {
-                    esimd::simd<float, TM * TN> c(0.0f);
-                    for (int kt = 0; kt < ktiles; ++kt) {
-                        // --- B: this lane's own N-tile slab (128B contiguous) ---
-                        auto v = esimd::block_load<uint8_t, 128>(
-                            wcoal_nt + (size_t)kt * 128);
-                        // Transpose n-outer -> kp-outer: bt[kp*16+n] = v[n*8+kp].
-                        esimd::simd<uint8_t, 128> bt;
-                        #pragma unroll
-                        for (int kp = 0; kp < 8; ++kp)
-                            bt.select<16, 1>(kp * 16) = v.select<16, 8>(kp);
-                        // Dequant the 16 e4m3 weight scales for this N-tile.
-                        auto wscale_raw = esimd::block_load<uint8_t, 16>(
-                            ws_nt + (size_t)kt * N);
-                        auto wscale_deq = esimd_vec::e4m3<16>(
-                            esimd::convert<uint16_t>(wscale_raw));
-                        esimd::simd<float, 128> scale;
-                        #pragma unroll
-                        for (int kp = 0; kp < 8; ++kp)
-                            scale.select<16, 1>(kp * 16) = wscale_deq;
-                        esimd::simd<bf16_t, TK * TN> b;
-                        {
-                            auto lo_nib = esimd::convert<uint16_t>(
-                                bt & esimd::simd<uint8_t, 128>(0x0f));
-                            auto lo_f = esimd_vec::e2m1<128>(lo_nib) * scale;
-                            b.select<128, 2>(0) = esimd::convert<bf16_t>(lo_f);
-                        }
-                        {
-                            auto hi_nib = esimd::convert<uint16_t>(
-                                bt >> 4);
-                            auto hi_f = esimd_vec::e2m1<128>(hi_nib) * scale;
-                            b.select<128, 2>(1) = esimd::convert<bf16_t>(hi_f);
-                        }
-                        // --- A: shared M-tile, 8 rows x 8 bytes (row-major) ---
-                        esimd::simd<uint8_t, 64> abytes;
-                        esimd::simd<uint8_t, TM> ascale_raw(0);
-                        #pragma unroll
-                        for (int m = 0; m < TM; ++m) {
-                            int row = offset + m_tile * TM + m;
-                            bool ok = (row - offset) < count;
-                            int safe_row = ok ? row : offset;
-                            const uint8_t* rp = A_packed +
-                                (size_t)safe_row * halfK + (size_t)kt * (TK / 2);
-                            abytes.select<8, 1>(m * 8) =
-                                esimd::block_load<uint8_t, 8>(rp);
-                            if (ok) ascale_raw[m] =
-                                A_scale[(size_t)safe_row * ktiles + kt];
-                        }
-                        auto ascale_deq = esimd_vec::e4m3<TM>(
-                            esimd::convert<uint16_t>(ascale_raw));
-                        esimd::simd<float, 64> ascale_vec;
-                        #pragma unroll
-                        for (int m = 0; m < TM; ++m)
-                            ascale_vec.select<8, 1>(m * 8) =
-                                esimd::simd<float, 8>(ascale_deq[m]);
-                        esimd::simd<bf16_t, TM * TK> a;
-                        {
-                            auto lo_nib = esimd::convert<uint16_t>(
-                                abytes & esimd::simd<uint8_t, 64>(0x0f));
-                            auto lo_f = esimd_vec::e2m1<64>(lo_nib) * ascale_vec;
-                            a.select<64, 2>(0) = esimd::convert<bf16_t>(lo_f);
-                        }
-                        {
-                            auto hi_nib = esimd::convert<uint16_t>(
-                                abytes >> 4);
-                            auto hi_f = esimd_vec::e2m1<64>(hi_nib) * ascale_vec;
-                            a.select<64, 2>(1) = esimd::convert<bf16_t>(hi_f);
-                        }
-                        // --- C += A @ B (dpas: per-lane, own A & B) ---
-                        c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
-                    }
-                    // --- store this lane's 8x16 result tile ---
-                    #pragma unroll
-                    for (int m = 0; m < TM; ++m) {
-                        int row = offset + m_tile * TM + m;
-                        if ((row - offset) >= count) continue;
-                        #pragma unroll
-                        for (int n = 0; n < TN; ++n)
-                            C[(size_t)row * N + nt * TN + n] =
-                                float_to_bf16(c[m * TN + n] * inv_dst);
-                    }
-                }
-            });
-    });
-}
-
-// v6: parallelize M across work-groups (best of both regimes).
-// v5 serialized the M-tiles in an inner loop, which dominated latency when mt
-// was large (e.g. p=8192 -> mt=8 -> ~8x slower than onednn-loop). v6 lifts m_tile
-// into the work-group grid: dim0 = localE*max_mt, so each work-group does exactly
-// one (expert, m_tile, n_chunk). The 16 lanes still own N-tiles (small-batch win
-// preserved: at mt=1 the grid collapses to v5's shape). B for a given (expert,
-// n_chunk) is loaded by mt work-groups but hits L2; A is unique per (expert, m_tile).
-inline void matmul_nvfp4_grouped_rows_xe2_v6(
-    GpuEngine& ctx,
-    const uint8_t* A_packed,
-    const uint8_t* A_scale,
-    int K,
-    const int32_t* expert_offsets,
-    const int32_t* rows_per_expert,
-    int localE,
-    int max_mt,
-    const uint8_t* const* W_coal_by_expert,
-    const uint8_t* const* W_scale_by_expert,
-    const float* const* dst_scale_by_expert,
-    int N,
-    bf16* C)
-{
-    if (K % 16 != 0 || N % 16 != 0)
-        throw std::runtime_error("xe2v6 grouped NVFP4 matmul requires K%16 and N%16");
-    if (localE <= 0 || max_mt <= 0) return;
-    namespace esimd = sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
-    using bf16_t = sycl::ext::oneapi::bfloat16;
-    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
-    constexpr int TN = 16;  // dpas N (cols) per tile  = ExecutionSize
-    constexpr int TK = 16;  // dpas K (contraction)    = SystolicDepth * OpsPerChannel
-    constexpr int LANES = 16;
-    auto& q = ctx.queue;
-    int halfK = K / 2;
-    int ktiles = K / TK;
-    int ntiles = N / TN;
-    int nchunks = (ntiles + LANES - 1) / LANES;
-
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>((size_t)localE * max_mt, (size_t)nchunks * LANES),
-                              sycl::range<2>(1, LANES)),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                int em = (int)it.get_group(0);
-                int e = em / max_mt;
-                int m_tile = em % max_mt;
-                int lane = (int)it.get_local_id(1);
-                int nt_chunk = (int)it.get_group(1);
-                int nt = nt_chunk * LANES + lane;       // this lane's N-tile
-                int offset = expert_offsets[e];
-                int count = rows_per_expert[e];
-                if (count <= 0) return;
-                int mt = (count + TM - 1) / TM;
-                if (m_tile >= mt) return;                // expert has fewer M-tiles than max_mt
-                if (nt >= ntiles) return;                // tail lanes of last chunk
-
-                const uint8_t* wcoal = W_coal_by_expert[e];
-                const uint8_t* ws = W_scale_by_expert[e];
-                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
-                const uint8_t* ws_nt = ws + (size_t)nt * TN;
-                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
-
-                esimd::simd<float, TM * TN> c(0.0f);
-                for (int kt = 0; kt < ktiles; ++kt) {
-                    // --- B: this lane's own N-tile slab (128B contiguous) ---
-                    auto v = esimd::block_load<uint8_t, 128>(
-                        wcoal_nt + (size_t)kt * 128);
-                    // Transpose n-outer -> kp-outer: bt[kp*16+n] = v[n*8+kp].
-                    esimd::simd<uint8_t, 128> bt;
-                    #pragma unroll
-                    for (int kp = 0; kp < 8; ++kp)
-                        bt.select<16, 1>(kp * 16) = v.select<16, 8>(kp);
-                    // Dequant the 16 e4m3 weight scales for this N-tile.
-                    auto wscale_raw = esimd::block_load<uint8_t, 16>(
-                        ws_nt + (size_t)kt * N);
-                    auto wscale_deq = esimd_vec::e4m3<16>(
-                        esimd::convert<uint16_t>(wscale_raw));
-                    esimd::simd<float, 128> scale;
-                    #pragma unroll
-                    for (int kp = 0; kp < 8; ++kp)
-                        scale.select<16, 1>(kp * 16) = wscale_deq;
-                    esimd::simd<bf16_t, TK * TN> b;
-                    {
-                        auto lo_nib = esimd::convert<uint16_t>(
-                            bt & esimd::simd<uint8_t, 128>(0x0f));
-                        auto lo_f = esimd_vec::e2m1<128>(lo_nib) * scale;
-                        b.select<128, 2>(0) = esimd::convert<bf16_t>(lo_f);
-                    }
-                    {
-                        auto hi_nib = esimd::convert<uint16_t>(
-                            bt >> 4);
-                        auto hi_f = esimd_vec::e2m1<128>(hi_nib) * scale;
-                        b.select<128, 2>(1) = esimd::convert<bf16_t>(hi_f);
-                    }
-                    // --- A: this M-tile, 8 rows x 8 bytes (row-major) ---
-                    esimd::simd<uint8_t, 64> abytes;
-                    esimd::simd<uint8_t, TM> ascale_raw(0);
-                    #pragma unroll
-                    for (int m = 0; m < TM; ++m) {
-                        int row = offset + m_tile * TM + m;
-                        bool ok = (row - offset) < count;
-                        int safe_row = ok ? row : offset;
-                        const uint8_t* rp = A_packed +
-                            (size_t)safe_row * halfK + (size_t)kt * (TK / 2);
-                        abytes.select<8, 1>(m * 8) =
-                            esimd::block_load<uint8_t, 8>(rp);
-                        if (ok) ascale_raw[m] =
-                            A_scale[(size_t)safe_row * ktiles + kt];
-                    }
-                    auto ascale_deq = esimd_vec::e4m3<TM>(
-                        esimd::convert<uint16_t>(ascale_raw));
-                    esimd::simd<float, 64> ascale_vec;
-                    #pragma unroll
-                    for (int m = 0; m < TM; ++m)
-                        ascale_vec.select<8, 1>(m * 8) =
-                            esimd::simd<float, 8>(ascale_deq[m]);
-                    esimd::simd<bf16_t, TM * TK> a;
-                    {
-                        auto lo_nib = esimd::convert<uint16_t>(
-                            abytes & esimd::simd<uint8_t, 64>(0x0f));
-                        auto lo_f = esimd_vec::e2m1<64>(lo_nib) * ascale_vec;
-                        a.select<64, 2>(0) = esimd::convert<bf16_t>(lo_f);
-                    }
-                    {
-                        auto hi_nib = esimd::convert<uint16_t>(
-                            abytes >> 4);
-                        auto hi_f = esimd_vec::e2m1<64>(hi_nib) * ascale_vec;
-                        a.select<64, 2>(1) = esimd::convert<bf16_t>(hi_f);
-                    }
-                    // --- C += A @ B (dpas: per-lane, own A & B) ---
-                    c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
-                }
-                // --- store this lane's 8x16 result tile ---
-                #pragma unroll
-                for (int m = 0; m < TM; ++m) {
-                    int row = offset + m_tile * TM + m;
-                    if ((row - offset) >= count) continue;
-                    #pragma unroll
-                    for (int n = 0; n < TN; ++n)
-                        C[(size_t)row * N + nt * TN + n] =
-                            float_to_bf16(c[m * TN + n] * inv_dst);
-                }
-            });
-    });
-}
-
-// v7: SLM-cached B (hardware-aligned fix for the large-batch latency gap).
-// v5/v6 reload B from global every m_tile (mt times) and every kt; at large mt this
-// dominates latency (global block_load stalls, ~4% of 608 GB/s peak -> NOT BW bound but
-// stall/occupancy bound). v7 dequants B once per kt-chunk into SLM (128 KB available, unused
-// by v5/v6), then all mt m_tiles read B from SLM (~5-10 cyc) instead of global.
-// gateup full B = 360 KB > 128 KB -> kt-chunk KC=8 (64 KB chunk); down full B = 90 KB fits.
-// mt (<=8) live float accumulators persist across kt-chunks. Structure = v5 (lanes->N-tiles,
-// M-tile serial inner loop); v6's M-parallelism reverted (it gave no speedup, down p=8192
-// byte-identical v5/v6 -> latency not parallelism is the lever).
-inline void matmul_nvfp4_grouped_rows_xe2_v7(
-    GpuEngine& ctx,
-    const uint8_t* A_packed,
-    const uint8_t* A_scale,
-    int K,
-    const int32_t* expert_offsets,
-    const int32_t* rows_per_expert,
-    int localE,
-    const uint8_t* const* W_coal_by_expert,
-    const uint8_t* const* W_scale_by_expert,
-    const float* const* dst_scale_by_expert,
-    int N,
-    bf16* C)
-{
-    if (K % 16 != 0 || N % 16 != 0)
-        throw std::runtime_error("xe2v7 grouped NVFP4 matmul requires K%16 and N%16");
-    if (localE <= 0) return;
-    namespace esimd = sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
-    using bf16_t = sycl::ext::oneapi::bfloat16;
-    constexpr int TM = 8;    // dpas M (rows) per tile  = RepeatCount
-    constexpr int TN = 16;   // dpas N (cols) per tile  = ExecutionSize
-    constexpr int TK = 16;   // dpas K (contraction)    = SystolicDepth * OpsPerChannel
-    constexpr int LANES = 16;
-    constexpr int KC = 8;    // kt-chunk size (SLM budget: KC*128*16 = 16KB? -> see below)
-    auto& q = ctx.queue;
-    int halfK = K / 2;
-    int ktiles = K / TK;
-    int ntiles = N / TN;
-    int nchunks = (ntiles + LANES - 1) / LANES;
-
-    // SLM layout: per lane per kt, the dequantized B is simd<bf16_t,TK*TN> = 256 bf16 = 512 B.
-    // Slot offset(ki,lane) = ki*(LANES*512) + lane*512. Full chunk = KC*LANES*512 =
-    // 8*16*512 = 65536 B = 64 KB (fits 128 KB). One code path for gateup/down (KC=8).
-    constexpr int SLM_SIZE = KC * LANES * 512;
-
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>((size_t)localE, (size_t)nchunks * LANES),
-                              sycl::range<2>(1, LANES)),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                esimd::slm_init<SLM_SIZE>();
-                int e = (int)it.get_group(0);
-                int lane = (int)it.get_local_id(1);
-                int nt_chunk = (int)it.get_group(1);
-                int nt = nt_chunk * LANES + lane;       // this lane's N-tile
-                int offset = expert_offsets[e];
-                int count = rows_per_expert[e];
-                if (count <= 0) return;
-                int mt = (count + TM - 1) / TM;
-                if (nt >= ntiles) return;               // tail lanes of last chunk
-
-                const uint8_t* wcoal = W_coal_by_expert[e];
-                const uint8_t* ws = W_scale_by_expert[e];
-                const uint8_t* wcoal_nt = wcoal + (size_t)nt * ktiles * 128;
-                const uint8_t* ws_nt = ws + (size_t)nt * TN;
-                float inv_dst = 1.0f / dst_scale_by_expert[e][0];
-
-                // mt live accumulators (persist across kt-chunks).
-                esimd::simd<float, TM * TN> acc[8];
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[i] = esimd::simd<float, TM * TN>(0.0f);
-
-                int kchunks = (ktiles + KC - 1) / KC;
-                for (int kc = 0; kc < kchunks; ++kc) {
-                    int kt_base = kc * KC;
-                    int kt_end = kt_base + KC;
-                    if (kt_end > ktiles) kt_end = ktiles;
-                    int kc_len = kt_end - kt_base;
-
-                    // --- Load + dequant this chunk's B into SLM (once per chunk) ---
-                    #pragma unroll
-                    for (int ki = 0; ki < KC; ++ki) {
-                        int kt = kt_base + ki;
-                        uint32_t slm_off = (uint32_t)ki * LANES * 512 + (uint32_t)lane * 512;
-                        if (kt < kt_end) {
-                            auto v = esimd::block_load<uint8_t, 128>(
-                                wcoal_nt + (size_t)kt * 128);
-                            // Transpose n-outer -> kp-outer: bt[kp*16+n] = v[n*8+kp].
-                            esimd::simd<uint8_t, 128> bt;
-                            #pragma unroll
-                            for (int kp = 0; kp < 8; ++kp)
-                                bt.select<16, 1>(kp * 16) = v.select<16, 8>(kp);
-                            auto wscale_raw = esimd::block_load<uint8_t, 16>(
-                                ws_nt + (size_t)kt * N);
-                            auto wscale_deq = esimd_vec::e4m3<16>(
-                                esimd::convert<uint16_t>(wscale_raw));
-                            esimd::simd<float, 128> scale;
-                            #pragma unroll
-                            for (int kp = 0; kp < 8; ++kp)
-                                scale.select<16, 1>(kp * 16) = wscale_deq;
-                            esimd::simd<bf16_t, TK * TN> b;
-                            {
-                                auto lo_nib = esimd::convert<uint16_t>(
-                                    bt & esimd::simd<uint8_t, 128>(0x0f));
-                                auto lo_f = esimd_vec::e2m1<128>(lo_nib) * scale;
-                                b.select<128, 2>(0) = esimd::convert<bf16_t>(lo_f);
-                            }
-                            {
-                                auto hi_nib = esimd::convert<uint16_t>(
-                                    bt >> 4);
-                                auto hi_f = esimd_vec::e2m1<128>(hi_nib) * scale;
-                                b.select<128, 2>(1) = esimd::convert<bf16_t>(hi_f);
-                            }
-                            esimd::slm_block_store(slm_off, b);
-                        }
-                    }
-
-                    // --- For every m_tile, dpas using A(global) + B(SLM) ---
-                    for (int m_tile = 0; m_tile < mt; ++m_tile) {
-                        esimd::simd<float, TM * TN>& c = acc[m_tile];
-                        #pragma unroll
-                        for (int ki = 0; ki < KC; ++ki) {
-                            int kt = kt_base + ki;
-                            if (kt >= kt_end) break;
-                            uint32_t slm_off = (uint32_t)ki * LANES * 512 + (uint32_t)lane * 512;
-                            auto b = esimd::slm_block_load<bf16_t, TK * TN>(slm_off);
-                            // --- A: this M-tile, 8 rows x 8 bytes (row-major) ---
-                            esimd::simd<uint8_t, 64> abytes;
-                            esimd::simd<uint8_t, TM> ascale_raw(0);
-                            #pragma unroll
-                            for (int m = 0; m < TM; ++m) {
-                                int row = offset + m_tile * TM + m;
-                                bool ok = (row - offset) < count;
-                                int safe_row = ok ? row : offset;
-                                const uint8_t* rp = A_packed +
-                                    (size_t)safe_row * halfK + (size_t)kt * (TK / 2);
-                                abytes.select<8, 1>(m * 8) =
-                                    esimd::block_load<uint8_t, 8>(rp);
-                                if (ok) ascale_raw[m] =
-                                    A_scale[(size_t)safe_row * ktiles + kt];
-                            }
-                            auto ascale_deq = esimd_vec::e4m3<TM>(
-                                esimd::convert<uint16_t>(ascale_raw));
-                            esimd::simd<float, 64> ascale_vec;
-                            #pragma unroll
-                            for (int m = 0; m < TM; ++m)
-                                ascale_vec.select<8, 1>(m * 8) =
-                                    esimd::simd<float, 8>(ascale_deq[m]);
-                            esimd::simd<bf16_t, TM * TK> a;
-                            {
-                                auto lo_nib = esimd::convert<uint16_t>(
-                                    abytes & esimd::simd<uint8_t, 64>(0x0f));
-                                auto lo_f = esimd_vec::e2m1<64>(lo_nib) * ascale_vec;
-                                a.select<64, 2>(0) = esimd::convert<bf16_t>(lo_f);
-                            }
-                            {
-                                auto hi_nib = esimd::convert<uint16_t>(
-                                    abytes >> 4);
-                                auto hi_f = esimd_vec::e2m1<64>(hi_nib) * ascale_vec;
-                                a.select<64, 2>(1) = esimd::convert<bf16_t>(hi_f);
-                            }
-                            c = xmx::dpas<8, 8, float, float, bf16_t, bf16_t>(c, b, a);
-                        }
-                    }
-                }
-
-                // --- store all m_tiles' results ---
-                #pragma unroll
-                for (int m_tile = 0; m_tile < 8; ++m_tile) {
-                    if (m_tile >= mt) break;
-                    esimd::simd<float, TM * TN>& c = acc[m_tile];
-                    #pragma unroll
-                    for (int m = 0; m < TM; ++m) {
-                        int row = offset + m_tile * TM + m;
-                        if ((row - offset) >= count) continue;
-                        #pragma unroll
-                        for (int n = 0; n < TN; ++n)
-                            C[(size_t)row * N + nt * TN + n] =
-                                float_to_bf16(c[m * TN + n] * inv_dst);
-                    }
-                }
-            });
-    });
+    const Nvfp4Linear& W,
+    bf16* C,
+    GpuEngine& ctx = GpuEngine::get(0)) {
+    if (K % 16 != 0)
+        throw std::runtime_error("matmul_nvfp4_xe2: K must be divisible by 16");
+    GpuBuffer<uint8_t> packed((size_t)M * K / 2, ctx.queue);
+    GpuBuffer<uint8_t> scales((size_t)M * (K / 16), ctx.queue);
+    pack_bf16_to_nvfp4(ctx.queue, A, packed.data(), scales.data(), M, K,
+                       W.input_global_scale);
+    matmul_nvfp4_packed_xe2(ctx, packed.data(), scales.data(), M, K, W, C);
+    ctx.stream.wait();
 }

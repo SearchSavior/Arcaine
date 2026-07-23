@@ -1,5 +1,7 @@
 #include "expert_parallel.hpp"
+#include "int4_grouped_moe.hpp"
 #include "../../modeling/diffusion_gemma/arena.hpp"
+#include "../../modeling/diffusion_gemma/fusions/int4_awq.hpp"
 #include "ops.hpp"
 #include "../kernels/elementwise.hpp"
 #include "../../utils/profile.hpp"
@@ -53,11 +55,13 @@ static int nvfp4_expert_round_multiple() {
 static Nvfp4Kernel& g_kernel() {
     static Nvfp4Kernel k = [] {
         const char* env = std::getenv("DIFF_NVFP4_EXPERT_KERNEL");
-        if (!env) return Nvfp4Kernel::Default;
+        if (!env) return Nvfp4Kernel::Hybrid;
         if (!std::strcmp(env, "hybrid") || !std::strcmp(env, "grouped-pack") ||
             !std::strcmp(env, "pack")) return Nvfp4Kernel::Hybrid;
         if (!std::strcmp(env, "custom") || !std::strcmp(env, "grouped") ||
             !std::strcmp(env, "1")) return Nvfp4Kernel::Custom;
+        if (!std::strcmp(env, "grouped-dpas") || !std::strcmp(env, "dpas") ||
+            !std::strcmp(env, "geglu-pack")) return Nvfp4Kernel::GroupedDpas;
         return Nvfp4Kernel::Default;
     }();
     return k;
@@ -65,6 +69,29 @@ static Nvfp4Kernel& g_kernel() {
 
 static bool nvfp4_use_custom_expert_kernel() { return g_kernel() == Nvfp4Kernel::Custom; }
 static bool nvfp4_use_hybrid_expert_kernel() { return g_kernel() == Nvfp4Kernel::Hybrid; }
+static bool nvfp4_use_grouped_dpas_kernel() { return g_kernel() == Nvfp4Kernel::GroupedDpas; }
+
+// Fusion knobs for the hybrid (grouped-pack + per-expert oneDNN) path.
+// Each merges two adjacent kernels, eliminating a bf16 intermediate + a launch.
+// Bit-exact with the unfused sequence; AB-testable via env var.
+static bool nvfp4_fuse_geglu_pack() {
+    static bool v = [] {
+        const char* env = std::getenv("DIFF_NVFP4_FUSE_GEGLU_PACK");
+        if (!env) return true;          // on by default (bit-exact, pure win)
+        return std::strcmp(env, "0") && std::strcmp(env, "off") &&
+               std::strcmp(env, "false") && std::strcmp(env, "no");
+    }();
+    return v;
+}
+static bool nvfp4_fuse_scatter_pack() {
+    static bool v = [] {
+        const char* env = std::getenv("DIFF_NVFP4_FUSE_SCATTER_PACK");
+        if (!env) return true;          // on by default (device-routes mode only)
+        return std::strcmp(env, "0") && std::strcmp(env, "off") &&
+               std::strcmp(env, "false") && std::strcmp(env, "no");
+    }();
+    return v;
+}
 
 static bool nvfp4_gpu_layout_enabled() {
     static bool enabled = [] {
@@ -93,30 +120,14 @@ static bool nvfp4_grouped_gemm_xe2_enabled() {
     static bool enabled = [] {
         const char* env = std::getenv("DIFF_NVFP4_GROUPED_GEMM");
         if (!env) return false;
+        if (!std::strcmp(env, "xe2v2") || !std::strcmp(env, "xe2v3") ||
+            !std::strcmp(env, "xe2v4") || !std::strcmp(env, "xe2v5") ||
+            !std::strcmp(env, "xe2v6") || !std::strcmp(env, "xe2v7"))
+            throw std::runtime_error(
+                std::string("DIFF_NVFP4_GROUPED_GEMM=") + env +
+                " was removed (xe2v2-v7 dropped); valid: xe2|dpas|xmx|1");
         return !std::strcmp(env, "xe2") || !std::strcmp(env, "dpas") ||
                !std::strcmp(env, "xmx") || !std::strcmp(env, "1");
-    }();
-    return enabled;
-}
-
-// xe2v2: the rewritten per-expert DPAS kernel (arithmetic dequant, no k-split,
-// no global LUT). Distinct value so the old xe2 path is preserved for A/B.
-static bool nvfp4_grouped_gemm_xe2v2_enabled() {
-    static bool enabled = [] {
-        const char* env = std::getenv("DIFF_NVFP4_GROUPED_GEMM");
-        if (!env) return false;
-        return !std::strcmp(env, "xe2v2");
-    }();
-    return enabled;
-}
-
-// xe2v6: lanes->N-tiles with M-tiles lifted into the work-group grid (best
-// small-batch MoE kernel; ~2x over onednn-loop at p<=1024). Single-device path.
-static bool nvfp4_grouped_gemm_xe2v6_enabled() {
-    static bool enabled = [] {
-        const char* env = std::getenv("DIFF_NVFP4_GROUPED_GEMM");
-        if (!env) return false;
-        return !std::strcmp(env, "xe2v6");
     }();
     return enabled;
 }
@@ -166,6 +177,7 @@ const char* nvfp4_kernel_name(Nvfp4Kernel kernel) {
     switch (kernel) {
         case Nvfp4Kernel::Hybrid: return "hybrid";
         case Nvfp4Kernel::Custom: return "custom";
+        case Nvfp4Kernel::GroupedDpas: return "grouped-dpas";
         default:                  return "default";
     }
 }
@@ -240,6 +252,123 @@ static void upload_alloc(sycl::queue& q, diffarena::Alloc<T>& dst,
     if (!src.empty())
         q.memcpy(dst.data(), src.data(), src.size() * sizeof(T)).wait();
 }
+
+} // namespace
+
+// Build the persistent raw-weight pointer tables for an NVFP4 shard, once.
+// The grouped-GEMM kernels read, per expert: packed-weight ptr, scale ptr,
+// dst-scale ptr, and input_global_scale. These are stable across steps, so we
+// upload them to persistent GpuBuffers in the shard at load time (outside any
+// Nvfp4GraphSession) and reuse them -- replacing the per-step upload_alloc the
+// gpu-layout path used to do, which could not be captured by a command_graph
+// (host source vector dangles at replay). Coalesced (xe2) tables are NOT built
+// here (they depend on the lazily-created coalesced weight buffers); the xe2
+// path keeps its per-step upload and is not session-capture-safe.
+void ensure_expert_pointer_tables_raw(DiffExpertShard& shard, GpuEngine& ctx) {
+    if (shard.pt_raw_built || !shard.nvfp4) return;
+    int localE = shard.num_experts;
+    auto& q = ctx.queue;
+    std::vector<const uint8_t*> gw(localE), gs(localE), dw(localE), ds(localE);
+    std::vector<const float*> gdst(localE), ddst(localE);
+    std::vector<float> gin(localE), din(localE);
+    for (int e = 0; e < localE; ++e) {
+        gw[e]   = shard.gate_up_proj_fp4[e].weight_packed.data();
+        gs[e]   = shard.gate_up_proj_fp4[e].weight_scale.data();
+        gdst[e] = shard.gate_up_proj_fp4[e].dst_scale.data();
+        gin[e]  = shard.gate_up_proj_fp4[e].input_global_scale;
+        dw[e]   = shard.down_proj_fp4[e].weight_packed.data();
+        ds[e]   = shard.down_proj_fp4[e].weight_scale.data();
+        ddst[e] = shard.down_proj_fp4[e].dst_scale.data();
+        din[e]  = shard.down_proj_fp4[e].input_global_scale;
+    }
+    shard.pt_gate_w     = GpuBuffer<const uint8_t*>((size_t)localE, q);
+    shard.pt_gate_s     = GpuBuffer<const uint8_t*>((size_t)localE, q);
+    shard.pt_gate_dst   = GpuBuffer<const float*>((size_t)localE, q);
+    shard.pt_gate_input = GpuBuffer<float>((size_t)localE, q);
+    shard.pt_down_w     = GpuBuffer<const uint8_t*>((size_t)localE, q);
+    shard.pt_down_s     = GpuBuffer<const uint8_t*>((size_t)localE, q);
+    shard.pt_down_dst   = GpuBuffer<const float*>((size_t)localE, q);
+    shard.pt_down_input = GpuBuffer<float>((size_t)localE, q);
+    shard.pt_gate_w.upload(gw.data(), localE);
+    shard.pt_gate_s.upload(gs.data(), localE);
+    shard.pt_gate_dst.upload(gdst.data(), localE);
+    shard.pt_gate_input.upload(gin.data(), localE);
+    shard.pt_down_w.upload(dw.data(), localE);
+    shard.pt_down_s.upload(ds.data(), localE);
+    shard.pt_down_dst.upload(ddst.data(), localE);
+    shard.pt_down_input.upload(din.data(), localE);
+    q.wait();
+    shard.pt_raw_built = true;
+ }
+
+void ensure_int4_expert_pointer_tables(DiffExpertShard& shard, GpuEngine& ctx) {
+    if (shard.pt_int4_built || !shard.int4) return;
+    const int localE = shard.num_experts;
+    if ((int)shard.gate_up_proj_int4.size() != localE ||
+        (int)shard.down_proj_int4.size() != localE)
+        throw std::runtime_error("INT4 expert pointer table: incomplete shard");
+
+    std::vector<const uint8_t*> gate_w(localE), down_w(localE);
+    std::vector<const bf16*> gate_s(localE), down_s(localE);
+    for (int e = 0; e < localE; ++e) {
+        gate_w[e] = shard.gate_up_proj_int4[e].weight_packed.data();
+        gate_s[e] = shard.gate_up_proj_int4[e].weight_scale.data();
+        down_w[e] = shard.down_proj_int4[e].weight_packed.data();
+        down_s[e] = shard.down_proj_int4[e].weight_scale.data();
+    }
+    auto& q = ctx.queue;
+    shard.pt_int4_gate_w = GpuBuffer<const uint8_t*>((size_t)localE, q);
+    shard.pt_int4_gate_s = GpuBuffer<const bf16*>((size_t)localE, q);
+    shard.pt_int4_down_w = GpuBuffer<const uint8_t*>((size_t)localE, q);
+    shard.pt_int4_down_s = GpuBuffer<const bf16*>((size_t)localE, q);
+    shard.pt_int4_gate_w.upload(gate_w.data(), localE);
+    shard.pt_int4_gate_s.upload(gate_s.data(), localE);
+    shard.pt_int4_down_w.upload(down_w.data(), localE);
+    shard.pt_int4_down_s.upload(down_s.data(), localE);
+    q.wait();
+    shard.pt_int4_built = true;
+}
+
+// Build persistent COALESCED (xe2 DPAS) weight pointer tables, once at load.
+// Pre-warms nvfp4_coalesced_weight per expert (caches in W.weight_coal; the
+// first call does a ctx.queue.wait() that is NOT capturable, hence must happen
+// outside a session) and nvfp4_dequant_lut (static cache), then uploads the
+// coalesced weight ptr table. The scale/dst/input tables from the raw build are
+// reused (layout-independent). Eliminates the xe2 path's per-step pointer-table
+// upload + lazy coalesce wait -> capturable. See ensure_expert_pointer_tables_raw.
+void ensure_expert_pointer_tables_coalesced(DiffExpertShard& shard, GpuEngine& ctx,
+                                             int moe_intermediate, int hidden_size) {
+    if (shard.pt_coal_built || !shard.nvfp4) return;
+    // Only build the ~380 MB of coalesced weights if the xe2 DPAS path is
+    // actually selected. nvfp4_grouped_gemm_xe2_enabled() is anon-namespace
+    // (not visible here), so check the env var it reads (DIFF_NVFP4_GROUPED_GEMM).
+    // Without this gate, every load pays 380 MB even for the default hybrid path.
+    const char* env = std::getenv("DIFF_NVFP4_GROUPED_GEMM");
+    bool xe2_on = env && std::strcmp(env, "0") && std::strcmp(env, "off") &&
+                  std::strcmp(env, "false") && std::strcmp(env, "no");
+    if (!xe2_on) return;
+    if (!shard.pt_raw_built)
+        ensure_expert_pointer_tables_raw(shard, ctx);
+    int localE = shard.num_experts;
+    int H = hidden_size;
+    int moe_inter = moe_intermediate;
+    // Warm the dequant LUT (static per-engine cache; first call uploads).
+    (void)nvfp4_dequant_lut(ctx);
+    // Warm coalesced weights per expert (caches on Nvfp4Linear::weight_coal).
+    std::vector<const uint8_t*> gw(localE), dw(localE);
+    for (int e = 0; e < localE; ++e) {
+        gw[e] = nvfp4_coalesced_weight(shard.gate_up_proj_fp4[e], H, 2 * moe_inter, ctx);
+        dw[e] = nvfp4_coalesced_weight(shard.down_proj_fp4[e], moe_inter, H, ctx);
+    }
+    shard.pt_gate_w_coal = GpuBuffer<const uint8_t*>(localE, ctx.queue);
+    shard.pt_down_w_coal = GpuBuffer<const uint8_t*>(localE, ctx.queue);
+    shard.pt_gate_w_coal.upload(gw.data(), localE);
+    shard.pt_down_w_coal.upload(dw.data(), localE);
+    ctx.queue.wait();
+    shard.pt_coal_built = true;
+}
+
+namespace {
 
 static bool run_shard_nvfp4_gpu_layout(
     GpuEngine& ctx,
@@ -363,93 +492,111 @@ static bool run_shard_nvfp4_gpu_layout(
 
     int HG = H / 16;
     int IG = moe_inter / 16;
-    bool use_xe2v2 = nvfp4_grouped_gemm_xe2v2_enabled();
-    bool use_xe2_gemm = !use_xe2v2 && nvfp4_grouped_gemm_xe2_enabled();
-    bool use_xe2v6 = !use_xe2v2 && !use_xe2_gemm && nvfp4_grouped_gemm_xe2v6_enabled();
-    bool need_coal = use_xe2_gemm || use_xe2v6;
+    // The xe2 (DPAS) grouped-GEMM path is capturable now that coalesced weight
+    // tables + the dequant LUT are pre-warmed at load (pt_*_coal, via
+    // ensure_expert_pointer_tables_coalesced). Under a recording session, use
+    // the persistent coalesced pointer tables (no per-step upload_alloc, no
+    // lazy nvfp4_coalesced_weight wait). AB knob: DIFF_NVFP4_GROUPED_GEMM (xe2).
+    bool use_xe2_gemm = nvfp4_grouped_gemm_xe2_enabled();
+    bool need_coal = use_xe2_gemm;
+    bool session_active = nvfp4_session_recording(q);
 
-    // xe2v6 sizes its work-group grid by max_mt (max M-tiles across experts),
-    // which requires the per-expert row counts on the host.
-    int max_mt = 1;
-    if (use_xe2v6) {
-        std::vector<int32_t> rpe_h(localE);
-        q.memcpy(rpe_h.data(), rows_per_expert_dev.data(), (size_t)localE * sizeof(int32_t)).wait();
+    // Persistent raw pointer tables (built once at load) for the default
+    // non-coalesced path -- avoids a per-step host->device upload that cannot
+    // be captured by a command_graph. The coalesced (xe2) path uses the
+    // persistent pt_*_coal tables under a session (also built once at load).
+    const uint8_t* const* gate_w_dev = nullptr;
+    const uint8_t* const* gate_s_dev = nullptr;
+    const float* const* gate_dst_dev = nullptr;
+    const float* gate_input_dev = nullptr;
+    const uint8_t* const* down_w_dev = nullptr;
+    const uint8_t* const* down_s_dev = nullptr;
+    const float* const* down_dst_dev = nullptr;
+    const float* down_input_dev = nullptr;
+    diffarena::Alloc<const uint8_t*> gw_a, gs_a, dw_a, ds_a;
+    diffarena::Alloc<const float*>   gdst_a, ddst_a;
+    diffarena::Alloc<float>           gin_a, din_a;
+    if (!need_coal) {
+        if (!shard.pt_raw_built)
+            ensure_expert_pointer_tables_raw(const_cast<DiffExpertShard&>(shard), ctx);
+        gate_w_dev     = shard.pt_gate_w.data();
+        gate_s_dev     = shard.pt_gate_s.data();
+        gate_dst_dev   = shard.pt_gate_dst.data();
+        gate_input_dev = shard.pt_gate_input.data();
+        down_w_dev     = shard.pt_down_w.data();
+        down_s_dev     = shard.pt_down_s.data();
+        down_dst_dev   = shard.pt_down_dst.data();
+        down_input_dev = shard.pt_down_input.data();
+    } else if (session_active && shard.pt_coal_built) {
+        // Session path: reuse persistent coalesced tables (scale/dst/input
+        // shared with the raw tables; only the weight ptrs differ). No upload.
+        gate_w_dev     = shard.pt_gate_w_coal.data();
+        gate_s_dev     = shard.pt_gate_s.data();
+        gate_dst_dev   = shard.pt_gate_dst.data();
+        gate_input_dev = shard.pt_gate_input.data();
+        down_w_dev     = shard.pt_down_w_coal.data();
+        down_s_dev     = shard.pt_down_s.data();
+        down_dst_dev   = shard.pt_down_dst.data();
+        down_input_dev = shard.pt_down_input.data();
+    } else {
+        std::vector<const uint8_t*> gate_w(localE), gate_s(localE), down_w(localE), down_s(localE);
+        std::vector<const float*> gate_dst(localE), down_dst(localE);
+        std::vector<float> gate_input(localE), down_input(localE);
         for (int e = 0; e < localE; ++e) {
-            int mt = (rpe_h[e] + 7) / 8;
-            if (mt > max_mt) max_mt = mt;
+            gate_w[e] = nvfp4_coalesced_weight(shard.gate_up_proj_fp4[e], H, 2 * moe_inter, ctx);
+            gate_s[e] = shard.gate_up_proj_fp4[e].weight_scale.data();
+            gate_dst[e] = shard.gate_up_proj_fp4[e].dst_scale.data();
+            gate_input[e] = shard.gate_up_proj_fp4[e].input_global_scale;
+            down_w[e] = nvfp4_coalesced_weight(shard.down_proj_fp4[e], moe_inter, H, ctx);
+            down_s[e] = shard.down_proj_fp4[e].weight_scale.data();
+            down_dst[e] = shard.down_proj_fp4[e].dst_scale.data();
+            down_input[e] = shard.down_proj_fp4[e].input_global_scale;
         }
-        static bool logged = false;
-        if (!logged) { std::fprintf(stderr, "[moe] xe2v6 engaged: localE=%d max_mt=%d\n", localE, max_mt); logged = true; }
+        gw_a = ar.alloc<const uint8_t*>(localE);
+        gs_a = ar.alloc<const uint8_t*>(localE);
+        dw_a = ar.alloc<const uint8_t*>(localE);
+        ds_a = ar.alloc<const uint8_t*>(localE);
+        gdst_a = ar.alloc<const float*>(localE);
+        ddst_a = ar.alloc<const float*>(localE);
+        gin_a = ar.alloc<float>(localE);
+        din_a = ar.alloc<float>(localE);
+        upload_alloc(q, gw_a, gate_w);
+        upload_alloc(q, gs_a, gate_s);
+        upload_alloc(q, gdst_a, gate_dst);
+        upload_alloc(q, gin_a, gate_input);
+        upload_alloc(q, dw_a, down_w);
+        upload_alloc(q, ds_a, down_s);
+        upload_alloc(q, ddst_a, down_dst);
+        upload_alloc(q, din_a, down_input);
+        gate_w_dev = gw_a.data(); gate_s_dev = gs_a.data(); gate_dst_dev = gdst_a.data();
+        gate_input_dev = gin_a.data();
+        down_w_dev = dw_a.data(); down_s_dev = ds_a.data(); down_dst_dev = ddst_a.data();
+        down_input_dev = din_a.data();
     }
-    std::vector<const uint8_t*> gate_w(localE), gate_s(localE), down_w(localE), down_s(localE);
-    std::vector<const float*> gate_dst(localE), down_dst(localE);
-    std::vector<float> gate_input(localE), down_input(localE);
-    for (int e = 0; e < localE; ++e) {
-        gate_w[e] = need_coal
-            ? nvfp4_coalesced_weight(shard.gate_up_proj_fp4[e], H, 2 * moe_inter, ctx)
-            : shard.gate_up_proj_fp4[e].weight_packed.data();
-        gate_s[e] = shard.gate_up_proj_fp4[e].weight_scale.data();
-        gate_dst[e] = shard.gate_up_proj_fp4[e].dst_scale.data();
-        gate_input[e] = shard.gate_up_proj_fp4[e].input_global_scale;
-        down_w[e] = need_coal
-            ? nvfp4_coalesced_weight(shard.down_proj_fp4[e], moe_inter, H, ctx)
-            : shard.down_proj_fp4[e].weight_packed.data();
-        down_s[e] = shard.down_proj_fp4[e].weight_scale.data();
-        down_dst[e] = shard.down_proj_fp4[e].dst_scale.data();
-        down_input[e] = shard.down_proj_fp4[e].input_global_scale;
-    }
-
-    auto gate_w_dev = ar.alloc<const uint8_t*>(localE);
-    auto gate_s_dev = ar.alloc<const uint8_t*>(localE);
-    auto down_w_dev = ar.alloc<const uint8_t*>(localE);
-    auto down_s_dev = ar.alloc<const uint8_t*>(localE);
-    auto gate_dst_dev = ar.alloc<const float*>(localE);
-    auto down_dst_dev = ar.alloc<const float*>(localE);
-    auto gate_input_dev = ar.alloc<float>(localE);
-    auto down_input_dev = ar.alloc<float>(localE);
-    upload_alloc(q, gate_w_dev, gate_w);
-    upload_alloc(q, gate_s_dev, gate_s);
-    upload_alloc(q, gate_dst_dev, gate_dst);
-    upload_alloc(q, gate_input_dev, gate_input);
-    upload_alloc(q, down_w_dev, down_w);
-    upload_alloc(q, down_s_dev, down_s);
-    upload_alloc(q, down_dst_dev, down_dst);
-    upload_alloc(q, down_input_dev, down_input);
 
     auto xe_packed = ar.alloc<uint8_t>((size_t)A_all * H / 2);
     auto xe_scale = ar.alloc<uint8_t>((size_t)A_all * HG);
     { DIFF_PROF(q, prof.pack);
       pack_bf16_to_nvfp4_grouped_rows(q, Xe.data(), H,
                                       row_expert_dev.data(), A_all,
-                                      gate_input_dev.data(), xe_packed.data(), xe_scale.data()); }
+                                      gate_input_dev, xe_packed.data(), xe_scale.data()); }
     Xe.reset();
-    gate_input_dev.reset();
+    gin_a.reset();
 
     auto gu = ar.alloc<bf16>((size_t)A_all * 2 * moe_inter);
     { DIFF_PROF(q, prof.gateup_mm);
-      if (use_xe2v2) {
-          matmul_nvfp4_grouped_rows_xe2_v2(ctx, xe_packed.data(), xe_scale.data(), H,
-                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
-                                           gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
-                                           2 * moe_inter, gu.data());
-      } else if (use_xe2v6) {
-          matmul_nvfp4_grouped_rows_xe2_v6(ctx, xe_packed.data(), xe_scale.data(), H,
-                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
-                                           max_mt,
-                                           gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
-                                           2 * moe_inter, gu.data());
-      } else if (use_xe2_gemm) {
+      if (use_xe2_gemm) {
           matmul_nvfp4_grouped_rows_xe2(ctx, xe_packed.data(), xe_scale.data(), H,
-                                        row_expert_dev.data(), A_all,
-                                        gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
-                                        2 * moe_inter, gu.data());
+                                         row_expert_dev.data(), A_all,
+                                         gate_w_dev, gate_s_dev, gate_dst_dev,
+                                         2 * moe_inter, gu.data());
       } else {
           matmul_nvfp4_grouped_rows_custom(q, xe_packed.data(), xe_scale.data(), H,
                                            row_expert_dev.data(), A_all,
-                                           gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
+                                           gate_w_dev, gate_s_dev, gate_dst_dev,
                                            2 * moe_inter, gu.data());
       } }
-    gate_w_dev.reset(); gate_s_dev.reset(); gate_dst_dev.reset();
+    gw_a.reset(); gs_a.reset(); gdst_a.reset();
     xe_packed.reset(); xe_scale.reset();
 
     auto act = ar.alloc<bf16>((size_t)A_all * moe_inter);
@@ -460,36 +607,25 @@ static bool run_shard_nvfp4_gpu_layout(
                            row_expert_dev.data(), A_all, moe_inter);
       pack_bf16_to_nvfp4_grouped_rows(q, act.data(), moe_inter,
                                       row_expert_dev.data(), A_all,
-                                      down_input_dev.data(), act_packed.data(), act_scale.data()); }
+                                      down_input_dev, act_packed.data(), act_scale.data()); }
     gu.reset();
     act.reset();
-    down_input_dev.reset();
+    din_a.reset();
 
     auto Ye = ar.alloc<bf16>((size_t)A_all * H);
     { DIFF_PROF(q, prof.down_mm);
-      if (use_xe2v2) {
-          matmul_nvfp4_grouped_rows_xe2_v2(ctx, act_packed.data(), act_scale.data(), moe_inter,
-                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
-                                           down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
-                                           H, Ye.data());
-      } else if (use_xe2v6) {
-          matmul_nvfp4_grouped_rows_xe2_v6(ctx, act_packed.data(), act_scale.data(), moe_inter,
-                                           expert_offsets_dev.data(), rows_per_expert_dev.data(), localE,
-                                           max_mt,
-                                           down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
-                                           H, Ye.data());
-      } else if (use_xe2_gemm) {
+      if (use_xe2_gemm) {
           matmul_nvfp4_grouped_rows_xe2(ctx, act_packed.data(), act_scale.data(), moe_inter,
-                                        row_expert_dev.data(), A_all,
-                                        down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
-                                        H, Ye.data());
+                                         row_expert_dev.data(), A_all,
+                                         down_w_dev, down_s_dev, down_dst_dev,
+                                         H, Ye.data());
       } else {
           matmul_nvfp4_grouped_rows_custom(q, act_packed.data(), act_scale.data(), moe_inter,
                                            row_expert_dev.data(), A_all,
-                                           down_w_dev.data(), down_s_dev.data(), down_dst_dev.data(),
+                                           down_w_dev, down_s_dev, down_dst_dev,
                                            H, Ye.data());
       } }
-    down_w_dev.reset(); down_s_dev.reset(); down_dst_dev.reset();
+    dw_a.reset(); ds_a.reset(); ddst_a.reset();
     act_packed.reset(); act_scale.reset();
 
     auto t_combine = diffprof::tic(q);
@@ -511,7 +647,7 @@ static bool run_shard_nvfp4_gpu_layout(
             });
         });
     }
-    q.wait();
+    if (!nvfp4_session_recording(q)) q.wait();
     diffprof::toc(q, prof.combine, t_combine);
     return true;
 }
@@ -526,7 +662,8 @@ static void run_shard(
 	    const std::vector<float>& weight,
 	    const ExpertProfileLabels& prof,
 	    const int* idx_dev = nullptr,
-	    const float* weight_dev = nullptr)
+	    const float* weight_dev = nullptr,
+        const ExpertPostnormFusion* postnorm = nullptr)
 	{
 	    auto& q = ctx.queue;
 	    auto& ar = diffarena::arena(ctx.index);
@@ -535,8 +672,20 @@ static void run_shard(
 	    int A_all = seq * top_k;
 	    bool device_routes = idx_dev != nullptr && weight_dev != nullptr;
 
-        if (device_routes && shard.nvfp4 && nvfp4_gpu_layout_enabled() &&
-            seq <= nvfp4_gpu_layout_max_seq()) {
+        // Under a recording Nvfp4GraphSession the standard run_shard path is
+        // unusable: it does a host round-trip (q.memcpy(count).wait + host
+        // hot/cold bucketing with data-dependent total_rows) that neither
+        // captures nor re-runs on replay. The run_shard_nvfp4_gpu_layout path is
+        // fully device-resident and fixed-shape, so it IS capturable. Therefore,
+        // when a session is recording on this queue, FORCE the gpu_layout path
+        // regardless of DIFF_NVFP4_GPU_LAYOUT / its seq cap (the orchestrator
+        // only opens a session at a seq it intends to capture, so the cap is
+        // moot). Single-GPU scope: this is the only shard on owner's queue, so
+        // no cross-device coordination is involved. AB knob: DIFF_NVFP4_GPU_LAYOUT.
+        bool force_gpu_layout_for_session = nvfp4_session_recording(q);
+        if (device_routes && shard.nvfp4 &&
+            (force_gpu_layout_for_session ||
+             (nvfp4_gpu_layout_enabled() && seq <= nvfp4_gpu_layout_max_seq()))) {
             if (run_shard_nvfp4_gpu_layout(ctx, shard, expert_in, out, seq, H,
                                            top_k, moe_inter, prof,
                                            idx_dev, weight_dev))
@@ -573,7 +722,7 @@ static void run_shard(
 	        }
 	    }
 
-    q.memset(out, 0, (size_t)seq * H * sizeof(bf16));
+	    if (out) q.memset(out, 0, (size_t)seq * H * sizeof(bf16));
     if (A == 0) return;
 
     int T = std::min(moe_tail_cap(), round_up(seq, 8));
@@ -605,8 +754,13 @@ static void run_shard(
 
 	    auto slot_dev = ar.alloc<int32_t>(A_all);
 	    auto w_dev = ar.alloc<float>(A_all);
+	    // scatter+pack fusion (hybrid NVFP4, device-routes): skip the bf16 Xe
+	    // intermediate entirely -- the hybrid branch gathers hidden -> nvfp4.
+	    bool fuse_sp = shard.nvfp4 && nvfp4_use_hybrid_expert_kernel() &&
+	                   nvfp4_fuse_scatter_pack() && device_routes;
 	    auto Xe = ar.alloc<bf16>((size_t)total_rows * H);
-	    q.memset(Xe.data(), 0, (size_t)total_rows * H * sizeof(bf16));
+	    if (!fuse_sp)
+	        q.memset(Xe.data(), 0, (size_t)total_rows * H * sizeof(bf16));
 	    if (device_routes) {
 	        auto base_dev = ar.alloc<int32_t>(localE);
 	        auto cursor_dev = ar.alloc<int32_t>(localE);
@@ -638,14 +792,16 @@ static void run_shard(
 	        });
 	        const int32_t* slot = slot_dev.data();
 	        bf16* xe = Xe.data();
-	        q.submit([&](sycl::handler& h) {
-	            h.parallel_for(sycl::range<2>(A_all, H), [=](sycl::id<2> id) {
-	                int a = (int)id[0], d = (int)id[1];
-	                int s = slot[a];
-	                if (s >= 0)
-	                    xe[(size_t)s * H + d] = expert_in[(size_t)(a / top_k) * H + d];
+	        if (!fuse_sp) {
+	            q.submit([&](sycl::handler& h) {
+	                h.parallel_for(sycl::range<2>(A_all, H), [=](sycl::id<2> id) {
+	                    int a = (int)id[0], d = (int)id[1];
+	                    int s = slot[a];
+	                    if (s >= 0)
+	                        xe[(size_t)s * H + d] = expert_in[(size_t)(a / top_k) * H + d];
+	                });
 	            });
-	        });
+	        }
 	    } else {
 	        std::vector<int32_t> assign_token;
 	        std::vector<int32_t> assign_slot;
@@ -815,9 +971,21 @@ static void run_shard(
             auto xe_packed = ar.alloc<uint8_t>((size_t)total_rows * H / 2);
             auto xe_scale = ar.alloc<uint8_t>((size_t)total_rows * HG);
             { DIFF_PROF(q, prof.pack);
-              pack_bf16_to_nvfp4_grouped(q, Xe.data(), H,
+              if (fuse_sp) {
+                  // Scatter+pack fused: gather hidden -> nvfp4 directly, no Xe.
+                  // Padding bucket rows (beyond count[e]) stay zero from memset,
+                  // matching the unfused path where Xe=0 -> pack produces zeros.
+                  q.memset(xe_packed.data(), 0, (size_t)total_rows * H / 2);
+                  q.memset(xe_scale.data(), 0, (size_t)total_rows * HG);
+                  scatter_pack_nvfp4_grouped(q, expert_in, H,
+                                             slot_dev.data(), idx_dev, shard.first_expert,
+                                             gate_input_dev.data(), A_all, top_k,
+                                             xe_packed.data(), xe_scale.data());
+              } else {
+                  pack_bf16_to_nvfp4_grouped(q, Xe.data(), H,
                                        compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
-                                       gate_input_dev.data(), xe_packed.data(), xe_scale.data()); }
+                                       gate_input_dev.data(), xe_packed.data(), xe_scale.data());
+              } }
             Xe.reset();
             gate_input_dev.reset();
 
@@ -834,20 +1002,128 @@ static void run_shard(
             } }
             xe_packed.reset(); xe_scale.reset();
 
-            auto act = ar.alloc<bf16>((size_t)total_rows * moe_inter);
             auto act_packed = ar.alloc<uint8_t>((size_t)total_rows * moe_inter / 2);
             auto act_scale = ar.alloc<uint8_t>((size_t)total_rows * IG);
             { DIFF_PROF(q, prof.geglu_pack);
-              geglu_strided_grouped(q, gu.data(), act.data(), compute_slot_dev.data(),
-                                  compute_rows, moe_inter);
-              pack_bf16_to_nvfp4_grouped(q, act.data(), moe_inter,
-                                       compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
-                                       down_input_dev.data(), act_packed.data(), act_scale.data()); }
+              if (nvfp4_fuse_geglu_pack()) {
+                  // GeGLU + down-pack fused: no bf16 `act` intermediate.
+                  geglu_pack_nvfp4_grouped(q, gu.data(), moe_inter,
+                                          compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
+                                          down_input_dev.data(), act_packed.data(), act_scale.data());
+              } else {
+                  auto act = ar.alloc<bf16>((size_t)total_rows * moe_inter);
+                  geglu_strided_grouped(q, gu.data(), act.data(), compute_slot_dev.data(),
+                                      compute_rows, moe_inter);
+                  pack_bf16_to_nvfp4_grouped(q, act.data(), moe_inter,
+                                           compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
+                                           down_input_dev.data(), act_packed.data(), act_scale.data());
+                  act.reset();
+              } }
             gu.reset();
-            act.reset();
             compute_slot_dev.reset(); compute_expert_dev.reset();
             down_input_dev.reset();
 
+            Ye = ar.alloc<bf16>((size_t)total_rows * H);
+            { DIFF_PROF(q, prof.down_mm);
+            for (int e = 0; e < localE; ++e) {
+                if (count[e] == 0) continue;
+                int m = std::min(bucket_cap[e], round_up(count[e], round_m));
+                int off = base[e];
+                matmul_nvfp4_packed(act_packed.data() + (size_t)off * moe_inter / 2,
+                                    act_scale.data() + (size_t)off * IG,
+                                    m, moe_inter, shard.down_proj_fp4[e],
+                                    Ye.data() + (size_t)off * H, ctx);
+            } }
+            act_packed.reset(); act_scale.reset();
+        } else if (nvfp4_use_grouped_dpas_kernel()) {
+            // New codepath: grouped DPAS gate/up + GeGLU + down-pack fused into
+            // one custom kernel (eliminates gu/act bf16 intermediates + 2 launches),
+            // then the existing per-expert oneDNN loop for the down projection.
+            // The down GEMM has no clean epilogue fusion (the combine kernel's
+            // expert-sum is inherently separate), so it stays on oneDNN.
+            // Select via DIFF_NVFP4_EXPERT_KERNEL=grouped-dpas. Hybrid (oneDNN
+            // loop) remains the default.
+            std::vector<int32_t> compute_slot;
+            std::vector<int32_t> compute_expert;
+            compute_slot.reserve((size_t)A + localE * round_m);
+            compute_expert.reserve((size_t)A + localE * round_m);
+            for (int e = 0; e < localE; ++e) {
+                if (count[e] == 0) continue;
+                int m = std::min(bucket_cap[e], round_up(count[e], round_m));
+                int off = base[e];
+                for (int r = 0; r < m; ++r) {
+                    compute_slot.push_back(off + r);
+                    compute_expert.push_back(e);
+                }
+            }
+            int compute_rows = (int)compute_slot.size();
+            auto compute_slot_dev = ar.alloc<int32_t>(compute_rows);
+            auto compute_expert_dev = ar.alloc<int32_t>(compute_rows);
+            upload_alloc(q, compute_slot_dev, compute_slot);
+            upload_alloc(q, compute_expert_dev, compute_expert);
+
+            std::vector<float> gate_input(localE), down_input(localE);
+            for (int e = 0; e < localE; ++e) {
+                gate_input[e] = shard.gate_up_proj_fp4[e].input_global_scale;
+                down_input[e] = shard.down_proj_fp4[e].input_global_scale;
+            }
+            auto gate_input_dev = ar.alloc<float>(localE);
+            auto down_input_dev = ar.alloc<float>(localE);
+            upload_alloc(q, gate_input_dev, gate_input);
+            upload_alloc(q, down_input_dev, down_input);
+
+            // Scatter+pack hidden -> xe_packed/xe_scale (same fused path as hybrid).
+            auto xe_packed = ar.alloc<uint8_t>((size_t)total_rows * H / 2);
+            auto xe_scale = ar.alloc<uint8_t>((size_t)total_rows * HG);
+            { DIFF_PROF(q, prof.pack);
+              if (fuse_sp) {
+                  q.memset(xe_packed.data(), 0, (size_t)total_rows * H / 2);
+                  q.memset(xe_scale.data(), 0, (size_t)total_rows * HG);
+                  scatter_pack_nvfp4_grouped(q, expert_in, H,
+                                             slot_dev.data(), idx_dev, shard.first_expert,
+                                             gate_input_dev.data(), A_all, top_k,
+                                             xe_packed.data(), xe_scale.data());
+              } else {
+                  pack_bf16_to_nvfp4_grouped(q, Xe.data(), H,
+                                       compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
+                                       gate_input_dev.data(), xe_packed.data(), xe_scale.data());
+              } }
+            Xe.reset();
+            gate_input_dev.reset();
+
+            // Build per-expert device-pointer arrays for the fused kernel.
+            // Coalesced weight is cached on the Nvfp4Linear (one-time per expert).
+            std::vector<const uint8_t*> gate_w(localE), gate_s(localE);
+            std::vector<const float*> gate_dst(localE);
+            for (int e = 0; e < localE; ++e) {
+                gate_w[e] = nvfp4_coalesced_weight(shard.gate_up_proj_fp4[e], H, 2 * moe_inter, ctx);
+                gate_s[e] = shard.gate_up_proj_fp4[e].weight_scale.data();
+                gate_dst[e] = shard.gate_up_proj_fp4[e].dst_scale.data();
+            }
+            auto gate_w_dev = ar.alloc<const uint8_t*>(localE);
+            auto gate_s_dev = ar.alloc<const uint8_t*>(localE);
+            auto gate_dst_dev = ar.alloc<const float*>(localE);
+            upload_alloc(q, gate_w_dev, gate_w);
+            upload_alloc(q, gate_s_dev, gate_s);
+            upload_alloc(q, gate_dst_dev, gate_dst);
+
+            // Fused gate/up DPAS + GeGLU + down-pack -> act_packed/act_scale.
+            auto act_packed = ar.alloc<uint8_t>((size_t)total_rows * moe_inter / 2);
+            auto act_scale = ar.alloc<uint8_t>((size_t)total_rows * IG);
+            { DIFF_PROF(q, prof.gateup_mm);
+              matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
+                  ctx, xe_packed.data(), xe_scale.data(), H,
+                  compute_slot_dev.data(), compute_expert_dev.data(), compute_rows,
+                  gate_w_dev.data(), gate_s_dev.data(), gate_dst_dev.data(),
+                  moe_inter, down_input_dev.data(),
+                  act_packed.data(), act_scale.data()); }
+            // pack+geglu_profile combined into gateup_mm here (no separate geglu_pack).
+            xe_packed.reset(); xe_scale.reset();
+            gate_w_dev.reset(); gate_s_dev.reset(); gate_dst_dev.reset();
+            compute_slot_dev.reset(); compute_expert_dev.reset();
+            down_input_dev.reset();
+
+            // Down projection: per-expert oneDNN loop (unchanged from hybrid).
             Ye = ar.alloc<bf16>((size_t)total_rows * H);
             { DIFF_PROF(q, prof.down_mm);
             for (int e = 0; e < localE; ++e) {
@@ -1134,7 +1410,14 @@ static void run_shard(
     }
 
     auto t_combine = diffprof::tic(q);
-    {
+    if (postnorm) {
+        fused_int4_expert_combine_postnorm(
+            q, Ye.data(), slot_dev.data(), w_dev.data(), top_k,
+            postnorm->mlp_out, postnorm->mlp_norm_weight,
+            postnorm->moe_norm_weight, postnorm->combine_norm_weight,
+            postnorm->hidden, postnorm->layer_scalar,
+            seq, H, postnorm->rms_eps);
+    } else {
         const int32_t* slot = slot_dev.data();
         const float* wt = w_dev.data();
         const bf16* ye = Ye.data();
@@ -1194,14 +1477,41 @@ void expert_parallel_forward(
 
         if (local) {
             add_inplace(owner_q, out, shard_out, (int)N);
-            owner_q.wait();
+            if (!nvfp4_session_recording(owner_q)) owner_q.wait();
         } else {
             auto tmp = diffarena::arena(owner.index).alloc<bf16>(N);
             transfer(q, shard_out, owner_q, tmp.data(), N);
             add_inplace(owner_q, out, tmp.data(), (int)N);
-            owner_q.wait();
+            if (!nvfp4_session_recording(owner_q)) owner_q.wait();
         }
     }
+}
+
+bool expert_parallel_forward_int4_fused_postnorm(
+    GpuEngine& owner,
+    const DiffMoE& moe,
+    const bf16* expert_in,
+    int seq, int H, int E, int top_k, int moe_intermediate,
+    const int* idx_dev,
+    const float* weight_dev,
+    const ExpertPostnormFusion& fusion,
+    const ExpertProfileLabels& prof)
+{
+    if (!diff_int4_fuse_expert_postnorm_enabled() ||
+        !idx_dev || !weight_dev || moe.expert_shards.size() != 1)
+        return false;
+
+    const DiffExpertShard& shard = moe.expert_shards.front();
+    if (!shard.int4 || shard.gpu != owner.index || shard.first_expert != 0 ||
+        shard.num_experts != E)
+        return false;
+
+    static const std::vector<int> empty_idx;
+    static const std::vector<float> empty_weight;
+    run_shard(owner, shard, expert_in, /*out=*/nullptr, seq, H, top_k,
+              moe_intermediate, empty_idx, empty_weight, prof,
+              idx_dev, weight_dev, &fusion);
+    return true;
 }
 
 void expert_parallel_forward(
@@ -1260,12 +1570,12 @@ void expert_parallel_forward(
 
         if (local) {
             add_inplace(owner_q, out, shard_out, (int)N);
-            owner_q.wait();
+            if (!nvfp4_session_recording(owner_q)) owner_q.wait();
         } else {
             auto tmp = diffarena::arena(owner.index).alloc<bf16>(N);
             transfer(q, shard_out, owner_q, tmp.data(), N);
             add_inplace(owner_q, out, tmp.data(), (int)N);
-            owner_q.wait();
+            if (!nvfp4_session_recording(owner_q)) owner_q.wait();
         }
     }
 }

@@ -5,6 +5,7 @@
 #include "linear_dispatch.hpp"
 #include "fusions/prenorm.hpp"
 #include "fusions/postnorm.hpp"
+#include "fusions/int4_awq.hpp"
 #include "../../common/gpu/expert_parallel.hpp"
 #include "../../utils/profile.hpp"
 #include "arena.hpp"
@@ -70,6 +71,16 @@ static void dense_mlp(GpuEngine& ctx, const DiffDenseMLP& w,
                       const bf16* x, bf16* out, int seq, int H, int inter) {
     auto& q = ctx.queue;
     auto& ar = diffarena::arena(ctx.index);
+    if (!w.gate_up_proj_bf16.empty()) {
+        auto gate_up_a = ar.alloc<bf16>((size_t)seq * 2 * inter);
+        matmul_bf16(x, seq, H, w.gate_up_proj_bf16.data(), 2 * inter,
+                    gate_up_a.data(), ctx);
+        auto act_a = ar.alloc<bf16>((size_t)seq * inter);
+        geglu_strided(q, gate_up_a.data(), act_a.data(), seq, inter);
+        gate_up_a.reset();
+        matmul_linear_weight(act_a.data(), seq, inter, w.down_proj, H, out, ctx);
+        return;
+    }
     if (!w.gate_up_proj_fp4.empty()) {
         if (!w.down_proj.nvfp4)
             throw std::runtime_error("NVFP4 dense fused gate/up requires NVFP4 down projection");
@@ -85,7 +96,16 @@ static void dense_mlp(GpuEngine& ctx, const DiffDenseMLP& w,
         auto act_a = ar.alloc<bf16>((size_t)seq * inter);
         geglu_strided(q, gate_up_a.data(), act_a.data(), seq, inter);
         gate_up_a.reset();
-        matmul_nvfp4(act_a.data(), seq, inter, w.down_proj.fp4, out, ctx);
+        // down_proj goes through matmul_nvfp4 (bf16->pack->matmul). Pass stable
+        // arena-backed pack workspaces so matmul_nvfp4 does NOT allocate a
+        // transient sycl::malloc_device buffer (which would be freed at scope
+        // exit and dangle at SYCL-graph-replay time) and does NOT wait. This
+        // keeps the dense-MLP down_proj capture-safe inside a Nvfp4GraphSession.
+        int dG = inter / 16;
+        auto dp_packed_a = ar.alloc<uint8_t>((size_t)seq * inter / 2);
+        auto dp_scale_a  = ar.alloc<uint8_t>((size_t)seq * dG);
+        matmul_nvfp4(act_a.data(), seq, inter, w.down_proj.fp4, out, ctx,
+                    dp_packed_a.data(), dp_scale_a.data());
         return;
     }
 
@@ -472,7 +492,7 @@ void dual_ffn_forward(
     auto x2_a = ar.alloc<bf16>(N);
     auto rn_a = ar.alloc<bf16>(N);
     auto mlp_a = ar.alloc<bf16>(N);
-    auto moe_a = ar.alloc<bf16>(N);
+    diffarena::Alloc<bf16> moe_a;
     { DIFF_PROF(q, prof.prenorm);
       fused_triple_prenorm(q, hidden,
                            lw.pre_ffn_ln.data(), lw.pre_ffn_ln_2.data(),
@@ -489,24 +509,44 @@ void dual_ffn_forward(
     { DIFF_PROF(q, prof.router);
       routes = router(ctx, lw.moe, rn_a.data(), seq, H, num_experts, top_k); }
     rn_a.reset();
+    bool postnorm_fused = false;
     { DIFF_PROF(q, prof.experts_total);
-      if (routes.device) {
-          expert_parallel_forward(ctx, lw.moe, x2_a.data(), moe_a.data(),
-                                  seq, H, num_experts, top_k, moe_intermediate,
-                                  routes.idx_dev.data(), routes.weight_dev.data(),
-                                  exp_prof);
-      } else {
-          expert_parallel_forward(ctx, lw.moe, x2_a.data(), moe_a.data(),
-                                  seq, H, num_experts, top_k, moe_intermediate,
-                                  routes.idx, routes.weight, exp_prof);
+      if (routes.device && diff_int4_fuse_expert_postnorm_enabled()) {
+          ExpertPostnormFusion fusion;
+          fusion.mlp_out = mlp_a.data();
+          fusion.mlp_norm_weight = lw.post_ffn_ln_1.data();
+          fusion.moe_norm_weight = lw.post_ffn_ln_2.data();
+          fusion.combine_norm_weight = lw.post_ffn_ln.data();
+          fusion.hidden = hidden;
+          fusion.layer_scalar = layer_scalar;
+          fusion.rms_eps = rms_eps;
+          postnorm_fused = expert_parallel_forward_int4_fused_postnorm(
+              ctx, lw.moe, x2_a.data(), seq, H, num_experts, top_k,
+              moe_intermediate, routes.idx_dev.data(), routes.weight_dev.data(),
+              fusion, exp_prof);
+      }
+      if (!postnorm_fused) {
+          moe_a = ar.alloc<bf16>(N);
+          if (routes.device) {
+              expert_parallel_forward(ctx, lw.moe, x2_a.data(), moe_a.data(),
+                                      seq, H, num_experts, top_k, moe_intermediate,
+                                      routes.idx_dev.data(), routes.weight_dev.data(),
+                                      exp_prof);
+          } else {
+              expert_parallel_forward(ctx, lw.moe, x2_a.data(), moe_a.data(),
+                                      seq, H, num_experts, top_k, moe_intermediate,
+                                      routes.idx, routes.weight, exp_prof);
+          }
       } }
     x2_a.reset();
 
     // F3: hidden = (hidden + norm(norm(mlp,w1) + norm(moe,w2), w3)) * scalar
-    { DIFF_PROF(q, prof.postnorm);
-      fused_dual_postnorm(q,
-                          mlp_a.data(), lw.post_ffn_ln_1.data(),
-                          moe_a.data(), lw.post_ffn_ln_2.data(),
-                          lw.post_ffn_ln.data(),
-                          hidden, layer_scalar, seq, H, rms_eps); }
+    if (!postnorm_fused) {
+        DIFF_PROF(q, prof.postnorm);
+        fused_dual_postnorm(q,
+                            mlp_a.data(), lw.post_ffn_ln_1.data(),
+                            moe_a.data(), lw.post_ffn_ln_2.data(),
+                            lw.post_ffn_ln.data(),
+                            hidden, layer_scalar, seq, H, rms_eps);
+    }
 }

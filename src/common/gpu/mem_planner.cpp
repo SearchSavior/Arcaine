@@ -50,39 +50,6 @@ struct DynArena {
 
 int round_up(int v, int m) { return (v + m - 1) / m * m; }
 
-bool fused_int4_attn_proj_enabled_any() {
-    static bool enabled = [] {
-        const char* e = std::getenv("DIFF_FUSED_INT4_ATTN_PROJ");
-        return e && std::strcmp(e, "0") != 0 && std::strcmp(e, "false") != 0 &&
-               std::strcmp(e, "FALSE") != 0 && std::strcmp(e, "off") != 0 &&
-               std::strcmp(e, "OFF") != 0 && std::strcmp(e, "no") != 0 &&
-               std::strcmp(e, "NO") != 0;
-    }();
-    return enabled;
-}
-
-bool fused_int4_attn_proj_enabled_for(bool causal_encoder_path) {
-    const char* e = std::getenv("DIFF_FUSED_INT4_ATTN_PROJ");
-    if (!e) return false;
-    if (std::strcmp(e, "decode") == 0 || std::strcmp(e, "decoder") == 0)
-        return !causal_encoder_path;
-    if (std::strcmp(e, "prefill") == 0 || std::strcmp(e, "encode") == 0 ||
-        std::strcmp(e, "encoder") == 0)
-        return causal_encoder_path;
-    return fused_int4_attn_proj_enabled_any();
-}
-
-bool decode_kv_direct_cache_enabled() {
-    static bool enabled = [] {
-        const char* e = std::getenv("DIFF_DECODE_KV_DIRECT_CACHE");
-        return e && std::strcmp(e, "0") != 0 && std::strcmp(e, "false") != 0 &&
-               std::strcmp(e, "FALSE") != 0 && std::strcmp(e, "off") != 0 &&
-               std::strcmp(e, "OFF") != 0 && std::strcmp(e, "no") != 0 &&
-               std::strcmp(e, "NO") != 0;
-    }();
-    return enabled;
-}
-
 constexpr size_t B = 2;  // bf16 bytes
 constexpr size_t kScoresBudgetElems = (size_t)256 * 1024 * 1024;  // matches attention.cpp
 
@@ -93,9 +60,8 @@ void add_block(Graph& g, const DiffConfig& cfg, int layer, int hidden,
                int seq, int kv_len, bool causal) {
     const auto& t = cfg.text;
     bool nvfp4 = cfg.is_nvfp4_quantized();
-    bool direct_decode_kv = !causal && decode_kv_direct_cache_enabled();
-    bool fused_int4_attn = cfg.is_int4_quantized() && !direct_decode_kv &&
-                           fused_int4_attn_proj_enabled_for(causal);
+    bool direct_decode_kv = !causal;  // decoder (non-causal) always direct-caches now
+    bool fused_int4_attn = cfg.is_int4_quantized() && !direct_decode_kv;
     int H = t.hidden_size, nq = t.num_attn_heads;
     bool full = t.is_full_attention[layer];
     int nkv = full ? t.num_global_kv_heads : t.num_kv_heads;

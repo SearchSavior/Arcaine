@@ -3,6 +3,7 @@
 #include "../../common/kernels/attention_mask.hpp"
 #include "../../common/kernels/rms_norm.hpp"
 #include "../../common/kernels/rope.hpp"
+#include "attention_kernels.hpp"  // fused norm+rope / softmax leaf kernels + AB knobs
 #include "../../common/layers/attention_layout.hpp"  // transpose_q_into, scatter_ctx
 #include "linear_dispatch.hpp"
 #include "arena.hpp"
@@ -142,58 +143,13 @@ static const char* attn_fused_split_prof(AttnProfileKind kind) {
     return labels[(int)kind];
 }
 
-static bool attn_kind_is_encoder(AttnProfileKind kind) {
-    return kind == AttnProfileKind::EncSliding || kind == AttnProfileKind::EncFull;
-}
-
-static bool fused_int4_attn_proj_enabled_any() {
-    static bool enabled = [] {
-        const char* e = std::getenv("DIFF_FUSED_INT4_ATTN_PROJ");
-        return e && std::strcmp(e, "0") != 0 && std::strcmp(e, "false") != 0 &&
-               std::strcmp(e, "FALSE") != 0 && std::strcmp(e, "off") != 0 &&
-               std::strcmp(e, "OFF") != 0 && std::strcmp(e, "no") != 0 &&
-               std::strcmp(e, "NO") != 0;
-    }();
-    return enabled;
-}
-
-static bool fused_int4_attn_proj_enabled_for(AttnProfileKind kind) {
-    const char* e = std::getenv("DIFF_FUSED_INT4_ATTN_PROJ");
-    if (!e) return false;
-    if (std::strcmp(e, "decode") == 0 || std::strcmp(e, "decoder") == 0)
-        return !attn_kind_is_encoder(kind);
-    if (std::strcmp(e, "prefill") == 0 || std::strcmp(e, "encode") == 0 ||
-        std::strcmp(e, "encoder") == 0)
-        return attn_kind_is_encoder(kind);
-    return fused_int4_attn_proj_enabled_any();
-}
-
+// Fused int4 attention projection is always on when the fused QKV/QK weights
+// were uploaded (loader uploads them whenever the per-layer q/k/v projections
+// are int4). No runtime env toggle.
 static bool usable_int4_fused_proj(const Int4Linear& W, int in_features,
-                                   int out_features, AttnProfileKind kind) {
-    return fused_int4_attn_proj_enabled_for(kind) && !W.empty() &&
+                                   int out_features) {
+    return !W.empty() &&
            W.in_features == in_features && W.out_features == out_features;
-}
-
-static bool decoder_kv_stage_kernel_enabled() {
-    static bool enabled = [] {
-        const char* e = std::getenv("DIFF_STAGE_DECODER_KV_KERNEL");
-        return e && std::strcmp(e, "0") != 0 && std::strcmp(e, "false") != 0 &&
-               std::strcmp(e, "FALSE") != 0 && std::strcmp(e, "off") != 0 &&
-               std::strcmp(e, "OFF") != 0 && std::strcmp(e, "no") != 0 &&
-               std::strcmp(e, "NO") != 0;
-    }();
-    return enabled;
-}
-
-static bool decode_kv_direct_cache_enabled() {
-    static bool enabled = [] {
-        const char* e = std::getenv("DIFF_DECODE_KV_DIRECT_CACHE");
-        return e && std::strcmp(e, "0") != 0 && std::strcmp(e, "false") != 0 &&
-               std::strcmp(e, "FALSE") != 0 && std::strcmp(e, "off") != 0 &&
-               std::strcmp(e, "OFF") != 0 && std::strcmp(e, "no") != 0 &&
-               std::strcmp(e, "NO") != 0;
-    }();
-    return enabled;
 }
 
 static const char* onednn_sdpa_mode() {
@@ -248,82 +204,12 @@ static bool onednn_sdpa_encoder_sliding_enabled() {
            std::strcmp(e, "all_experimental") == 0;
 }
 
-static void stage_decoder_kv(sycl::queue& q,
-                             const bf16* K, const bf16* V,
-                             bf16* K_cache, bf16* V_cache,
-                             int seq, size_t row) {
-    size_t n = (size_t)seq * row;
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<2>(2, n), [=](sycl::id<2> id) {
-            size_t i = id[1];
-            if (id[0] == 0)
-                K_cache[i] = K[i];
-            else
-                V_cache[i] = V[i];
-        });
-    });
-}
-
-static void fused_norm_rope_inplace(
-    sycl::queue& q, bf16* x, const bf16* weight,
-    int seq, int nheads, int hd, int offset,
-    float theta, float partial, float eps) {
-    int pair_offset = hd / 2;
-    int n_active_pairs = static_cast<int>(partial * hd / 2.0f);
-    float freq_denom = static_cast<float>(hd);
-    size_t local = std::min(256, hd);
-    while (local & (local - 1)) local--;
-    int rows = seq * nheads;
-
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> lmem(local, h);
-        h.parallel_for(
-            sycl::nd_range<1>((size_t)rows * local, local),
-            [=](sycl::nd_item<1> it) {
-                int row = it.get_group(0);
-                int lid = it.get_local_id(0);
-                int lsz = it.get_local_range(0);
-                int tok = row / nheads;
-                int head = row - tok * nheads;
-                bf16* xrow = x + ((size_t)tok * nheads + head) * hd;
-
-                float ss = 0.0f;
-                for (int d = lid; d < hd; d += lsz) {
-                    float v = bf16_to_float(xrow[d]);
-                    ss += v * v;
-                }
-                lmem[lid] = ss;
-                it.barrier(sycl::access::fence_space::local_space);
-                for (int s = lsz >> 1; s > 0; s >>= 1) {
-                    if (lid < s) lmem[lid] += lmem[lid + s];
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                float rms_inv = sycl::rsqrt(lmem[0] / float(hd) + eps);
-
-                for (int d = lid; d < hd; d += lsz) {
-                    float v = bf16_to_float(xrow[d]) * rms_inv * bf16_to_float(weight[d]);
-                    xrow[d] = float_to_bf16(v);
-                }
-
-                it.barrier(sycl::access::fence_space::local_space);
-                for (int pair_i = lid; pair_i < n_active_pairs; pair_i += lsz) {
-                    float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
-                    float angle = (float)(offset + tok) * inv_freq;
-                    float c = sycl::cos(angle);
-                    float s = sycl::sin(angle);
-                    float x0 = bf16_to_float(xrow[pair_i]);
-                    float x1 = bf16_to_float(xrow[pair_i + pair_offset]);
-                    xrow[pair_i] = float_to_bf16(x0 * c - x1 * s);
-                    xrow[pair_i + pair_offset] = float_to_bf16(x0 * s + x1 * c);
-                }
-            });
-    });
-}
-
 static void fused_sliding_decoder_kv_cache_postprocess(
     sycl::queue& q, bf16* K_cache, bf16* V_cache, const bf16* kn,
     int seq, int nkv, int hd, int offset,
-    float theta, float partial, float eps) {
+    float theta, float partial, float eps,
+    const float* rope_cos, const float* rope_sin,
+    Nvfp4GraphSession* /*session*/ = nullptr) {
     int pair_offset = hd / 2;
     int n_active_pairs = static_cast<int>(partial * hd / 2.0f);
     float freq_denom = static_cast<float>(hd);
@@ -332,7 +218,6 @@ static void fused_sliding_decoder_kv_cache_postprocess(
     int kv_rows = seq * nkv;
 
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> lmem(local, h);
         h.parallel_for(
             sycl::nd_range<1>((size_t)kv_rows * 2 * local, local),
             [=](sycl::nd_item<1> it) {
@@ -350,13 +235,8 @@ static void fused_sliding_decoder_kv_cache_postprocess(
                     float v = bf16_to_float(xrow[d]);
                     ss += v * v;
                 }
-                lmem[lid] = ss;
-                it.barrier(sycl::access::fence_space::local_space);
-                for (int s = lsz >> 1; s > 0; s >>= 1) {
-                    if (lid < s) lmem[lid] += lmem[lid + s];
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                float rms_inv = sycl::rsqrt(lmem[0] / float(hd) + eps);
+                float ss_sum = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                float rms_inv = sycl::rsqrt(ss_sum / float(hd) + eps);
 
                 for (int d = lid; d < hd; d += lsz) {
                     float v = bf16_to_float(xrow[d]) * rms_inv;
@@ -367,10 +247,17 @@ static void fused_sliding_decoder_kv_cache_postprocess(
                 if (is_k) {
                     it.barrier(sycl::access::fence_space::local_space);
                     for (int pair_i = lid; pair_i < n_active_pairs; pair_i += lsz) {
-                        float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
-                        float angle = (float)(offset + tok) * inv_freq;
-                        float c = sycl::cos(angle);
-                        float s = sycl::sin(angle);
+                        float c, s;
+                        if (rope_cos) {
+                            int ti = tok * n_active_pairs + pair_i;
+                            c = rope_cos[ti];
+                            s = rope_sin[ti];
+                        } else {
+                            float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
+                            float angle = (float)(offset + tok) * inv_freq;
+                            c = sycl::cos(angle);
+                            s = sycl::sin(angle);
+                        }
                         float x0 = bf16_to_float(xrow[pair_i]);
                         float x1 = bf16_to_float(xrow[pair_i + pair_offset]);
                         xrow[pair_i] = float_to_bf16(x0 * c - x1 * s);
@@ -384,7 +271,9 @@ static void fused_sliding_decoder_kv_cache_postprocess(
 static void fused_full_decoder_kv_cache_postprocess(
     sycl::queue& q, bf16* K_cache, bf16* V_cache, const bf16* kn,
     int seq, int nkv, int hd, int offset,
-    float theta, float partial, float eps) {
+    float theta, float partial, float eps,
+    const float* rope_cos, const float* rope_sin,
+    Nvfp4GraphSession* /*session*/ = nullptr) {
     int pair_offset = hd / 2;
     int n_active_pairs = static_cast<int>(partial * hd / 2.0f);
     float freq_denom = static_cast<float>(hd);
@@ -393,7 +282,6 @@ static void fused_full_decoder_kv_cache_postprocess(
     int rows = seq * nkv;
 
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> lmem(local, h);
         h.parallel_for(
             sycl::nd_range<1>((size_t)rows * local, local),
             [=](sycl::nd_item<1> it) {
@@ -410,13 +298,8 @@ static void fused_full_decoder_kv_cache_postprocess(
                     float v = bf16_to_float(krow[d]);
                     ss += v * v;
                 }
-                lmem[lid] = ss;
-                it.barrier(sycl::access::fence_space::local_space);
-                for (int s = lsz >> 1; s > 0; s >>= 1) {
-                    if (lid < s) lmem[lid] += lmem[lid + s];
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                float rms_inv = sycl::rsqrt(lmem[0] / float(hd) + eps);
+                float ss_sum = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                float rms_inv = sycl::rsqrt(ss_sum / float(hd) + eps);
 
                 for (int d = lid; d < hd; d += lsz) {
                     float v = bf16_to_float(krow[d]) * rms_inv;
@@ -426,10 +309,17 @@ static void fused_full_decoder_kv_cache_postprocess(
 
                 it.barrier(sycl::access::fence_space::local_space);
                 for (int pair_i = lid; pair_i < n_active_pairs; pair_i += lsz) {
-                    float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
-                    float angle = (float)(offset + tok) * inv_freq;
-                    float c = sycl::cos(angle);
-                    float s = sycl::sin(angle);
+                    float c, s;
+                    if (rope_cos) {
+                        int ti = tok * n_active_pairs + pair_i;
+                        c = rope_cos[ti];
+                        s = rope_sin[ti];
+                    } else {
+                        float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
+                        float angle = (float)(offset + tok) * inv_freq;
+                        c = sycl::cos(angle);
+                        s = sycl::sin(angle);
+                    }
                     float x0 = bf16_to_float(krow[pair_i]);
                     float x1 = bf16_to_float(krow[pair_i + pair_offset]);
                     krow[pair_i] = float_to_bf16(x0 * c - x1 * s);
@@ -444,7 +334,9 @@ static void fused_sliding_qkv_postprocess(
     bf16* Q, bf16* K, bf16* V,
     const bf16* qn, const bf16* kn,
     int seq, int nq, int nkv, int hd, int offset,
-    float theta, float partial, float eps) {
+    float theta, float partial, float eps,
+    const float* rope_cos, const float* rope_sin,
+    Nvfp4GraphSession* /*session*/ = nullptr) {
     int rows = nq + 2 * nkv;
     int q_dim = nq * hd;
     int kv_dim = nkv * hd;
@@ -456,7 +348,6 @@ static void fused_sliding_qkv_postprocess(
     while (local & (local - 1)) local--;
 
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> lmem(local, h);
         h.parallel_for(
             sycl::nd_range<1>((size_t)seq * rows * local, local),
             [=](sycl::nd_item<1> it) {
@@ -479,13 +370,8 @@ static void fused_sliding_qkv_postprocess(
                     float v = bf16_to_float(fused[src_base + d]);
                     ss += v * v;
                 }
-                lmem[lid] = ss;
-                it.barrier(sycl::access::fence_space::local_space);
-                for (int s = lsz >> 1; s > 0; s >>= 1) {
-                    if (lid < s) lmem[lid] += lmem[lid + s];
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                float rms_inv = sycl::rsqrt(lmem[0] / float(hd) + eps);
+                float ss_sum = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                float rms_inv = sycl::rsqrt(ss_sum / float(hd) + eps);
 
                 bf16* dst = is_q ? Q + ((size_t)tok * nq + head) * hd
                                  : is_k ? K + ((size_t)tok * nkv + head) * hd
@@ -500,10 +386,17 @@ static void fused_sliding_qkv_postprocess(
                 if (is_q || is_k) {
                     it.barrier(sycl::access::fence_space::local_space);
                     for (int pair_i = lid; pair_i < n_active_pairs; pair_i += lsz) {
-                        float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
-                        float angle = (float)(offset + tok) * inv_freq;
-                        float c = sycl::cos(angle);
-                        float s = sycl::sin(angle);
+                        float c, s;
+                        if (rope_cos) {
+                            int ti = tok * n_active_pairs + pair_i;
+                            c = rope_cos[ti];
+                            s = rope_sin[ti];
+                        } else {
+                            float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
+                            float angle = (float)(offset + tok) * inv_freq;
+                            c = sycl::cos(angle);
+                            s = sycl::sin(angle);
+                        }
                         float x0 = bf16_to_float(dst[pair_i]);
                         float x1 = bf16_to_float(dst[pair_i + pair_offset]);
                         dst[pair_i] = float_to_bf16(x0 * c - x1 * s);
@@ -519,7 +412,9 @@ static void fused_full_qk_postprocess(
     bf16* Q, bf16* K, bf16* V,
     const bf16* qn, const bf16* kn,
     int seq, int nq, int nkv, int hd, int offset,
-    float theta, float partial, float eps) {
+    float theta, float partial, float eps,
+    const float* rope_cos, const float* rope_sin,
+    Nvfp4GraphSession* /*session*/ = nullptr) {
     int rows = nq + nkv;
     int q_dim = nq * hd;
     int kv_dim = nkv * hd;
@@ -531,7 +426,6 @@ static void fused_full_qk_postprocess(
     while (local & (local - 1)) local--;
 
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> lmem(local, h);
         h.parallel_for(
             sycl::nd_range<1>((size_t)seq * rows * local, local),
             [=](sycl::nd_item<1> it) {
@@ -551,13 +445,8 @@ static void fused_full_qk_postprocess(
                     float v = bf16_to_float(fused[src_base + d]);
                     ss += v * v;
                 }
-                lmem[lid] = ss;
-                it.barrier(sycl::access::fence_space::local_space);
-                for (int s = lsz >> 1; s > 0; s >>= 1) {
-                    if (lid < s) lmem[lid] += lmem[lid + s];
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                float rms_inv = sycl::rsqrt(lmem[0] / float(hd) + eps);
+                float ss_sum = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                float rms_inv = sycl::rsqrt(ss_sum / float(hd) + eps);
 
                 bf16* dst = is_q ? Q + ((size_t)tok * nq + head) * hd
                                  : K + ((size_t)tok * nkv + head) * hd;
@@ -574,10 +463,17 @@ static void fused_full_qk_postprocess(
 
                 it.barrier(sycl::access::fence_space::local_space);
                 for (int pair_i = lid; pair_i < n_active_pairs; pair_i += lsz) {
-                    float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
-                    float angle = (float)(offset + tok) * inv_freq;
-                    float c = sycl::cos(angle);
-                    float s = sycl::sin(angle);
+                    float c, s;
+                    if (rope_cos) {
+                        int ti = tok * n_active_pairs + pair_i;
+                        c = rope_cos[ti];
+                        s = rope_sin[ti];
+                    } else {
+                        float inv_freq = 1.0f / sycl::pow(theta, 2.0f * pair_i / freq_denom);
+                        float angle = (float)(offset + tok) * inv_freq;
+                        c = sycl::cos(angle);
+                        s = sycl::sin(angle);
+                    }
                     float x0 = bf16_to_float(dst[pair_i]);
                     float x1 = bf16_to_float(dst[pair_i + pair_offset]);
                     dst[pair_i] = float_to_bf16(x0 * c - x1 * s);
@@ -598,7 +494,8 @@ struct QKV {
 // Project + per-head Q/K RMSNorm + (scaleless) V norm + RoPE at `offset`.
 QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
                 int seq, const DiffTextConfig& cfg, int offset,
-                AttnProfileKind prof) {
+                AttnProfileKind prof,
+                Nvfp4GraphSession* session = nullptr) {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
     int nq = cfg.num_attn_heads;
@@ -629,6 +526,8 @@ QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
     out.V = ar.alloc<bf16>((size_t)seq * nkv * hd);
     bf16* Q = out.Q.data(); bf16* K = out.K.data(); bf16* V = out.V.data();
 
+    RopeTable rope = (diff_fused_norm_rope_mode() == RopeKernelMode::Table)
+        ? make_rope_table(ctx, seq, offset, hd, theta, partial) : RopeTable{};
     bool used_fused_proj = false;
     bool rope_done = false;
     if (!lw.is_full) {
@@ -636,14 +535,16 @@ QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
         int q_dim = nq * hd;
         int kv_dim = nkv * hd;
         int fused_dim = q_dim + 2 * kv_dim;
-        if (usable_int4_fused_proj(s.qkv_proj_int4, H, fused_dim, prof)) {
+        if (usable_int4_fused_proj(s.qkv_proj_int4, H, fused_dim)) {
             auto fused = ar.alloc<bf16>((size_t)seq * fused_dim);
             { DIFF_PROF(q, attn_fused_proj_prof(prof));
               matmul_int4(hidden, seq, H, s.qkv_proj_int4, fused.data(), ctx); }
             { DIFF_PROF(q, attn_fused_split_prof(prof));
               fused_sliding_qkv_postprocess(q, fused.data(), Q, K, V,
-                                            qn, kn, seq, nq, nkv, hd, offset,
-                                            theta, partial, cfg.rms_norm_eps); }
+                                             qn, kn, seq, nq, nkv, hd, offset,
+                                             theta, partial, cfg.rms_norm_eps,
+                                             rope.cos_data(), rope.sin_data(),
+                                             session); }
             used_fused_proj = true;
             rope_done = true;
         }
@@ -652,14 +553,16 @@ QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
         int q_dim = nq * hd;
         int kv_dim = nkv * hd;
         int fused_dim = q_dim + kv_dim;
-        if (usable_int4_fused_proj(fa.qk_proj_int4, H, fused_dim, prof)) {
+        if (usable_int4_fused_proj(fa.qk_proj_int4, H, fused_dim)) {
             auto fused = ar.alloc<bf16>((size_t)seq * fused_dim);
             { DIFF_PROF(q, attn_fused_proj_prof(prof));
               matmul_int4(hidden, seq, H, fa.qk_proj_int4, fused.data(), ctx); }
             { DIFF_PROF(q, attn_fused_split_prof(prof));
               fused_full_qk_postprocess(q, fused.data(), Q, K, V,
                                         qn, kn, seq, nq, nkv, hd, offset,
-                                        theta, partial, cfg.rms_norm_eps); }
+                                        theta, partial, cfg.rms_norm_eps,
+                                        rope.cos_data(), rope.sin_data(),
+                                        session); }
             used_fused_proj = true;
             rope_done = true;
         }
@@ -695,7 +598,8 @@ QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
 
     if (!rope_done) {
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::Rope));
-          apply_rope(q, Q, K, seq, offset, nq, nkv, hd, theta, partial); }
+          apply_rope(q, Q, K, seq, offset, nq, nkv, hd, theta, partial,
+                     rope.cos_data(), rope.sin_data()); }
     }
     return out;
 }
@@ -706,7 +610,8 @@ QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
 QKV project_qkv_decoder_direct_cache(
     GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
     int seq, const DiffTextConfig& cfg, int offset,
-    bf16* K_cache, bf16* V_cache, AttnProfileKind prof) {
+    bf16* K_cache, bf16* V_cache, AttnProfileKind prof,
+    Nvfp4GraphSession* session = nullptr) {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
     int nq = cfg.num_attn_heads;
@@ -737,9 +642,16 @@ QKV project_qkv_decoder_direct_cache(
 
     { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::QProj));
       matmul_linear_weight(hidden, seq, H, *qpw, nq * hd, Q, ctx); }
+    RopeTable rope = (diff_fused_norm_rope_mode() == RopeKernelMode::Table)
+        ? make_rope_table(ctx, seq, offset, hd, theta, partial) : RopeTable{};
     { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::QNorm));
-      fused_norm_rope_inplace(q, Q, qn, seq, nq, hd, offset, theta, partial,
-                              cfg.rms_norm_eps); }
+      if (diff_fused_norm_rope_mode() == RopeKernelMode::Fused) {
+          fused_norm_rope_inplace_fused(q, Q, qn, seq, nq, hd, offset, theta, partial,
+                                        cfg.rms_norm_eps);
+      } else {
+          fused_norm_rope_inplace(q, Q, qn, seq, nq, hd, offset, theta, partial,
+                                  cfg.rms_norm_eps, rope.cos_data(), rope.sin_data());
+      } }
 
     if (!lw.is_full) {
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::KProj));
@@ -749,7 +661,7 @@ QKV project_qkv_decoder_direct_cache(
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::KNorm));
           fused_sliding_decoder_kv_cache_postprocess(
               q, K_cache, V_cache, kn, seq, nkv, hd, offset, theta, partial,
-              cfg.rms_norm_eps); }
+              cfg.rms_norm_eps, rope.cos_data(), rope.sin_data(), session); }
     } else {
         // Full attention derives V from raw K before applying K's learned scale.
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::KProj));
@@ -757,7 +669,7 @@ QKV project_qkv_decoder_direct_cache(
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::KNorm));
           fused_full_decoder_kv_cache_postprocess(
               q, K_cache, V_cache, kn, seq, nkv, hd, offset, theta, partial,
-              cfg.rms_norm_eps); }
+              cfg.rms_norm_eps, rope.cos_data(), rope.sin_data(), session); }
     }
     return out;
 }
@@ -774,65 +686,6 @@ QKV project_qkv_decoder_direct_cache(
 // the mask (and the RoPE already baked into K/V at projection) keep referring to
 // real sequence positions, never band-local ones.
 // ---------------------------------------------------------------------------
-void fused_masked_softmax(
-    sycl::queue& q, bf16* scores,
-    int nq, int seq, int kv_len,
-    int q_pos0, int kv_pos0, int sliding_window, bool causal)
-{
-    constexpr int WG = 256;
-    constexpr float NEG_INF = -3.4028235e38f;
-    size_t rows = (size_t)nq * seq;
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> sf(sycl::range<1>(WG), h);
-        h.parallel_for(
-            sycl::nd_range<1>(rows * WG, WG),
-            [=](sycl::nd_item<1> it) {
-                int row = it.get_group(0);
-                int lid = it.get_local_id(0);
-                int sq  = row % seq;             // query index within this tile
-                bf16* x = scores + (size_t)row * kv_len;
-
-                int q_global = q_pos0 + sq;
-
-                auto masked = [=](int c) {
-                    if (!causal) return false;
-                    int kv_global = kv_pos0 + c;
-                    if (kv_global > q_global) return true;
-                    return sliding_window != INT_MAX &&
-                           kv_global < q_global - sliding_window + 1;
-                };
-
-                float m = NEG_INF;
-                for (int c = lid; c < kv_len; c += WG)
-                    if (!masked(c)) m = sycl::fmax(m, bf16_to_float(x[c]));
-                sf[lid] = m;
-                it.barrier(sycl::access::fence_space::local_space);
-                for (int o = WG / 2; o > 0; o >>= 1) {
-                    if (lid < o) sf[lid] = sycl::fmax(sf[lid], sf[lid + o]);
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                m = sf[0];
-                it.barrier(sycl::access::fence_space::local_space);
-
-                float z = 0.0f;
-                for (int c = lid; c < kv_len; c += WG)
-                    if (!masked(c)) z += sycl::exp(bf16_to_float(x[c]) - m);
-                sf[lid] = z;
-                it.barrier(sycl::access::fence_space::local_space);
-                for (int o = WG / 2; o > 0; o >>= 1) {
-                    if (lid < o) sf[lid] += sf[lid + o];
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                float inv_z = 1.0f / sf[0];
-
-                for (int c = lid; c < kv_len; c += WG) {
-                    float p = masked(c) ? 0.0f
-                            : sycl::exp(bf16_to_float(x[c]) - m) * inv_z;
-                    x[c] = float_to_bf16(p);
-                }
-            });
-    });
-}
 
 // ---------------------------------------------------------------------------
 // GQA attention reading the KV cache directly through strided batched GEMMs.
@@ -855,7 +708,8 @@ diffarena::Alloc<bf16> gqa_attention(
     const bf16* Q, int seq, int nq, int hd,
     const bf16* Kc, const bf16* Vc, int kv_len, int nkv,
     int past_offset, int sliding_window, bool causal,
-    AttnProfileKind prof)
+    AttnProfileKind prof,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     auto& q = ctx.queue;
     int g = nq / nkv;
@@ -872,6 +726,30 @@ diffarena::Alloc<bf16> gqa_attention(
     tq = std::min(tq, seq);
 
     int kv0 = past_offset - (kv_len - seq);   // absolute position of Kc[0]
+
+    // Hoist the per-tile temps out of the tile loop: Q_hm/ctx_hm are fixed at
+    // nq*tq*hd, and scores is bounded by nq*tq*max_kb (kb shrinks across tiles
+    // as the causal/sliding band narrows, so the first tile sets the peak).
+    // Reusing one arena allocation across tiles avoids per-tile alloc/free churn.
+    int max_kb = kv_len;
+    if (causal) {
+        max_kb = 0;
+        for (int qs0 = 0; qs0 < seq; qs0 += tq) {
+            int qe0 = std::min(seq, qs0 + tq);
+            int q_lo0 = past_offset + qs0;
+            int q_hi0 = past_offset + qe0 - 1;
+            int ke0 = std::min(kv_len, (q_hi0 - kv0) + 1);
+            int ks0 = (sliding_window == INT_MAX)
+                   ? 0
+                   : std::max(0, (q_lo0 - sliding_window + 1) - kv0);
+            int kb0 = ke0 - ks0;
+            if (kb0 > max_kb) max_kb = kb0;
+        }
+        if (max_kb <= 0) max_kb = 1;
+    }
+    auto Qhm_a   = ar.alloc<bf16>((size_t)nq * tq * hd);
+    auto scores_a = ar.alloc<bf16>((size_t)nq * tq * max_kb);
+    auto ctxhm_a = ar.alloc<bf16>((size_t)nq * tq * hd);
 
     for (int qs = 0; qs < seq; qs += tq) {
         int qe = std::min(seq, qs + tq);
@@ -890,11 +768,6 @@ diffarena::Alloc<bf16> gqa_attention(
         int kb = ke - ks;
         if (kb <= 0) continue;
 
-        // Per-tile temps: scoped to this iteration, so each tile's scores/Q_hm/
-        // ctx_hm reuse the same arena storage rather than stacking up.
-        auto Qhm_a   = ar.alloc<bf16>((size_t)nq * t * hd);
-        auto scores_a = ar.alloc<bf16>((size_t)nq * t * kb);
-        auto ctxhm_a = ar.alloc<bf16>((size_t)nq * t * hd);
         bf16* Q_hm   = Qhm_a.data();
         bf16* scores = scores_a.data();
         bf16* ctx_hm = ctxhm_a.data();
@@ -918,10 +791,16 @@ diffarena::Alloc<bf16> gqa_attention(
             ctx); }
 
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::Softmax));
-          fused_masked_softmax(q, scores, nq, t, kb,
-                               /*q_pos0=*/past_offset + qs,
-                               /*kv_pos0=*/kv0 + ks,
-                               sliding_window, causal); }
+          if (softmax_span_mode())
+              fused_masked_softmax(q, scores, nq, t, kb,
+                                   /*q_pos0=*/past_offset + qs,
+                                   /*kv_pos0=*/kv0 + ks,
+                                   sliding_window, causal);
+          else
+              fused_masked_softmax_branchy(q, scores, nq, t, kb,
+                                           /*q_pos0=*/past_offset + qs,
+                                           /*kv_pos0=*/kv0 + ks,
+                                           sliding_window, causal); }
 
         // ctx(b, m, n) = scores(b, m, k) @ Vb[k][b][n] — V read in place.
         { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::ValueMM));
@@ -1053,7 +932,8 @@ diffarena::Alloc<bf16> gqa_attention_sdpa(
     const bf16* Q, int seq, int nq, int hd,
     const bf16* Kc, const bf16* Vc, int kv_len, int nkv,
     const float* mask, int mask_type,
-    AttnProfileKind prof)
+    AttnProfileKind prof,
+    Nvfp4GraphSession* /*session*/ = nullptr)
 {
     static std::unordered_map<SdpaKey, dnnl::primitive, SdpaKeyHash> cache;
 
@@ -1120,12 +1000,13 @@ void encoder_attention_forward(
     GpuEngine& ctx, const DiffLayer& lw,
     const bf16* hidden, bf16* out,
     DiffLayerKv& kv, int seq, int past_len,
-    const DiffTextConfig& cfg)
+    const DiffTextConfig& cfg,
+    Nvfp4GraphSession* session)
 {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
     AttnProfileKind prof = attn_profile_kind(/*is_encoder=*/true, lw.is_full);
-    QKV x = project_qkv(ctx, lw, hidden, seq, cfg, past_len, prof);
+    QKV x = project_qkv(ctx, lw, hidden, seq, cfg, past_len, prof, session);
 
     // Append K/V to cache at past_len, then release them (the GEMMs read the
     // cache, not these staging buffers).
@@ -1148,7 +1029,7 @@ void encoder_attention_forward(
         attn = gqa_attention_sdpa(ctx,
             x.Q.data(), seq, x.nq, x.hd,
             kv.k.data(), kv.v.data(), kv.filled, x.nkv,
-            /*mask=*/nullptr, /*mask_type=*/3, prof);
+            /*mask=*/nullptr, /*mask_type=*/3, prof, session);
     } else if (!lw.is_full && onednn_sdpa_encoder_sliding_enabled()) {
         auto& ar = diffarena::arena(ctx.index);
         sdpa_mask = ar.alloc<float>((size_t)seq * kv.filled);
@@ -1156,12 +1037,12 @@ void encoder_attention_forward(
         attn = gqa_attention_sdpa(ctx,
             x.Q.data(), seq, x.nq, x.hd,
             kv.k.data(), kv.v.data(), kv.filled, x.nkv,
-            sdpa_mask.data(), /*mask_type=*/1, prof);
+            sdpa_mask.data(), /*mask_type=*/1, prof, session);
     } else {
         attn = gqa_attention(ctx,
             x.Q.data(), seq, x.nq, x.hd,
             kv.k.data(), kv.v.data(), kv.filled, x.nkv,
-            /*past_offset=*/past_len, win, /*causal=*/true, prof);
+            /*past_offset=*/past_len, win, /*causal=*/true, prof, session);
     }
     x.Q.reset();   // Q consumed by the score GEMM
 
@@ -1176,7 +1057,8 @@ void decoder_attention_forward(
     GpuEngine& ctx, const DiffLayer& lw,
     const bf16* hidden, bf16* out,
     DiffLayerKv& enc_kv, int seq, int enc_len,
-    const DiffTextConfig& cfg)
+    const DiffTextConfig& cfg,
+    Nvfp4GraphSession* session)
 {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
@@ -1197,21 +1079,11 @@ void decoder_attention_forward(
     bf16* k_dst = enc_kv.k.data() + (size_t)enc_len * row;
     bf16* v_dst = enc_kv.v.data() + (size_t)enc_len * row;
 
-    bool direct_cache = decode_kv_direct_cache_enabled();
-    QKV x = direct_cache
-        ? project_qkv_decoder_direct_cache(ctx, lw, hidden, seq, cfg, enc_len,
-                                           k_dst, v_dst, prof)
-        : project_qkv(ctx, lw, hidden, seq, cfg, enc_len, prof);
-    if (!direct_cache) {
-        { DIFF_PROF(q, attn_prof(prof, AttnProfilePhase::CanvasKVStage));
-          if (decoder_kv_stage_kernel_enabled()) {
-              stage_decoder_kv(q, x.K.data(), x.V.data(), k_dst, v_dst, seq, row);
-          } else {
-              q.memcpy(k_dst, x.K.data(), (size_t)seq * row * sizeof(bf16));
-              q.memcpy(v_dst, x.V.data(), (size_t)seq * row * sizeof(bf16));
-          } }
-        x.K.reset(); x.V.reset();
-    }
+    // Decoder always materializes K/V directly into the cache canvas (no staging
+    // copy/launch).  DIFF_DECODE_KV_DIRECT_CACHE / DIFF_STAGE_DECODER_KV_KERNEL
+    // and the staging kernel are gone.
+    QKV x = project_qkv_decoder_direct_cache(ctx, lw, hidden, seq, cfg, enc_len,
+                                             k_dst, v_dst, prof, session);
 
     // Bidirectional decoder attention: full layers see all encoder KV + canvas;
     // sliding layers see the last sliding_window-1 encoder positions + canvas
@@ -1224,11 +1096,11 @@ void decoder_attention_forward(
     auto attn = onednn_sdpa_decoder_enabled()
         ? gqa_attention_sdpa(ctx,
             x.Q.data(), seq, x.nq, x.hd, Kc, Vc, kv_len - kv0, x.nkv,
-            /*mask=*/nullptr, /*mask_type=*/0, prof)
+            /*mask=*/nullptr, /*mask_type=*/0, prof, session)
         : gqa_attention(ctx,
             x.Q.data(), seq, x.nq, x.hd, Kc, Vc, kv_len - kv0, x.nkv,
             /*past_offset=*/0, /*sliding_window=*/INT_MAX, /*causal=*/false,
-            prof);
+            prof, session);
     x.Q.reset();
 
     const DiffLinearWeight& o_proj = lw.is_full

@@ -11,6 +11,22 @@ from transformers import AutoTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DIFFUSIONGEMMA_MODEL_DIR = Path("/workspace/models/diffusiongemma-26B-A4B-it-NVFP4")
+GEMMA4_UNIFIED_MODEL_DIR = Path("/workspace/models/gemma-4-12B-it")
+
+# Parser tests are parameterized over both Gemma4-family model dirs so that
+# adding a Gemma4 unified checkpoint automatically exercises the same parser
+# paths as DiffusionGemma. Both arches share parse_assistant_output (the parser
+# is text-based and uses hardcoded <|tool_call>/<tool_call|> markers), so the
+# same inputs are piped through the C++ harness for each model dir.
+#
+# Note on token layouts: DiffusionGemma stores stc/etc/escape tokens under a
+# `model_specific_special_tokens` block (with top-level fallbacks). Gemma4 12B
+# it stores them at the top level only. tokenizer_tool_call_tokens() reads
+# the nested block when present and falls back to top-level keys otherwise.
+MODEL_DIR_PARAMS = [
+    pytest.param(DIFFUSIONGEMMA_MODEL_DIR, id="diffusiongemma"),
+    pytest.param(GEMMA4_UNIFIED_MODEL_DIR, id="gemma4_unified"),
+]
 
 
 @pytest.fixture(scope="session")
@@ -30,6 +46,46 @@ def diffusiongemma_tokenizer_config() -> dict:
 @pytest.fixture(scope="session")
 def diffusiongemma_chat_template() -> str:
     return (DIFFUSIONGEMMA_MODEL_DIR / "chat_template.jinja").read_text()
+
+
+@pytest.fixture(scope="session")
+def gemma4_unified_tokenizer():
+    if not GEMMA4_UNIFIED_MODEL_DIR.exists():
+        pytest.skip(f"gemma4_unified model dir not present: {GEMMA4_UNIFIED_MODEL_DIR}")
+    return AutoTokenizer.from_pretrained(
+        GEMMA4_UNIFIED_MODEL_DIR,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+
+
+@pytest.fixture(scope="session")
+def gemma4_unified_tokenizer_config() -> dict:
+    if not GEMMA4_UNIFIED_MODEL_DIR.exists():
+        pytest.skip(f"gemma4_unified model dir not present: {GEMMA4_UNIFIED_MODEL_DIR}")
+    return json.loads((GEMMA4_UNIFIED_MODEL_DIR / "tokenizer_config.json").read_text())
+
+
+@pytest.fixture(scope="session")
+def gemma4_unified_chat_template() -> str:
+    if not GEMMA4_UNIFIED_MODEL_DIR.exists():
+        pytest.skip(f"gemma4_unified model dir not present: {GEMMA4_UNIFIED_MODEL_DIR}")
+    return (GEMMA4_UNIFIED_MODEL_DIR / "chat_template.jinja").read_text()
+
+
+# Parameterized tokenizer_config fixture: yields the tokenizer_config.json dict
+# for each available Gemma4-family model dir. Skips entries whose model dir is
+# not present on disk.
+@pytest.fixture(scope="session", params=MODEL_DIR_PARAMS)
+def parser_tokenizer_config_dir(request) -> Path:
+    if not request.param.exists():
+        pytest.skip(f"model dir not present: {request.param}")
+    return request.param
+
+
+@pytest.fixture(scope="session")
+def parser_tokenizer_config(parser_tokenizer_config_dir: Path) -> dict:
+    return json.loads((parser_tokenizer_config_dir / "tokenizer_config.json").read_text())
 
 
 @pytest.fixture(scope="session")
@@ -76,6 +132,14 @@ def parser_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
             str(harness),
             str(REPO_ROOT / "src/utils/gemma4_tool_call_parser.cpp"),
             str(REPO_ROOT / "src/common/preprocess/tokenizer.cpp"),
+            # tokenizer.cpp depends on the ported llama.cpp unicode helpers
+            # (unicode_len_utf8, unicode_utf8_to_byte, unicode_cpts_from_utf8,
+            # unicode_regex_split_custom_qwen2, unicode_cpt_to_utf8,
+            # unicode_byte_to_utf8). These are the same UNICODE_SRCS linked
+            # into every CMake target that compiles tokenizer.cpp — see
+            # CMakeLists.txt:50-53.
+            str(REPO_ROOT / "src/common/preprocess/unicode.cpp"),
+            str(REPO_ROOT / "src/common/preprocess/unicode-data.cpp"),
             "-I",
             str(REPO_ROOT / "src"),
             "-I",
@@ -101,8 +165,13 @@ def parse_with_harness(parser_harness: Path, raw: str) -> dict:
 
 
 def tokenizer_tool_call_tokens(config: dict) -> tuple[str, str, str]:
-    special = config["model_specific_special_tokens"]
-    return special["stc_token"], special["etc_token"], special["escape_token"]
+    # DiffusionGemma stores stc/etc/escape under `model_specific_special_tokens`
+    # (with top-level fallbacks). Gemma4 12B it stores them at the top level
+    # only. Prefer the nested block when present, else read top-level keys.
+    if "model_specific_special_tokens" in config:
+        special = config["model_specific_special_tokens"]
+        return special["stc_token"], special["etc_token"], special["escape_token"]
+    return config["stc_token"], config["etc_token"], config["escape_token"]
 
 
 def test_matches_diffusiongemma_gemma_tokenizer_response_schema(
@@ -126,17 +195,44 @@ def test_matches_diffusiongemma_gemma_tokenizer_response_schema(
     assert "{{- '}<tool_call|>' -}}" in diffusiongemma_chat_template
 
 
+def test_matches_gemma4_unified_tokenizer_response_schema(
+    gemma4_unified_tokenizer,
+    gemma4_unified_tokenizer_config: dict,
+    gemma4_unified_chat_template: str,
+):
+    # The shared parse_assistant_output parser uses the same <|tool_call>...
+    # <tool_call|> markers across the Gemma4 family. Gemma4 unified exposes
+    # the same response_schema regexes as DiffusionGemma so the same parser
+    # is reusable; this test pins that contract. The processor_class differs
+    # (Gemma4UnifiedProcessor vs Gemma4Processor) but the tool-call markers
+    # and regexes are identical.
+    assert gemma4_unified_tokenizer_config["tokenizer_class"] == "GemmaTokenizer"
+    assert gemma4_unified_tokenizer_config["processor_class"] == "Gemma4UnifiedProcessor"
+    assert gemma4_unified_tokenizer.name_or_path == str(GEMMA4_UNIFIED_MODEL_DIR)
+    assert gemma4_unified_tokenizer.bos_token == gemma4_unified_tokenizer_config["bos_token"]
+    assert gemma4_unified_tokenizer.eos_token == gemma4_unified_tokenizer_config["eos_token"]
+    assert gemma4_unified_tokenizer.chat_template == gemma4_unified_chat_template
+
+    schema = gemma4_unified_tokenizer_config["response_schema"]
+    assert schema["properties"]["tool_calls"]["x-regex-iterator"] == r"<\|tool_call>(.*?)<tool_call\|>"
+    assert schema["properties"]["tool_calls"]["items"]["properties"]["function"]["x-regex"] == (
+        r"call\:(?P<name>\w+)(?P<arguments>\{.*\})"
+    )
+    assert "{{- '<|tool_call>call:' + function['name'] + '{' -}}" in gemma4_unified_chat_template
+    assert "{{- '}<tool_call|>' -}}" in gemma4_unified_chat_template
+
+
 def test_parses_single_gemma_tokenizer_tool_call(
     parser_harness: Path,
-    diffusiongemma_tokenizer_config: dict,
+    parser_tokenizer_config: dict,
 ):
-    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(parser_tokenizer_config)
     raw_call = (
         f"{stc_token}call:get_weather{{city:{escape_token}Paris{escape_token},"
         f"unit:{escape_token}celsius{escape_token},days:3,alerts:true}}{etc_token}"
     )
 
-    schema = diffusiongemma_tokenizer_config["response_schema"]["properties"]["tool_calls"]
+    schema = parser_tokenizer_config["response_schema"]["properties"]["tool_calls"]
     match = re.fullmatch(schema["x-regex-iterator"], raw_call, flags=re.DOTALL)
     assert match is not None
     body = match.group(1)
@@ -165,9 +261,9 @@ def test_parses_single_gemma_tokenizer_tool_call(
 
 def test_parses_nested_arrays_and_objects(
     parser_harness: Path,
-    diffusiongemma_tokenizer_config: dict,
+    parser_tokenizer_config: dict,
 ):
-    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(parser_tokenizer_config)
     parsed = parse_with_harness(
         parser_harness,
         f"{stc_token}call:search{{query:{escape_token}intel gpu{escape_token},"
@@ -183,9 +279,9 @@ def test_parses_nested_arrays_and_objects(
 
 def test_parses_tool_call_with_extra_trailing_brace(
     parser_harness: Path,
-    diffusiongemma_tokenizer_config: dict,
+    parser_tokenizer_config: dict,
 ):
-    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(parser_tokenizer_config)
     parsed = parse_with_harness(
         parser_harness,
         f"{stc_token}call:bash{{command:{escape_token}"
@@ -204,9 +300,9 @@ def test_parses_tool_call_with_extra_trailing_brace(
 
 def test_parses_tool_call_with_duplicated_nested_braces(
     parser_harness: Path,
-    diffusiongemma_tokenizer_config: dict,
+    parser_tokenizer_config: dict,
 ):
-    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(parser_tokenizer_config)
     parsed = parse_with_harness(
         parser_harness,
         f"{stc_token}call:edit{{edits:[{{{{newText:{escape_token}"
@@ -233,13 +329,14 @@ def test_parses_tool_call_with_duplicated_nested_braces(
 
 def test_parses_visible_content_before_malformed_edit_tool_call(
     parser_harness: Path,
-    diffusiongemma_tokenizer_config: dict,
+    parser_tokenizer_config: dict,
 ):
-    special = diffusiongemma_tokenizer_config["model_specific_special_tokens"]
-    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    cfg = parser_tokenizer_config
+    soc, eoc = cfg["soc_token"], cfg["eoc_token"]
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(parser_tokenizer_config)
     parsed = parse_with_harness(
         parser_harness,
-        f"{special['soc_token']}thought\n{special['eoc_token']}"
+        f"{soc}thought\n{eoc}"
         "The error occurred because np.diff does not take a step size.\n\n"
         f"{stc_token}call:edit{{edits:[{{{{newText:{escape_token}"
         "dy_noisy = np.diff(y_noisy) / h"
@@ -255,14 +352,18 @@ def test_parses_visible_content_before_malformed_edit_tool_call(
 
 def test_removes_gemma_tokenizer_thinking_and_special_tokens_from_content(
     parser_harness: Path,
-    diffusiongemma_tokenizer_config: dict,
+    parser_tokenizer_config: dict,
 ):
-    special = diffusiongemma_tokenizer_config["model_specific_special_tokens"]
+    # soc/eoc/eot tokens live at the top level on both layouts (see
+    # tokenizer_tool_call_tokens). Read them directly so this test doesn't
+    # depend on the model_specific_special_tokens block existing.
+    cfg = parser_tokenizer_config
+    soc, eoc, eot = cfg["soc_token"], cfg["eoc_token"], cfg["eot_token"]
     parsed = parse_with_harness(
         parser_harness,
-        f"{diffusiongemma_tokenizer_config['bos_token']}"
-        f"{special['soc_token']}thought\nhidden chain{special['eoc_token']}\n"
-        f"Final answer.{special['eot_token']}{diffusiongemma_tokenizer_config['eos_token']}",
+        f"{cfg['bos_token']}"
+        f"{soc}thought\nhidden chain{eoc}\n"
+        f"Final answer.{eot}{cfg['eos_token']}",
     )
 
     assert parsed == {"content": "Final answer.", "tool_calls": []}
@@ -270,9 +371,9 @@ def test_removes_gemma_tokenizer_thinking_and_special_tokens_from_content(
 
 def test_parses_multiple_tool_calls_and_keeps_surrounding_content(
     parser_harness: Path,
-    diffusiongemma_tokenizer_config: dict,
+    parser_tokenizer_config: dict,
 ):
-    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(parser_tokenizer_config)
     parsed = parse_with_harness(
         parser_harness,
         'I will check.\n'
@@ -289,9 +390,9 @@ def test_parses_multiple_tool_calls_and_keeps_surrounding_content(
 
 def test_malformed_tool_call_stays_out_of_tool_calls(
     parser_harness: Path,
-    diffusiongemma_tokenizer_config: dict,
+    parser_tokenizer_config: dict,
 ):
-    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(diffusiongemma_tokenizer_config)
+    stc_token, etc_token, escape_token = tokenizer_tool_call_tokens(parser_tokenizer_config)
     parsed = parse_with_harness(
         parser_harness,
         f"Answer before {stc_token}call:broken{{unterminated:{escape_token}oops{etc_token} answer after",
