@@ -81,7 +81,18 @@ struct DiffConfig {
         if (j.contains("quantization_config") && j.at("quantization_config").is_object()) {
             auto& qc = j.at("quantization_config");
             cfg.quantization_format = qc.value("format", std::string());
+            // Try direct group_size first, then nested config_groups.group_0.weights.group_size
             cfg.text.int4_group_size = qc.value("group_size", 0);
+            if (cfg.text.int4_group_size == 0 && qc.contains("config_groups") && qc.at("config_groups").is_object()) {
+                auto& cg = qc.at("config_groups");
+                if (cg.contains("group_0") && cg.at("group_0").is_object()) {
+                    auto& g0 = cg.at("group_0");
+                    if (g0.contains("weights") && g0.at("weights").is_object()) {
+                        auto& w = g0.at("weights");
+                        cfg.text.int4_group_size = w.value("group_size", 0);
+                    }
+                }
+            }
         }
 
         cfg.canvas_length  = j.value("canvas_length", 256);
