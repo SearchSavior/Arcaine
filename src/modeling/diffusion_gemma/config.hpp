@@ -19,6 +19,7 @@ struct DiffTextConfig {
     int head_dim = 0, global_head_dim = 0;
     int num_experts = 0, top_k_experts = 0, moe_intermediate_size = 0;
     int sliding_window = 0;
+    int int4_group_size = 0;  // INT4-AWQ quantization group size (0 = not quantized)
     float rms_norm_eps = 1e-6f, final_logit_softcapping = 30.0f;
     int bos_token_id = 2, pad_token_id = 0;
     std::vector<int> eos_token_ids;
@@ -77,8 +78,22 @@ struct DiffConfig {
         cfg.model_type = j.at("model_type").get<std::string>();
         if (cfg.model_type != "diffusion_gemma")
             throw std::runtime_error("Expected model_type=diffusion_gemma, got " + cfg.model_type);
-        if (j.contains("quantization_config") && j.at("quantization_config").is_object())
-            cfg.quantization_format = j.at("quantization_config").value("format", std::string());
+        if (j.contains("quantization_config") && j.at("quantization_config").is_object()) {
+            auto& qc = j.at("quantization_config");
+            cfg.quantization_format = qc.value("format", std::string());
+            // Try direct group_size first, then nested config_groups.group_0.weights.group_size
+            cfg.text.int4_group_size = qc.value("group_size", 0);
+            if (cfg.text.int4_group_size == 0 && qc.contains("config_groups") && qc.at("config_groups").is_object()) {
+                auto& cg = qc.at("config_groups");
+                if (cg.contains("group_0") && cg.at("group_0").is_object()) {
+                    auto& g0 = cg.at("group_0");
+                    if (g0.contains("weights") && g0.at("weights").is_object()) {
+                        auto& w = g0.at("weights");
+                        cfg.text.int4_group_size = w.value("group_size", 0);
+                    }
+                }
+            }
+        }
 
         cfg.canvas_length  = j.value("canvas_length", 256);
         cfg.image_token_id = j.value("image_token_id", 258880);

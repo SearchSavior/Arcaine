@@ -9,11 +9,21 @@ namespace {
 
 static size_t bf16_bytes(size_t elements) { return 2 * elements; }
 
-static size_t linear_bytes(size_t out_features, size_t in_features, bool nvfp4) {
-    if (!nvfp4) return bf16_bytes(out_features * in_features);
-    size_t packed = out_features * ((in_features + 1) / 2);
-    size_t scales = out_features * ((in_features + 15) / 16);
-    return packed + scales + 2 * sizeof(float);
+static size_t int4_bytes(size_t out_features, size_t in_features, int group_size) {
+    size_t elements = (size_t)out_features * in_features;
+    size_t packed = elements / 2;
+    size_t scales = (elements / group_size) * 2;
+    return packed + scales;
+}
+
+static size_t linear_bytes(size_t out_features, size_t in_features, bool nvfp4, int int4_group_size = 0) {
+    if (int4_group_size > 0) return int4_bytes(out_features, in_features, int4_group_size);
+    if (nvfp4) {
+        size_t packed = out_features * ((in_features + 1) / 2);
+        size_t scales = out_features * ((in_features + 15) / 16);
+        return packed + scales + 2 * sizeof(float);
+    }
+    return bf16_bytes(out_features * in_features);
 }
 
 static size_t attention_bytes(const DiffTextConfig& t, bool full) {
@@ -21,24 +31,27 @@ static size_t attention_bytes(const DiffTextConfig& t, bool full) {
     size_t attn;
     if (full) {
         size_t hd = t.global_head_dim;
-        attn = (size_t)t.num_attn_heads * hd * H * 2 + (size_t)t.num_global_kv_heads * hd * H;
+        attn = (size_t)(t.num_attn_heads + t.num_global_kv_heads) * hd * H * 2;
     } else {
         size_t hd = t.head_dim;
-        attn = (size_t)t.num_attn_heads * hd * H * 2 + (size_t)t.num_kv_heads * hd * H * 2;
+        attn = (size_t)(t.num_attn_heads + t.num_kv_heads) * hd * H * 2;
     }
+    if (t.int4_group_size > 0) return attn / 2 + (attn / t.int4_group_size) * 2;
     return bf16_bytes(attn);
 }
 
 static size_t dense_mlp_bytes(const DiffTextConfig& t, bool nvfp4) {
     size_t H = t.hidden_size;
     size_t I = t.intermediate_size;
-    return 2 * linear_bytes(I, H, nvfp4) + linear_bytes(H, I, nvfp4);
+    int g = t.int4_group_size;
+    return 2 * linear_bytes(I, H, nvfp4, g) + linear_bytes(H, I, nvfp4, g);
 }
 
 static size_t one_expert_bytes(const DiffTextConfig& t, bool nvfp4) {
     size_t H = t.hidden_size;
     size_t I = t.moe_intermediate_size;
-    return 2 * linear_bytes(I, H, nvfp4) + linear_bytes(H, I, nvfp4);
+    int g = t.int4_group_size;
+    return 2 * linear_bytes(I, H, nvfp4, g) + linear_bytes(H, I, nvfp4, g);
 }
 
 static size_t layer_bytes(const DiffTextConfig& t, bool full, bool nvfp4) {
