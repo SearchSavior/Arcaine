@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include "buffer.hpp"
 #include "engine.hpp"
+#include "ops.hpp"
 
 struct Int4Linear {
     int in_features = 0;
@@ -34,6 +35,11 @@ struct Int4Linear {
     // BF16 per-group scales transposed for oneDNN, logical shape
     // (in_features / group_size, out_features).
     GpuBuffer<bf16> weight_scale;
+
+    // Optional asymmetric zero-point correction (compressed-tensors AWQ):
+    // scale*zp transposed to (groups, out_features) BF16. Empty for symmetric
+    // (diffusion) checkpoints — matmul_int4 skips the correction entirely.
+    GpuBuffer<bf16> weight_zp_corr;
 
     // oneDNN impl-preferred weight layout, materialized once on first use under
     // DIFF_INT4_WEIGHT_LAYOUT=any. The raw tag::ba layout forces oneDNN's
@@ -140,6 +146,34 @@ inline const uint8_t* int4_weight_data(const Int4Linear& W,
     return W.weight_any.data();
 }
 
+// SA(M, G) = sum_{k in group g} A(m, k), with G = K / group. A is (M,K) row-major.
+inline void group_sum_bf16(sycl::queue& q, const bf16* A, int M, int K,
+                           int group, bf16* SA) {
+    int G = K / group;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>((size_t)M * G), [=](sycl::id<1> id) {
+            size_t idx = id[0];
+            int m = (int)(idx / (size_t)G);
+            int g = (int)(idx % (size_t)G);
+            const bf16* row = A + (size_t)m * K;
+            float acc = 0.0f;
+            for (int j = 0; j < group; ++j)
+                acc += bf16_to_float(row[(size_t)g * group + j]);
+            SA[(size_t)m * G + g] = float_to_bf16(acc);
+        });
+    });
+}
+
+// C[i] = C[i] - X[i], element-wise over n BF16 values.
+inline void axpy_bf16_inplace_sub(sycl::queue& q, bf16* C, const bf16* X, size_t n) {
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+            C[id[0]] = float_to_bf16(
+                bf16_to_float(C[id[0]]) - bf16_to_float(X[id[0]]));
+        });
+    });
+}
+
 // C (M,N) = A (M,K) @ dequant(W)^T, where W is logical (N,K) s4 with per-group
 // BF16 scales.  A and C are BF16.  Async on ctx's stream.
 inline void matmul_int4(
@@ -180,4 +214,40 @@ inline void matmul_int4(
         {DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
             dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
+
+    // Asymmetric INT4 (compressed-tensors AWQ) zero-point correction.
+    //
+    // The weight is w = scale*(q - zp) = scale*q - scale*zp. The oneDNN s4 GEMM
+    // above computed only Part1 = scale*q: its decompression has no zero-point
+    // argument and the XOR-0x88 rebased nibbles are symmetric around 0, so the
+    // scale*zp term is missing. We must add it back here:
+    //     C = Part1 - corr,   corr = group_sum(A) @ (scale*zp)
+    //   where group_sum(A)[m,g] = sum_{k in group g} A[m,k]  (G = K/group_size).
+    //
+    // LOAD-BEARING — not optional, not gated. Without this subtraction every
+    // output channel is biased by a per-group constant scale*zp * sum(A over
+    // the group); those biases accumulate across all groups and every layer,
+    // collapsing generation to a degenerate repeating token. Verified on
+    // cyankiwi_gemma-4-12B-it-qat-AWQ-INT4: with the block below, "capital of
+    // France" -> "Paris"; without it, -> "предметы предметы предметы ...".
+    // The correction is exact in f64 (ref sim) and ~0.1% rel err in bf16.
+    //
+    // Only asymmetric checkpoints populate weight_zp_corr (loader.cpp
+    // upload_int4_linear_awq); symmetric int4 checkpoints (diffusion_gemma)
+    // leave it empty and skip this branch untouched, so dense/symmetric paths
+    // are unaffected.
+    //
+    // Layout (the second load-bearing detail): weight_zp_corr is (G, N)
+    // row-major holding c^T where c[n,g] = scale*zp, so the no-transpose GEMM
+    // gives corr = SA @ c^T = sum_g SA[m,g]*c[n,g]. MUST use matmul_bf16_nn
+    // (weights tag::ab). matmul_bf16 forces tag::ba and would read this (G,N)
+    // buffer *transposed*, producing garbage even with the right values.
+    if (!W.weight_zp_corr.empty()) {
+        int G = K / W.group_size;
+        GpuBuffer<bf16> SA((size_t)M * G, ctx.queue);
+        group_sum_bf16(ctx.queue, A, M, K, W.group_size, SA.data());
+        GpuBuffer<bf16> corr((size_t)M * N, ctx.queue);
+        matmul_bf16_nn(SA.data(), M, G, W.weight_zp_corr.data(), N, corr.data(), ctx);
+        axpy_bf16_inplace_sub(ctx.queue, C, corr.data(), (size_t)M * N);
+    }
 }

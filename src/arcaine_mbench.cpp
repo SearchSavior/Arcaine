@@ -73,23 +73,75 @@ static std::vector<int> parse_list(const char* s) {
     return v;
 }
 
-// ---------------------------------------------------------------------------
-static void print_header() {
-    printf("\n %-18s %9s   %10s   %7s   %9s   %8s\n",
-           "test", "kv-depth", "t/s", "± sd", "ms/tok", "time(s)");
-    printf(" %-18s %9s   %10s   %7s   %9s   %8s\n",
-           "──────────────────", "─────────",
-           "──────────", "───────", "─────────", "────────");
+// --- llama-bench-style output ----------------------------------------------
+// A single `test` column encodes pp/tg and folds the KV-cache depth in as a
+// `@ d N` suffix (matching llama-bench's `tg128 @ d512`); the `t/s` column is
+// `mean ± sd`.  Output format is selectable with -o (md default, also csv/json).
+enum class OutputFormat { Markdown, Csv, Json };
+
+static OutputFormat parse_output_format(const char* s) {
+    std::string f = s;
+    for (auto& c : f) c = (char)std::tolower((unsigned char)c);
+    if (f == "md" || f == "markdown") return OutputFormat::Markdown;
+    if (f == "csv")                    return OutputFormat::Csv;
+    if (f == "json")                   return OutputFormat::Json;
+    std::fprintf(stderr, "unknown output format: %s (use md|csv|json)\n", s);
+    std::exit(1);
 }
 
-static void print_row(const char* test, const char* depth,
-                      const Stats& s, bool skipped = false) {
-    if (skipped) {
-        printf(" %-18s %9s   [skipped: depth+tg > max_seq]\n", test, depth);
-        return;
+static std::string model_basename(const std::string& dir) {
+    size_t pos = dir.find_last_of('/');
+    return dir.substr(pos == std::string::npos ? 0 : pos + 1);
+}
+
+// "pp 512", "tg 128", "tg 128 @ d 512" — depth folded into the test name.
+static std::string test_name(const char* kind, int n, int depth) {
+    char buf[64];
+    if (depth > 0) std::snprintf(buf, sizeof buf, "%s %d @ d %d", kind, n, depth);
+    else           std::snprintf(buf, sizeof buf, "%s %d", kind, n);
+    return buf;
+}
+
+struct BenchRow {
+    std::string test;
+    double mean_tps = 0, sd_tps = 0;
+    bool skipped = false;
+};
+
+static void print_results(OutputFormat fmt, const std::string& model, int gpus,
+                          const std::vector<BenchRow>& rows) {
+    if (rows.empty()) return;
+    if (fmt == OutputFormat::Markdown) {
+        std::printf("\n| model | gpus | test | t/s |\n");
+        std::printf("|---|---:|---|---:|\n");
+        for (const auto& r : rows) {
+            if (r.skipped)
+                std::printf("| %s | %d | %s | N/A |\n", model.c_str(), gpus, r.test.c_str());
+            else
+                std::printf("| %s | %d | %s | %.2f ± %.2f |\n",
+                            model.c_str(), gpus, r.test.c_str(), r.mean_tps, r.sd_tps);
+        }
+    } else if (fmt == OutputFormat::Csv) {
+        std::printf("model,gpus,test,t/s,sd\n");
+        for (const auto& r : rows) {
+            if (r.skipped)
+                std::printf("%s,%d,%s,,\n", model.c_str(), gpus, r.test.c_str());
+            else
+                std::printf("%s,%d,%s,%.4f,%.4f\n",
+                            model.c_str(), gpus, r.test.c_str(), r.mean_tps, r.sd_tps);
+        }
+    } else { // Json
+        std::printf("[\n");
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
+            std::printf("  {\"model\":\"%s\",\"gpus\":%d,\"test\":\"%s\",",
+                        model.c_str(), gpus, r.test.c_str());
+            if (r.skipped) std::printf("\"t/s\":null,\"sd\":null");
+            else           std::printf("\"t/s\":%.4f,\"sd\":%.4f", r.mean_tps, r.sd_tps);
+            std::printf("}%s\n", (i + 1 < rows.size()) ? "," : "");
+        }
+        std::printf("]\n");
     }
-    printf(" %-18s %9s   %10.2f   %7.2f   %9.3f   %8.3f\n",
-           test, depth, s.mean_tps, s.sd_tps, s.ms_per_tok, s.mean_ms * 0.001);
 }
 
 // ---------------------------------------------------------------------------
@@ -99,11 +151,12 @@ int main(int argc, char* argv[]) {
         "  -h, --help    show this help text\n"
         "  -p, --p P,... prefill sizes          (default: 128,512)\n"
         "  -n, --n N,... new-token counts       (default: 128)\n"
-        "  -d D,...      KV-cache depths        (default: 0,512,1024,2048)\n"
+        "  -d D,...      KV-cache depths (applies to pp and tg) (default: 0,512,1024,2048)\n"
         "  -r, --r R     timed repetitions      (default: 3)\n"
         "  -w, --w W     warmup runs            (default: 1)\n"
         "  --max-seq N   KvCache capacity       (default: auto)\n"
-        "  --device N    run with one visible Level Zero GPU\n";
+        "  --device N    run with one visible Level Zero GPU\n"
+        "  -o, --output <md|csv|json>  output format (default: md)\n";
 
     std::string model_dir;
     std::vector<int> pp_list  = {128, 512};
@@ -114,6 +167,7 @@ int main(int argc, char* argv[]) {
     int warmup  = 1;
     int max_seq = -1;  // computed after arg parsing
     bool device_index_set = false;
+    OutputFormat out_fmt = OutputFormat::Markdown;
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--model")    && i+1<argc) model_dir = argv[++i];
@@ -128,6 +182,7 @@ int main(int argc, char* argv[]) {
                   !strcmp(argv[i], "--warmup")) && i+1<argc) warmup = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-seq") && i+1<argc) max_seq = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--device")  && i+1<argc) { device_index = argv[++i]; device_index_set = true; }
+        else if ((!strcmp(argv[i], "-o") || !strcmp(argv[i], "--output")) && i+1<argc) out_fmt = parse_output_format(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { fputs(USAGE, stderr); return 0; }
         else if (argv[i][0] != '-' && model_dir.empty()) model_dir = argv[i];
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); fputs(USAGE, stderr); return 1; }
@@ -150,13 +205,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Derive max_seq from the largest depth + n, plus the largest pp size,
-    // if the user did not override it with --max-seq.
+    // Derive max_seq from the largest depth + (pp or tg), plus the largest pp
+    // size, if the user did not override it with --max-seq.  Both pp and tg are
+    // swept over depths, so the cache must hold depth + max(pp, tg) tokens.
     if (max_seq < 0) {
         int max_d = *std::max_element(depths.begin(), depths.end());
         int max_p = *std::max_element(pp_list.begin(), pp_list.end());
         int max_n = *std::max_element(tg_list.begin(), tg_list.end());
-        max_seq = std::max(max_d + max_n, max_p);
+        max_seq = std::max({max_d + max_n, max_d + max_p, max_p});
     }
 
     // ── Load ────────────────────────────────────────────────────────────────
@@ -180,38 +236,57 @@ int main(int argc, char* argv[]) {
     const int bos_id = info.bos_token_id;
     const std::vector<int> single(1, bos_id);
 
-    print_header();
+    std::vector<BenchRow> rows;
 
-    // ── Prefill (PP) ────────────────────────────────────────────────────────
+    // ── Prefill (PP) at various KV-cache depths ─────────────────────────────
+    // Mirrors the decode sweep: -d pre-fills the cache to `depth` (untimed,
+    // chunked) then times processing `pp` prompt tokens.  The timed prefill is
+    // also chunked (CHUNK) so full-attention layers never materialize an
+    // O(depth²) score matrix; pp <= CHUNK is a single forward (unchanged).
     for (int pp : pp_list) {
-        if (pp > max_seq) {
-            char name[32]; snprintf(name, sizeof name, "pp %d", pp);
-            printf(" %-18s %9s   [skip: pp=%d > max_seq=%d]\n", name, "—", pp, max_seq);
+      for (int depth : depths) {
+        if (depth + pp > max_seq) {
+            rows.push_back({test_name("pp", pp, depth), 0, 0, true});
             continue;
         }
-        const std::vector<int> prompt(pp, bos_id);
         std::vector<double> times;
 
         for (int r = 0; r < warmup + reps; ++r) {
             model->reset_cache();
+
+            // Pre-fill KV cache to `depth` tokens in chunks (untimed).
+            if (depth > 0) {
+                constexpr int CHUNK = 512;
+                for (int pos = 0; pos < depth; pos += CHUNK) {
+                    int sz = std::min(CHUNK, depth - pos);
+                    std::vector<int> chunk(sz, bos_id);
+                    model->forward(ForwardInput{chunk, pos});
+                }
+            }
+
+            // Time `pp` prompt tokens processed in chunks from `depth`.
             double t = now_ms();
-            model->forward(ForwardInput{prompt, 0});
+            constexpr int CHUNK = 512;
+            for (int pos = 0; pos < pp; pos += CHUNK) {
+                int sz = std::min(CHUNK, pp - pos);
+                std::vector<int> chunk(sz, bos_id);
+                model->forward(ForwardInput{chunk, depth + pos});
+            }
             double dt = now_ms() - t;
+
             if (r >= warmup) times.push_back(dt);
         }
 
-        char name[32]; snprintf(name, sizeof name, "pp %d", pp);
-        print_row(name, "—", compute_stats(times, pp));
+        Stats s = compute_stats(times, pp);
+        rows.push_back({test_name("pp", pp, depth), s.mean_tps, s.sd_tps, false});
+      }
     }
 
     // ── Decode (TG) at various KV-cache depths ──────────────────────────────
     for (int tg : tg_list) {
       for (int depth : depths) {
-        char name[32]; snprintf(name, sizeof name, "tg %d", tg);
-        char dstr[32]; snprintf(dstr, sizeof dstr, "%d", depth);
-
         if (depth + tg > max_seq) {
-            print_row(name, dstr, {}, /*skipped=*/true);
+            rows.push_back({test_name("tg", tg, depth), 0, 0, true});
             continue;
         }
 
@@ -244,10 +319,12 @@ int main(int argc, char* argv[]) {
             if (r >= warmup) times.push_back(dt);
         }
 
-        print_row(name, dstr, compute_stats(times, tg));
+        Stats s = compute_stats(times, tg);
+        rows.push_back({test_name("tg", tg, depth), s.mean_tps, s.sd_tps, false});
       }
     }
 
+    print_results(out_fmt, model_basename(model_dir), GpuEngine::count(), rows);
     printf("\n");
     return 0;
 }

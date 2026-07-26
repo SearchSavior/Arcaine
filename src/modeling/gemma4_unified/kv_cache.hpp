@@ -7,8 +7,6 @@
 struct LayerKvCache {
     GpuBuffer<bf16> k;  // (max_seq_len, nkv_heads, head_dim)
     GpuBuffer<bf16> v;  // same shape — always separate (K != V in Gemma4Unified)
-    GpuBuffer<bf16> k_decode;  // sliding decode layout: (nkv_heads, max_seq, head_dim)
-    GpuBuffer<bf16> v_decode;  // sliding decode layout: (nkv_heads, head_dim, max_seq)
     int   filled   = 0;
     bool  kv_shared = false;  // unused, kept for compatibility
 
@@ -52,10 +50,6 @@ public:
                 size_t n = (size_t)max_seq_len * lkv.nkv_heads * lkv.head_dim;
                 lkv.k = GpuBuffer<bf16>(n, q);
                 lkv.v = GpuBuffer<bf16>(n, q);
-                if (!full) {
-                    lkv.k_decode = GpuBuffer<bf16>(n, q);
-                    lkv.v_decode = GpuBuffer<bf16>(n, q);
-                }
             }
         }
     }

@@ -27,6 +27,7 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "common/gpu/device_select.hpp"
 #include "common/gpu/placement.hpp"
 #include "common/model_interface.hpp"
 #include "common/registry.hpp"
@@ -46,6 +47,10 @@ struct ServerOptions {
     std::string host = "127.0.0.1";
     int port = 8000;
     int max_seq = 2048;
+    // AR prefill is fed to the model in fixed-size chunks so full-attention
+    // layers never materialize an O(seq^2) score matrix on a single forward
+    // (the SYCL USM pool would retain that peak for the process lifetime).
+    int chunked_prefill_size = 512;
     int default_max_tokens = 256;
     int steps = -1;
     unsigned seed = 42;
@@ -92,6 +97,32 @@ struct OpenAiError : std::runtime_error {
     OpenAiError(int s, std::string t, std::string c, const std::string& msg)
         : std::runtime_error(msg), status(s), type(std::move(t)), code(std::move(c)) {}
 };
+
+// Read model_type from <dir>/config.json. Used at startup to pick the backend
+// family: diffusion_gemma uses DiffusionGemmaModel; anything else goes through
+// the ModelRegistry (AR arches: gemma4_unified, qwen3_5_moe_text, qwen3_5).
+// ---------------------------------------------------------------------------
+// AR prefill helper: feed the prompt through the model in fixed-size chunks so
+// full-attention layers never form an O(seq^2) score matrix on one forward.
+// The KV cache accumulates state across chunks; returns the last chunk's
+// logits (i.e. logits for the final prompt token, same as a single forward).
+static std::vector<float> run_chunked_prefill(Model& model,
+                                              const std::vector<int>& prompt_ids,
+                                              int chunk) {
+    if (chunk <= 0) chunk = 512;
+    int n = (int)prompt_ids.size();
+    std::vector<float> logits;
+    for (int pos = 0; pos < n; pos += chunk) {
+        int sz = std::min(chunk, n - pos);
+        std::vector<int> chunk_ids(prompt_ids.begin() + pos,
+                                   prompt_ids.begin() + pos + sz);
+        ForwardInput fin{chunk_ids, /*past_len=*/pos,
+                         /*images=*/nullptr, /*audio=*/nullptr,
+                         /*mm_token_type_ids=*/nullptr};
+        logits = model.forward(fin);
+    }
+    return logits;
+}
 
 // Read model_type from <dir>/config.json. Used at startup to pick the backend
 // family: diffusion_gemma uses DiffusionGemmaModel; anything else goes through
@@ -685,16 +716,11 @@ void handle_non_streaming(const ChatRequest& chat, const std::vector<int>& promp
         std::mt19937 rng(chat.seed);
         const float temp  = chat.temperature >= 0 ? chat.temperature : app.ar_info.temperature;
         const int   top_k = chat.top_k       >= 0 ? chat.top_k       : app.ar_info.top_k;
-        const float top_p = chat.top_p       >= 0 ? chat.top_p       : app.ar_info.top_p;
+        const float top_p = chat.top_p >= 0 ? chat.top_p       : app.ar_info.top_p;
+        app.ar_model->reset_cache();
         auto t_prefill0 = Clock::now();
-        ForwardInput fin{
-            std::cref(prompt_ids),
-            /*past_len=*/0,
-            /*images=*/nullptr,
-            /*audio=*/nullptr,
-            /*mm_token_type_ids=*/nullptr,
-        };
-        std::vector<float> logits = app.ar_model->forward(fin);
+        std::vector<float> logits = run_chunked_prefill(
+            *app.ar_model, prompt_ids, app.opts.chunked_prefill_size);
         double prefill_s = std::chrono::duration<double>(Clock::now() - t_prefill0).count();
         int past = (int)prompt_ids.size();
         auto t_gen0 = Clock::now();
@@ -1031,11 +1057,10 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                 const int   top_k = chat.top_k       >= 0 ? chat.top_k       : app.ar_info.top_k;
                 const float top_p = chat.top_p       >= 0 ? chat.top_p       : app.ar_info.top_p;
 
+                app.ar_model->reset_cache();
                 auto t_prefill0 = Clock::now();
-                ForwardInput fin{std::cref(prompt_ids), /*past_len=*/0,
-                                 /*images=*/nullptr, /*audio=*/nullptr,
-                                 /*mm_token_type_ids=*/nullptr};
-                std::vector<float> logits = app.ar_model->forward(fin);
+                std::vector<float> logits = run_chunked_prefill(
+                    *app.ar_model, prompt_ids, app.opts.chunked_prefill_size);
                 double prefill_s = std::chrono::duration<double>(Clock::now() - t_prefill0).count();
                 int past = (int)prompt_ids.size();
                 auto t_gen0 = Clock::now();
@@ -1244,12 +1269,15 @@ void usage(const char* p) {
         "  --host <addr>              listen address (default: 127.0.0.1)\n"
         "  --port <N>                 listen port (default: 8000)\n"
         "  --max-seq <N>              KV cache capacity (default: 2048)\n"
+        "  --chp, --chunked-prefill-size <N>  AR prefill chunk size (default: 512)\n"
+        "                             caps full-attention score memory to O(N*kv_len)\n"
         "  --max-tokens <N>           default max completion tokens (default: 256)\n"
         "  --steps <N>                default denoising steps (default: model config)\n"
         "  --seed <S>                 default RNG seed (default: 42)\n"
         "  --layers <spec>            layer placement: auto, single, split:N, ranges:N,N,..., gpus:N\n"
         "  --experts <spec>           expert placement: auto, layer-owner, replicate, shard, ranges:N,N,..., gpus:N\n"
         "  --gpus <spec>              GPU selection: all, or future comma-list (default: all)\n"
+        "  --device <N>               visible GPU via ZE_AFFINITY_MASK (default: all GPUs)\n"
         "  --print-placement          print resolved placement during model load (default)\n"
         "  --no-print-placement       suppress placement report during model load\n"
         "  --debug                    write full debug responses to ./arcaine_debug.log\n"
@@ -1272,12 +1300,15 @@ ServerOptions parse_args(int argc, char** argv) {
         else if (a == "--host")              opts.host = next();
         else if (a == "--port")              opts.port = std::stoi(next());
         else if (a == "--max-seq")           opts.max_seq = std::stoi(next());
+        else if (a == "--chp" || a == "--chunked-prefill-size")
+                                         opts.chunked_prefill_size = std::stoi(next());
         else if (a == "--max-tokens")        opts.default_max_tokens = std::stoi(next());
         else if (a == "--steps")             opts.steps = std::stoi(next());
         else if (a == "--seed")              opts.seed = (unsigned)std::stoul(next());
         else if (a == "--layers")            apply_layers_spec(next(), opts.placement);
         else if (a == "--experts")           apply_experts_spec(next(), opts.placement);
         else if (a == "--gpus")              apply_gpus_spec(next());
+        else if (a == "--device")            gpu_device_control::apply_device_index(next());
         else if (a == "--print-placement")   opts.print_placement = true;
         else if (a == "--no-print-placement") opts.print_placement = false;
         else if (a == "--debug")             opts.debug = true;
@@ -1288,6 +1319,7 @@ ServerOptions parse_args(int argc, char** argv) {
     if (opts.served_model_name.empty()) opts.served_model_name = basename_of(opts.model_dir);
     if (opts.port <= 0 || opts.port > 65535) throw std::runtime_error("--port must be 1..65535");
     if (opts.max_seq <= 0) throw std::runtime_error("--max-seq must be greater than 0");
+    if (opts.chunked_prefill_size <= 0) throw std::runtime_error("--chp/--chunked-prefill-size must be greater than 0");
     if (opts.default_max_tokens <= 0) throw std::runtime_error("--max-tokens must be greater than 0");
     return opts;
 }

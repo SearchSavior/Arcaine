@@ -13,128 +13,6 @@
 
 
 
-static void append_sliding_decode_layouts(
-    sycl::queue& q,
-    const bf16* k_src,
-    const bf16* v_src,
-    bf16* k_dst,
-    bf16* v_dst,
-    int past_len,
-    int seq_len,
-    int nkv_heads,
-    int head_dim,
-    int max_seq
-) {
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<3>((size_t)seq_len, (size_t)nkv_heads, (size_t)head_dim),
-            [=](sycl::id<3> id) {
-                int t = (int)id[0];
-                int kvh = (int)id[1];
-                int d = (int)id[2];
-                size_t src_off = ((size_t)t * nkv_heads + kvh) * head_dim + d;
-                k_dst[((size_t)kvh * max_seq + past_len + t) * head_dim + d] = k_src[src_off];
-                v_dst[((size_t)kvh * head_dim + d) * max_seq + past_len + t] = v_src[src_off];
-            });
-    });
-}
-
-
-static void softmax_bf16_rows_inplace(
-    sycl::queue& q,
-    bf16* x,
-    int rows,
-    int cols
-) {
-    constexpr int WG = 256;
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> scratch(sycl::range<1>(WG), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)rows * WG), sycl::range<1>(WG)),
-            [=](sycl::nd_item<1> it) {
-                int row = it.get_group(0);
-                int lid = it.get_local_id(0);
-                int lsz = it.get_local_range(0);
-                bf16* row_ptr = x + (size_t)row * cols;
-
-                float maxv = -3.4028234663852886e38f;
-                for (int c = lid; c < cols; c += lsz)
-                    maxv = sycl::fmax(maxv, bf16_to_float(row_ptr[c]));
-                scratch[lid] = maxv;
-                it.barrier(sycl::access::fence_space::local_space);
-
-                for (int offset = WG / 2; offset > 0; offset >>= 1) {
-                    if (lid < offset)
-                        scratch[lid] = sycl::fmax(scratch[lid], scratch[lid + offset]);
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                maxv = scratch[0];
-
-                float sum = 0.0f;
-                for (int c = lid; c < cols; c += lsz)
-                    sum += sycl::exp(bf16_to_float(row_ptr[c]) - maxv);
-                scratch[lid] = sum;
-                it.barrier(sycl::access::fence_space::local_space);
-
-                for (int offset = WG / 2; offset > 0; offset >>= 1) {
-                    if (lid < offset)
-                        scratch[lid] += scratch[lid + offset];
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-                float inv_sum = 1.0f / scratch[0];
-
-                for (int c = lid; c < cols; c += lsz) {
-                    float p = sycl::exp(bf16_to_float(row_ptr[c]) - maxv) * inv_sum;
-                    row_ptr[c] = float_to_bf16(p);
-                }
-            });
-    });
-}
-
-static GpuBuffer<bf16> sliding_decode_attention(
-    GpuEngine& ctx,
-    const bf16* Q_dev,
-    const bf16* K_decode_dev,
-    const bf16* V_decode_dev,
-    int kv_len,
-    int kv_start,
-    int cache_stride,
-    int nq_heads,
-    int nkv_heads,
-    int head_dim
-) {
-    auto& q = ctx.queue;
-    int gqa_ratio = nq_heads / nkv_heads;
-
-    // scores(b, m, t) = Q(b, m, d) @ K_decode(b, t, d)^T
-    GpuBuffer<bf16> scores_bf16((size_t)nq_heads * kv_len, q);
-    matmul_bf16_batched_strided(
-        Q_dev,
-        nkv_heads, gqa_ratio, head_dim,
-        (dnnl_dim_t)gqa_ratio * head_dim, head_dim, 1,
-        K_decode_dev + (size_t)kv_start * head_dim,
-        kv_len,
-        (dnnl_dim_t)cache_stride * head_dim, 1, head_dim,
-        scores_bf16.data(),
-        (dnnl_dim_t)gqa_ratio * kv_len, kv_len, 1,
-        ctx);
-
-    softmax_bf16_rows_inplace(q, scores_bf16.data(), nq_heads, kv_len);
-
-    // ctx(b, m, d) = scores(b, m, t) @ V_decode(b, d, t)^T
-    GpuBuffer<bf16> ctx_tm((size_t)nq_heads * head_dim, q);
-    matmul_bf16_batched_strided(
-        scores_bf16.data(),
-        nkv_heads, gqa_ratio, kv_len,
-        (dnnl_dim_t)gqa_ratio * kv_len, kv_len, 1,
-        V_decode_dev + kv_start,
-        head_dim,
-        (dnnl_dim_t)head_dim * cache_stride, 1, cache_stride,
-        ctx_tm.data(),
-        (dnnl_dim_t)gqa_ratio * head_dim, head_dim, 1,
-        ctx);
-
-    return ctx_tm;
-}
 
 // ---------------------------------------------------------------------------
 // Sliding attention
@@ -157,13 +35,13 @@ void sliding_attention_forward(
     int win  = cfg.sliding_window;      // 1024
 
     GpuBuffer<bf16> Q((size_t)seq_len * nq * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.q_proj.data(), nq * hd, Q.data(), ctx);
+    proj_matmul(w.q_proj, hidden, seq_len, H, nq * hd, Q.data(), ctx);
 
     GpuBuffer<bf16> K_raw((size_t)seq_len * nkv * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.k_proj.data(), nkv * hd, K_raw.data(), ctx);
+    proj_matmul(w.k_proj, hidden, seq_len, H, nkv * hd, K_raw.data(), ctx);
 
     GpuBuffer<bf16> V_raw((size_t)seq_len * nkv * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.v_proj.data(), nkv * hd, V_raw.data(), ctx);
+    proj_matmul(w.v_proj, hidden, seq_len, H, nkv * hd, V_raw.data(), ctx);
 
     rms_norm(q, Q.data(),     w.q_norm.data(), Q.data(),     seq_len * nq,  hd, cfg.rms_norm_eps);
     rms_norm(q, K_raw.data(), w.k_norm.data(), K_raw.data(), seq_len * nkv, hd, cfg.rms_norm_eps);
@@ -180,41 +58,51 @@ void sliding_attention_forward(
         size_t koff = (size_t)past_len * row;
         q.memcpy(kv.k.data() + koff, K_raw.data(), seq_len * row * sizeof(bf16));
         q.memcpy(kv.v.data() + koff, V_raw.data(), seq_len * row * sizeof(bf16));
-        append_sliding_decode_layouts(q, K_raw.data(), V_raw.data(),
-                                      kv.k_decode.data(), kv.v_decode.data(),
-                                      past_len, seq_len, nkv, hd, kv.max_seq);
         kv.filled = past_len + seq_len;
     }
 
-    // Truncate the KV view to the effective sliding window.
-    // Tokens older than `win` positions will be masked to -inf anyway; skipping
-    // them eliminates the expand_kv copies and QK^T matmul over masked-out rows.
-    // Truncation also guarantees all remaining KV positions are within the window,
-    // so the sliding-window part of fill_causal_mask is a no-op → pass INT_MAX.
-    // For decode (seq_len==1) the mask is entirely zero after truncation → skip it.
-    int eff_kv_len   = std::min(kv.filled, win);
-    int eff_kv_start = kv.filled - eff_kv_len;
-    size_t kv_row    = (size_t)nkv * hd;
-    const bf16* K_ptr = kv.k.data() + (size_t)eff_kv_start * kv_row;
-    const bf16* V_ptr = kv.v.data() + (size_t)eff_kv_start * kv_row;
-
+    // Decode (seq_len == 1): use the general masked attention path on the
+    // primary KV cache (kv.k / kv.v). The dedicated sliding_decode_attention
+    // kernel that read the transposed k_decode/v_decode buffers is unreliable
+    // once the context length exceeds the sliding window (filled > win): the
+    // strided batched matmul over those buffers produces incoherent scores at
+    // kv_len > 1024 that drive the model into a degenerate token-repetition
+    // loop, and decode throughput collapses ~8x. The general path shares the
+    // exact kv.k/kv.v + fill_causal_mask machinery used for prefill (verified
+    // correct at any length) and stays coherent. For a single decode query
+    // the score matrix is only (nq * filled), so the cost is modest.
     if (seq_len == 1) {
-        auto attn_ctx = sliding_decode_attention(ctx,
-            Q.data(), kv.k_decode.data(), kv.v_decode.data(),
-            eff_kv_len, eff_kv_start, kv.max_seq, nq, nkv, hd);
-        matmul_bf16(attn_ctx.data(), seq_len, nq * hd, w.o_proj.data(), H, tmp, ctx);
+        auto attn_ctx = batched_attention(ctx,
+            Q.data(), seq_len, nq, hd,
+            kv.k.data(), kv.v.data(), kv.filled, nkv, hd,
+            past_len, /*sliding_window=*/win,
+            /*scale=*/1.0f,            // Q/K are RMSNorm-ed, so no 1/sqrt(d) factor
+            /*skip_mask=*/false,
+            /*block_ids=*/nullptr);     // text decode: no vision blocks
+        proj_matmul(w.o_proj, attn_ctx.data(), seq_len, nq * hd, H, tmp, ctx);
         return;
     }
 
+    // Prefill: do NOT tail-truncate the KV cache. The decode truncation above is
+    // only valid because the lone decode query is at the cache tail. During
+    // prefill the queries span the whole chunk, so an early query (e.g. position
+    // 0 of a 1812-token prompt) must attend to early KV positions that a
+    // tail-truncation to the last `win` entries would drop. Worse, when the
+    // chunk is longer than `win`, the earliest queries would have NO surviving
+    // KV within the window, producing a fully -inf mask row → NaN softmax →
+    // corrupt hidden states and collapse of the model into a degenerate token
+    // loop. Pass the full accumulated KV and the real `sliding_window` so
+    // fill_causal_mask applies the per-query window
+    // (kv_global < q_global - win + 1 → -inf) correctly.
     auto attn_ctx = batched_attention(ctx,
         Q.data(), seq_len, nq, hd,
-        K_ptr, V_ptr, eff_kv_len, nkv, hd,
-        past_len, /*sliding_window=*/INT_MAX,
+        kv.k.data(), kv.v.data(), kv.filled, nkv, hd,
+        past_len, /*sliding_window=*/win,
         /*scale=*/1.0f,            // Q/K are RMSNorm-ed, so no 1/sqrt(d) factor
         /*skip_mask=*/false,
         block_ids);
 
-    matmul_bf16(attn_ctx.data(), seq_len, nq * hd, w.o_proj.data(), H, tmp, ctx);
+    proj_matmul(w.o_proj, attn_ctx.data(), seq_len, nq * hd, H, tmp, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -237,10 +125,10 @@ void full_attention_forward(
     int hd   = cfg.global_head_dim;      // 512
 
     GpuBuffer<bf16> Q((size_t)seq_len * nq * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.q_proj.data(), nq * hd, Q.data(), ctx);
+    proj_matmul(w.q_proj, hidden, seq_len, H, nq * hd, Q.data(), ctx);
 
     GpuBuffer<bf16> K_raw((size_t)seq_len * nkv * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.k_proj.data(), nkv * hd, K_raw.data(), ctx);
+    proj_matmul(w.k_proj, hidden, seq_len, H, nkv * hd, K_raw.data(), ctx);
 
     rms_norm(q, Q.data(), w.q_norm.data(), Q.data(), seq_len * nq, hd, cfg.rms_norm_eps);
 
@@ -283,7 +171,7 @@ void full_attention_forward(
 
         // attn_out(nq, hd) = scores(nq, kv_len) @ V(kv_len, hd). Reuse Q (same size).
         matmul_bf16_nn(scores_bf16.data(), nq, kv_len, kv.v.data(), hd, Q.data(), ctx);
-        matmul_bf16(Q.data(), 1, nq * hd, w.o_proj.data(), H, tmp, ctx);
+        proj_matmul(w.o_proj, Q.data(), 1, nq * hd, H, tmp, ctx);
         return;
     }
 
@@ -296,5 +184,5 @@ void full_attention_forward(
         /*skip_mask=*/(seq_len == 1),
         block_ids);
 
-    matmul_bf16(attn_ctx.data(), seq_len, nq * hd, w.o_proj.data(), H, tmp, ctx);
+    proj_matmul(w.o_proj, attn_ctx.data(), seq_len, nq * hd, H, tmp, ctx);
 }
