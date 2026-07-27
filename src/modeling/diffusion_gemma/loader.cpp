@@ -1,11 +1,11 @@
 #include "loader.hpp"
-#include "../../common/gpu/placement.hpp"
-#include "../../common/gpu/expert_parallel.hpp"
-#include "../../common/io/quant_loader.hpp"
-#include "../../common/io/safetensors.hpp"
-#include "../../common/io/gguf.hpp"
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/engine.hpp"
+#include "inference/placement.hpp"
+#include "inference/expert_execution.hpp"
+#include "../../runtime/quantization/quant_loader.hpp"
+#include "../../runtime/quantization/safetensors.hpp"
+#include "../../runtime/quantization/gguf.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
 #include "fusions/int4_awq.hpp"
 #include <fstream>
 #include <memory>
@@ -20,7 +20,7 @@
 #include <nlohmann/json.hpp>
 
 // TensorSource / ShardedSafetensors and the NVFP4/BF16 upload helpers now
-// live in common/io/quant_loader.hpp (shared with other model modules).
+// live in runtime/quantization/quant_loader.hpp (shared with other model modules).
 
 class DiffusionGgufSource : public TensorSource {
 public:

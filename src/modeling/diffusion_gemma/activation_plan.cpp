@@ -1,7 +1,7 @@
 #include "activation_plan.hpp"
 #include "arena.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/mem_planner.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "inference/memory_plan.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>

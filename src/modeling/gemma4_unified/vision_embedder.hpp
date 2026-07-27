@@ -1,8 +1,8 @@
 #pragma once
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 #include "weights.hpp"
 #include "config.hpp"
-#include "../../common/preprocess/image_proc.hpp"
+#include "../../preprocessing/image_processor.hpp"
 
 // Run the GPU vision embedding pipeline.
 // Returns device buffer of shape (num_valid_patches, hidden_size).

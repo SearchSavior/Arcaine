@@ -1,5 +1,5 @@
 #include "chat.hpp"
-#include "../common/preprocess/chat_template.hpp"
+#include "../preprocessing/chat_template.hpp"
 
 TokenizerBridge::TokenizerBridge(const std::string& model_dir)
     : model_dir_(model_dir), tokenizer_(Tokenizer::from_json(model_dir + "/tokenizer.json")) {}

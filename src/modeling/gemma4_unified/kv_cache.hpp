@@ -1,7 +1,7 @@
 #pragma once
 #include <vector>
 #include <stdexcept>
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 #include "config.hpp"
 
 struct LayerKvCache {

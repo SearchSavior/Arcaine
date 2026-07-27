@@ -1,7 +1,7 @@
 #pragma once
-#include "../../modeling/diffusion_gemma/weights.hpp"
-#include "engine.hpp"
-#include "buffer.hpp"
+#include "../weights.hpp"
+#include "../../../runtime/gpu/engine.hpp"
+#include "../../../runtime/gpu/buffer.hpp"
 #include <vector>
 
 // NVFP4 expert-kernel selection. Default comes from DIFF_NVFP4_EXPERT_KERNEL,

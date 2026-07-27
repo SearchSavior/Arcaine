@@ -10,13 +10,13 @@
 #include "loader.hpp"
 #include "operators.hpp"
 #include "vision.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/fp8.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/quantization/fp8.hpp"
 #include "../../common/kernels/elementwise.hpp"
 #include "../../common/kernels/embedding.hpp"
 #include "../../common/kernels/rms_norm.hpp"
 #include "../../common/kernels/scatter.hpp"
-#include "../../common/preprocess/chat_template.hpp"
+#include "../../preprocessing/chat_template.hpp"
 
 namespace {
 

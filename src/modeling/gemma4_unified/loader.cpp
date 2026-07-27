@@ -1,8 +1,8 @@
 #include "weights.hpp"
 #include "config.hpp"
-#include "../../common/io/safetensors.hpp"
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/engine.hpp"
+#include "../../runtime/quantization/safetensors.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
 #include <vector>
 #include <cstring>
 #include <stdexcept>

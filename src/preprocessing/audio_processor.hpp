@@ -2,10 +2,9 @@
 #include <vector>
 #include <string>
 
-struct AudioInput {
-    std::vector<float> frames;  // (num_frames, 640) — raw waveform chunks
-    int                num_frames;
-};
+#include "inference/contracts/media_input.hpp"
+
+using AudioInput = arcaine::inference::AudioInput;
 
 // Chunk raw waveform samples into 640-sample frames.
 // waveform: PCM float32 at the processor-configured sample rate.

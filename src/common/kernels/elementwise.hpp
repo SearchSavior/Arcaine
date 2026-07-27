@@ -1,6 +1,6 @@
 #pragma once
 #include <sycl/sycl.hpp>
-#include "../gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 #include <cmath>
 
 // GELU with tanh approximation. Applied in-place.

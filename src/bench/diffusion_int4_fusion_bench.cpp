@@ -14,9 +14,9 @@
 #include "common/bench/registry.hpp"
 #include "common/bench/util.hpp"
 
-#include "common/gpu/buffer.hpp"
-#include "common/gpu/engine.hpp"
-#include "common/gpu/ops.hpp"
+#include "runtime/gpu/buffer.hpp"
+#include "runtime/gpu/engine.hpp"
+#include "runtime/gpu/ops.hpp"
 #include "common/kernels/elementwise.hpp"
 #include "common/kernels/rms_norm.hpp"
 #include "modeling/diffusion_gemma/fusions/int4_awq.hpp"

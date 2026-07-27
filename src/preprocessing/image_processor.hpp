@@ -4,17 +4,12 @@
 #include <string>
 #include <cstdint>
 
-struct ImageInput {
-    std::vector<float>             pixel_values;    // (max_soft_tokens, 6912) padded
-    std::vector<std::array<int,2>> position_ids;    // (max_soft_tokens, 2) — -1 for padding
-    int                            num_valid_patches;
-    int                            max_patches = 280;
-    // Qwen VL fields. Gemma leaves these at their defaults.
-    std::array<int,3>              grid_thw = {0, 0, 0};
-    int                            raw_patches = 0;
-    int                            patch_dim = 0;
-    int                            modality_type = 1;  // 1=image, 2=video
-};
+#include "inference/contracts/media_input.hpp"
+
+// The neutral ImageInput container lives in the inference contract
+// (arcaine::inference::ImageInput). This alias keeps existing call sites
+// (which use the unqualified `ImageInput`) working during the migration.
+using ImageInput = arcaine::inference::ImageInput;
 
 // Decode PNG/JPEG and run the full CPU preprocessing pipeline.
 ImageInput preprocess_image(const std::string& path,

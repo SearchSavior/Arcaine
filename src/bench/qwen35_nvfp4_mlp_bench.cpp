@@ -18,11 +18,11 @@
 #include <string>
 #include <vector>
 
-#include "common/gpu/buffer.hpp"
-#include "common/gpu/device_select.hpp"
-#include "common/gpu/engine.hpp"
-#include "common/gpu/nvfp4.hpp"
-#include "common/io/quant_loader.hpp"
+#include "runtime/gpu/buffer.hpp"
+#include "runtime/gpu/device_select.hpp"
+#include "runtime/gpu/engine.hpp"
+#include "runtime/quantization/nvfp4.hpp"
+#include "runtime/quantization/quant_loader.hpp"
 #include "modeling/qwen3_5_moe/kernels.hpp"
 
 using arcaine::bench::aggregate;

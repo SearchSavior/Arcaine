@@ -1,10 +1,10 @@
 #pragma once
 #include <variant>
 #include <vector>
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/nvfp4.hpp"
-#include "../../common/gpu/int4.hpp"
-#include "../../common/gpu/q8_0.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"
+#include "../../runtime/quantization/int4.hpp"
+#include "../../runtime/quantization/q8_0.hpp"
 
 // A projection weight that may be plain BF16, NVFP4 (W4A4), int4 W4A16, or
 // GGUF Q8_0 W8A16.

@@ -2,7 +2,7 @@
 //   pure assertions run always; render-merge assertions run only when a model
 //   directory is passed as argv[1] (following the test_tokenizer convention).
 #include "chat_template_kwargs.hpp"
-#include "../common/preprocess/chat_template.hpp"
+#include "../preprocessing/chat_template.hpp"
 
 #include <cstdio>
 #include <stdexcept>

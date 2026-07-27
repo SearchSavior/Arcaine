@@ -1,6 +1,6 @@
 #pragma once
 #include <sycl/sycl.hpp>
-#include "../gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 
 // RMSNorm: out[row, d] = x[row, d] / rms(x[row, :]) * weight[d]
 // x and out may alias (in-place ok).

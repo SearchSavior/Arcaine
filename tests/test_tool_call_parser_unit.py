@@ -138,7 +138,7 @@ def parser_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
             # unicode_byte_to_utf8). These are the same UNICODE_SRCS linked
             # into every CMake target that compiles tokenizer.cpp — see
             # CMakeLists.txt:50-53.
-            str(REPO_ROOT / "src/common/preprocess/unicode.cpp"),
+            str(REPO_ROOT / "src/preprocessing/unicode.cpp"),
             str(REPO_ROOT / "src/common/preprocess/unicode-data.cpp"),
             "-I",
             str(REPO_ROOT / "src"),

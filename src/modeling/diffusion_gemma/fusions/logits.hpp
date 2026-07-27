@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <sycl/sycl.hpp>
-#include "../../../common/gpu/buffer.hpp"
+#include "../../../runtime/gpu/buffer.hpp"
 
 // Counter-based device RNG — must match diffsamp::rng_u32 in device_sampler.hpp.
 // Duplicated here (rather than #include'ing device_sampler.hpp) to keep the

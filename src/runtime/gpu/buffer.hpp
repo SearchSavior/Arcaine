@@ -3,7 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <sycl/sycl.hpp>
-#include "engine.hpp"
+#include "runtime/gpu/engine.hpp"
 
 using bf16 = uint16_t;  // BF16 stored as raw bits
 

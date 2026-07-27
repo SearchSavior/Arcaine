@@ -40,55 +40,54 @@ set_target_properties(onnxruntime PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
-# Source groups
-#   common/         — architecture-independent engine (registry, preprocessing, ...)
-#   modeling/<arch> — one directory per model architecture; add a sibling to extend.
-# ---------------------------------------------------------------------------
-# Plain-C++ Unicode tables + helpers (ported from llama.cpp, MIT) used by
-# tokenizer.cpp for Qwen2/GPT-2 byte-level BPE. Linked into every target that
-# compiles tokenizer.cpp.
-set(UNICODE_SRCS
-    src/common/preprocess/unicode.cpp
-    src/common/preprocess/unicode-data.cpp
-)
+# Model selection. ARCAINE_MODELS selects which model implementations are
+# compiled into this build (independent per-model CMake targets). A disabled
+# model's sources are not compiled or linked; loading a disabled model at
+# runtime yields a clear error from ModelRegistry.
+set(ARCAINE_KNOWN_MODELS "gemma4_unified;qwen3_5;qwen3_5_moe;diffusion_gemma")
+set(ARCAINE_MODELS "${ARCAINE_KNOWN_MODELS}" CACHE STRING
+    "Model implementations compiled into Arcaine (semicolon-separated)")
+foreach(m ${ARCAINE_MODELS})
+    if(NOT m IN_LIST ARCAINE_KNOWN_MODELS)
+        message(FATAL_ERROR
+            "Unknown model '${m}' in ARCAINE_MODELS. Known: ${ARCAINE_KNOWN_MODELS}")
+    endif()
+endforeach()
+# Global registration defines — visible to register_builtins.cpp (and, from
+# Phase 6 on, builtin_models.cpp) so the #ifdef-gated registration calls match
+# the set of models actually compiled into this build.
+foreach(m ${ARCAINE_MODELS})
+    string(TOUPPER "${m}" _M)
+    add_compile_definitions(ARCAINE_MODEL_${_M})
+endforeach()
 
-set(COMMON_SRCS
+include(${CMAKE_SOURCE_DIR}/cmake/ArcaineModel.cmake)
+
+enable_testing()
+add_subdirectory(src/inference)
+add_subdirectory(src/preprocessing)   # tokenizer/chat-template/media/quant loader (no model logic)
+add_subdirectory(src/modeling)        # adds only enabled model subdirs; sets ARCAINE_*_MODEL_LIBS
+add_subdirectory(tests)
+
+# ---------------------------------------------------------------------------
+# Shared app infrastructure. Project preprocessing (tokenizer, chat template,
+# media, quant loader) and the inference contracts live in the
+# arcaine_preprocessing / arcaine_contracts libraries linked below; model
+# implementations live in per-model static libraries under src/modeling/<m>/,
+# linked via ARCAINE_*_MODEL_LIBS.
+#
+# AR apps still drive the legacy ModelRegistry (common/registry.cpp +
+# register_builtins.cpp) until the Phase 7 server cutover.
+set(ARCAINE_COMMON_SRCS
     src/register_builtins.cpp
     src/common/registry.cpp
-    src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp
-    src/common/preprocess/tokenizer.cpp
-    src/common/preprocess/chat_template.cpp
-    src/common/preprocess/image_proc.cpp
-    src/common/preprocess/audio_proc.cpp
-    ${UNICODE_SRCS}
 )
 
-set(GEMMA4_SRCS
-    src/modeling/gemma4_unified/loader.cpp
-    src/modeling/gemma4_unified/attention.cpp
-    src/modeling/gemma4_unified/ffn.cpp
-    src/modeling/gemma4_unified/vision_embedder.cpp
-    src/modeling/gemma4_unified/audio_embedder.cpp
-    src/modeling/gemma4_unified/model.cpp
-    src/modeling/gemma4_unified/register.cpp
-)
-
-set(QWEN_SRCS
-    src/modeling/qwen3_5_moe/loader.cpp
-    src/modeling/qwen3_5_moe/model.cpp
-    src/modeling/qwen3_5_moe/register.cpp
-)
-
-set(QWEN35_SRCS
-    src/modeling/qwen3_5/loader.cpp
-    src/modeling/qwen3_5/vision.cpp
-    src/modeling/qwen3_5/model.cpp
-    src/modeling/qwen3_5/register.cpp
-)
-
-# All built-in architectures linked into the inference/bench binaries.
-set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS} ${QWEN35_SRCS})
+set(ARCAINE_SYCL_LIB_FLAGS
+    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+set(ARCAINE_SYCL_LINK_FLAGS
+    -fsycl ${ARCAINE_SYCL_TARGET_FLAG}
+    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
 # ---------------------------------------------------------------------------
 add_executable(get_device_props src/utils/gpu_check.cpp)
@@ -99,109 +98,85 @@ set_target_properties(get_device_props PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/.agents/skills/check-available-hardware")
 
 # ---------------------------------------------------------------------------
-add_executable(gemma4 src/main.cpp ${COMMON_SRCS} ${ARCH_SRCS})
-target_compile_options(gemma4 PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(gemma4   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-# ARCH_SRCS now pulls qwen3_5_moe (NVFP4 loader) + common/quant_loader.cpp, both
-# of which include nvfp4.hpp -> __spirv_SubgroupMatrixMultiplyAccumulateINTEL.
-target_link_options(gemma4 PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(gemma4 PRIVATE DNNL::dnnl soxr onnxruntime)
+# CLI (AR frontends, model-agnostic via the legacy ModelRegistry).
+add_executable(gemma4 src/main.cpp ${ARCAINE_COMMON_SRCS})
+target_compile_options(gemma4 PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(gemma4 PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(gemma4 PRIVATE
+    arcaine_preprocessing ${ARCAINE_AR_MODEL_LIBS} DNNL::dnnl soxr onnxruntime)
 set_target_properties(gemma4 PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
     INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
-# --chat-template-kwargs parsing + chat-template merge. Logic is SYCL-free, but
-# the global -fsycl-targets flag means every target must also pass -fsycl.
-# Pass a model dir as argv[1] to exercise the render-merge assertions.
+# --chat-template-kwargs parsing + chat-template merge. SYCL-free logic, but
+# every target must pass -fsycl under the global sycl-targets flag. Pass a
+# model dir as argv[1] to exercise the render-merge assertions.
 add_executable(test_chat_template_kwargs
-    src/utils/test_chat_template_kwargs.cpp
-    src/common/preprocess/chat_template.cpp
-    src/common/preprocess/tokenizer.cpp
-    ${UNICODE_SRCS})
-target_compile_options(test_chat_template_kwargs PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(test_chat_template_kwargs    PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_libraries(test_chat_template_kwargs  PRIVATE DNNL::dnnl)
+    src/utils/test_chat_template_kwargs.cpp)
+target_compile_options(test_chat_template_kwargs PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(test_chat_template_kwargs PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(test_chat_template_kwargs PRIVATE arcaine_preprocessing DNNL::dnnl)
 
 # ---------------------------------------------------------------------------
-# Inference benchmark. Goes through the model registry, so it links the same
-# architecture + common sources as the main binary.
-add_executable(arcaine_mbench src/arcaine_mbench.cpp ${COMMON_SRCS} ${ARCH_SRCS})
-target_compile_options(arcaine_mbench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(arcaine_mbench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-# See gemma4: ARCH_SRCS / COMMON_SRCS include nvfp4.hpp-bearing loader TUs.
-target_link_options(arcaine_mbench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(arcaine_mbench PRIVATE DNNL::dnnl soxr onnxruntime)
+# Inference benchmark. Goes through the legacy ModelRegistry, so it links the
+# same AR model libs + common infra as the CLI.
+add_executable(arcaine_mbench src/arcaine_mbench.cpp ${ARCAINE_COMMON_SRCS})
+target_compile_options(arcaine_mbench PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(arcaine_mbench PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(arcaine_mbench PRIVATE
+    arcaine_preprocessing ${ARCAINE_AR_MODEL_LIBS} DNNL::dnnl soxr onnxruntime)
 set_target_properties(arcaine_mbench PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
     INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
-# DiffusionGemma 26B-A4B (block-diffusion MoE) — hello-world driver.
-# Text-only path: needs no soxr / onnxruntime preprocessing.
-set(DIFFUSION_SRCS
-    src/common/preprocess/tokenizer.cpp
-    src/common/preprocess/chat_template.cpp
-    src/common/io/quant_loader.cpp
-    ${UNICODE_SRCS}
-    src/common/gpu/nvfp4_session.cpp
-    src/modeling/diffusion_gemma/loader.cpp
-    src/modeling/diffusion_gemma/moe.cpp
-    src/common/gpu/expert_parallel.cpp
-    src/common/gpu/placement.cpp
-    src/modeling/diffusion_gemma/activation_plan.cpp
-    src/modeling/diffusion_gemma/attention.cpp
-    src/modeling/diffusion_gemma/generate.cpp
-    src/modeling/diffusion_gemma/model.cpp
-    src/common/gpu/mem_planner.cpp
-    src/utils/chat.cpp
-    src/utils/viz.cpp
-    src/utils/profile.cpp
-)
-add_executable(diffusion_gemma src/diffusion_main.cpp ${DIFFUSION_SRCS})
-target_compile_options(diffusion_gemma PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_gemma   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+# DiffusionGemma driver + throughput bench. Gated on diffusion_gemma being
+# enabled (the diffusion lib is self-contained for its GPU helpers).
+if(ARCAINE_DIFFUSION_MODEL_LIB)
+add_executable(diffusion_gemma src/diffusion_main.cpp src/utils/viz.cpp)
+target_compile_options(diffusion_gemma PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(diffusion_gemma PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(diffusion_gemma PRIVATE
+    arcaine_preprocessing ${ARCAINE_DIFFUSION_MODEL_LIB} DNNL::dnnl)
 
-# OpenAI-compatible HTTP API server. Single binary serving every registered
-# architecture: dispatches by config.json::model_type at startup.
-#   - "diffusion_gemma"   -> DiffusionGemmaModel (block-diffusion MoE)
-#   - "gemma4_unified"    -> Gemma4Model (AR, multimodal, BF16)
-#   - "qwen3_5_moe_text"  -> QwenModel (AR, NVFP4 MoE)
-#   - "qwen3_5"           -> Qwen35Model (AR, FP8/NVFP4, multimodal)
-# Links COMMON_SRCS + ARCH_SRCS (all arches, so the registry can construct any)
-# plus DIFFUSION_SRCS (the block-diffusion path) and register_builtins.cpp
-# (wires the AR arches into ModelRegistry). Needs soxr + onnxruntime for the
-# Gemma4/Qwen3.5 audio + Silero VAD preprocessing paths.
+add_executable(diffusion_bench src/diffusion_bench.cpp)
+target_compile_options(diffusion_bench PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(diffusion_bench PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(diffusion_bench PRIVATE
+    arcaine_preprocessing ${ARCAINE_DIFFUSION_MODEL_LIB} DNNL::dnnl)
+endif()
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible HTTP API server. Talks only to ModelService; one execution
+# path for every model (autoregressive or block-diffusion). Requires at least
+# one enabled model (ARCAINE_MODEL_LIBS).
+if(ARCAINE_MODEL_LIBS)
 add_executable(arcaine_server
-    src/arcaine_server.cpp
-    src/utils/gemma4_tool_call_parser.cpp
-    ${DIFFUSION_SRCS}
-    ${COMMON_SRCS}
-    ${ARCH_SRCS}
-    src/register_builtins.cpp)
-target_compile_options(arcaine_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(arcaine_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(arcaine_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-
-# llama-bench style throughput benchmark (loads once, sweeps expert kernels).
-add_executable(diffusion_bench src/diffusion_bench.cpp ${DIFFUSION_SRCS})
-target_compile_options(diffusion_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_bench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
-target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
-target_link_libraries(arcaine_server PRIVATE DNNL::dnnl soxr onnxruntime)
+    src/apps/server/main.cpp
+    src/apps/server/server_app.cpp
+    src/apps/server/app_state.cpp
+    src/apps/server/openai/error_encoder.cpp
+    src/apps/server/openai/request_decoder.cpp
+    src/apps/server/openai/response_encoder.cpp
+    src/apps/server/openai/sse_event_sink.cpp
+    src/apps/server/routes/chat_completions.cpp
+    src/apps/server/routes/models.cpp)
+target_compile_options(arcaine_server PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(arcaine_server PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(arcaine_server PRIVATE
+    arcaine_contracts arcaine_preprocessing ${ARCAINE_MODEL_LIBS}
+    DNNL::dnnl soxr onnxruntime)
 set_target_properties(arcaine_server PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
     INSTALL_RPATH "${ORT_DIR}/lib")
+endif()
 
 # ---------------------------------------------------------------------------
-# Unified kernel benchmark binary. Each kernel bench registers itself via
-# REGISTER_BENCH() in its TU; a new kernel bench is added by dropping a new
-# .cpp into src/bench/ and appending it to KBENCH_SRCS — no main dispatch
-# table to edit. Each bench keeps its own env-var AB gating.
-# Run:
+# Unified kernel benchmark. Each kernel bench registers itself via
+# REGISTER_BENCH() in its TU; a new kernel bench is added by dropping a .cpp
+# into src/bench/ and appending it to KBENCH_SRCS. Each bench keeps its own
+# env-var AB gating.
 #   ./build/arcaine_kbench --list
 #   ./build/arcaine_kbench <name> [opts]
 set(KBENCH_SRCS
@@ -211,16 +186,8 @@ set(KBENCH_SRCS
     src/bench/qwen35_deltanet_bench.cpp
     src/bench/qwen35_delta_decode_fusion_bench.cpp
     src/bench/nvfp4_roofline_bench.cpp
-    src/bench/diffusion_int4_fusion_bench.cpp
-    # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
-    src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp)
+    src/bench/diffusion_int4_fusion_bench.cpp)
 add_executable(arcaine_kbench ${KBENCH_SRCS})
-target_compile_options(arcaine_kbench PRIVATE
-    -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(arcaine_kbench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(arcaine_kbench PRIVATE
-    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(arcaine_kbench PRIVATE DNNL::dnnl)
-
-
+target_compile_options(arcaine_kbench PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(arcaine_kbench PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(arcaine_kbench PRIVATE arcaine_preprocessing DNNL::dnnl)

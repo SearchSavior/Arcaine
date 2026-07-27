@@ -1,10 +1,10 @@
-#include "expert_parallel.hpp"
-#include "int4_grouped_moe.hpp"
-#include "../../modeling/diffusion_gemma/arena.hpp"
-#include "../../modeling/diffusion_gemma/fusions/int4_awq.hpp"
-#include "ops.hpp"
-#include "../kernels/elementwise.hpp"
-#include "../../utils/profile.hpp"
+#include "expert_execution.hpp"
+#include "../kernels/int4_grouped_moe.hpp"
+#include "../arena.hpp"
+#include "../fusions/int4_awq.hpp"
+#include "../../../runtime/gpu/ops.hpp"
+#include "../../../common/kernels/elementwise.hpp"
+#include "../../../runtime/profiling/profile.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>

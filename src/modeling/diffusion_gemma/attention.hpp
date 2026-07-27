@@ -1,7 +1,7 @@
 #pragma once
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/nvfp4.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"
 #include "config.hpp"
 #include "weights.hpp"
 #include "kv_cache.hpp"

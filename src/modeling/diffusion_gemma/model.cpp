@@ -5,8 +5,8 @@
 #include "self_conditioning.hpp"
 #include "fusions/logits.hpp"
 #include "fusions/int4_awq.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/nvfp4.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"
 #include "../../common/kernels/embedding.hpp"
 #include <algorithm>
 #include <cmath>

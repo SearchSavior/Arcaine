@@ -1,6 +1,6 @@
 #pragma once
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/engine.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>

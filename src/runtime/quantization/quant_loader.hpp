@@ -14,9 +14,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../../common/gpu/buffer.hpp"   // GpuBuffer, bf16, float_to_bf16
-#include "../../common/gpu/nvfp4.hpp"    // Nvfp4Linear
-#include "../../common/gpu/fp8.hpp"      // Fp8Linear
+#include "../../runtime/gpu/buffer.hpp"   // GpuBuffer, bf16, float_to_bf16
+#include "../../runtime/quantization/nvfp4.hpp"    // Nvfp4Linear
+#include "../../runtime/quantization/fp8.hpp"      // Fp8Linear
 #include "safetensors.hpp"              // SafetensorsFile
 #include "tensor_view.hpp"             // TensorView
 

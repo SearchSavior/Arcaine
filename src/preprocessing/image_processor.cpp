@@ -1,5 +1,5 @@
 #define STB_IMAGE_IMPLEMENTATION
-#include "image_proc.hpp"
+#include "image_processor.hpp"
 #include <stb/stb_image.h>
 #include <cmath>
 #include <numeric>

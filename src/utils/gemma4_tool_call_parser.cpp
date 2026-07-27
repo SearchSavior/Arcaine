@@ -1,6 +1,6 @@
 #include "gemma4_tool_call_parser.hpp"
 
-#include "../common/preprocess/tokenizer.hpp"
+#include "../preprocessing/tokenizer.hpp"
 
 #include <nlohmann/json.hpp>
 

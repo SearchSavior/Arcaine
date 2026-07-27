@@ -2,8 +2,8 @@
 
 #include <variant>
 #include <vector>
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/nvfp4.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"
 
 // Qwen3.5-MoE device weights. NVFP4 projections are stored as Nvfp4Linear
 // (identical scheme to diffusion_gemma: weight_packed U8, weight_scale F8_E4M3

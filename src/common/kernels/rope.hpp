@@ -1,6 +1,6 @@
 #pragma once
 #include <sycl/sycl.hpp>
-#include "../gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 #include <cmath>
 
 // Apply RoPE in-place to Q and K using the rotate_half (non-interleaved) convention.

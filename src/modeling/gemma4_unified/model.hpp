@@ -5,11 +5,11 @@
 #include <optional>
 #include "config.hpp"
 #include "../../common/model_interface.hpp"
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 #include "weights.hpp"
 #include "kv_cache.hpp"
-#include "../../common/preprocess/image_proc.hpp"
-#include "../../common/preprocess/audio_proc.hpp"
+#include "../../preprocessing/image_processor.hpp"
+#include "../../preprocessing/audio_processor.hpp"
 
 class Gemma4Model : public Model {
 public:

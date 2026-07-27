@@ -26,8 +26,8 @@
 
 #include "common/model_interface.hpp"
 #include "common/registry.hpp"
-#include "common/gpu/device_select.hpp"
-#include "common/gpu/engine.hpp"
+#include "runtime/gpu/device_select.hpp"
+#include "runtime/gpu/engine.hpp"
 
 // ---------------------------------------------------------------------------
 using Clk = std::chrono::high_resolution_clock;

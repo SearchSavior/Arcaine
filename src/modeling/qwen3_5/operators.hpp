@@ -11,9 +11,9 @@
 #include "kernels.hpp"
 #include "weights.hpp"
 #include "workspace.hpp"
-#include "../../common/gpu/fp8.hpp"
-#include "../../common/gpu/nvfp4.hpp"
-#include "../../common/gpu/ops.hpp"
+#include "../../runtime/quantization/fp8.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"
+#include "../../runtime/gpu/ops.hpp"
 #include "../../common/kernels/elementwise.hpp"
 #include "../../common/kernels/rms_norm.hpp"
 

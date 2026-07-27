@@ -20,8 +20,8 @@
 #include "modeling/diffusion_gemma/model.hpp"
 #include "utils/chat.hpp"
 #include "utils/viz.hpp"
-#include "common/gpu/placement.hpp"
-#include "common/gpu/engine.hpp"
+#include "modeling/diffusion_gemma/inference/placement.hpp"
+#include "runtime/gpu/engine.hpp"
 
 // Device-reported VRAM usage for every GPU the engine runs on.
 static std::vector<DiffGpuMem> query_gpu_mem() {

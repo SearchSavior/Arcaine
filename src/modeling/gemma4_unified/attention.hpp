@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/ops.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/ops.hpp"
 #include "config.hpp"
 #include "weights.hpp"
 #include "kv_cache.hpp"

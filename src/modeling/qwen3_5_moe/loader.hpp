@@ -1,7 +1,7 @@
 #pragma once
 
 #include <string>
-#include "../../common/io/quant_loader.hpp"
+#include "../../runtime/quantization/quant_loader.hpp"
 #include "config.hpp"
 #include "weights.hpp"
 

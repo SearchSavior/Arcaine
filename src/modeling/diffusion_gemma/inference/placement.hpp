@@ -1,5 +1,5 @@
 #pragma once
-#include "../../modeling/diffusion_gemma/config.hpp"
+#include "../config.hpp"
 
 #include <string>
 

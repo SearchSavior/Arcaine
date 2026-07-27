@@ -8,8 +8,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include "buffer.hpp"
-#include "engine.hpp"
+#include "runtime/gpu/buffer.hpp"
+#include "runtime/gpu/engine.hpp"
 
 // compressed-tensors float-quantized linear:
 //   dequant_weight[n, k] = float(weight_e4m3[n, k]) * weight_scale[n]

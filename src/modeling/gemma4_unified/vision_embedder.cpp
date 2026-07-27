@@ -1,6 +1,6 @@
 #include "vision_embedder.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/ops.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/gpu/ops.hpp"
 #include "../../common/kernels/layer_norm.hpp"
 #include "../../common/kernels/rms_norm.hpp"
 #include <sycl/sycl.hpp>

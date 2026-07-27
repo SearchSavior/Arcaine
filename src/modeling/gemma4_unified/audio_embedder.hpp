@@ -1,8 +1,8 @@
 #pragma once
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 #include "weights.hpp"
 #include "config.hpp"
-#include "../../common/preprocess/audio_proc.hpp"
+#include "../../preprocessing/audio_processor.hpp"
 
 // Run the GPU audio embedding pipeline.
 // Returns device buffer of shape (num_frames, hidden_size).

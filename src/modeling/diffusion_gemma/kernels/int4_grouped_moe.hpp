@@ -11,8 +11,8 @@
 // reference/llm-scaler/vllm/custom-esimd-kernels-vllm/csrc/moe_batch/
 // int4_nmajor_gemm.h, but uses the project-wide SPIR-V DPAS builtin.  The
 // latter is already used by q8_0.hpp and permits direct BF16-bit operands.
-#include "int4.hpp"
-#include "q8_0.hpp" // DPAS builtin declaration / vector operand types.
+#include "runtime/quantization/int4.hpp"
+#include "runtime/quantization/q8_0.hpp" // DPAS builtin declaration / vector operand types.
 
 static constexpr int kInt4GroupedDpasBF16 = 0x3000;
 

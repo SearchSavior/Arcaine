@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <optional>
 
-#include "../gpu/ops.hpp"
+#include "../../runtime/gpu/ops.hpp"
 #include "../kernels/attention_mask.hpp"
 #include "attention_layout.hpp"
 

@@ -4,10 +4,10 @@
 // independently of the others.
 #include <stdexcept>
 #include "weights.hpp"
-#include "../../common/gpu/ops.hpp"
-#include "../../common/gpu/nvfp4.hpp"
-#include "../../common/gpu/int4.hpp"
-#include "../../common/gpu/q8_0.hpp"
+#include "../../runtime/gpu/ops.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"
+#include "../../runtime/quantization/int4.hpp"
+#include "../../runtime/quantization/q8_0.hpp"
 
 // C (M,N) = A (M,K) @ W^T, where W is (N=out_features, K=in_features).
 inline void matmul_linear_weight(const bf16* A, int M, int K,

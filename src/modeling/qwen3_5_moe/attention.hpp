@@ -27,9 +27,9 @@
 #include <stdexcept>
 #include <vector>
 
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
 #include "../../common/kernels/rms_norm.hpp"       // rms_norm (plain w*x; +1 baked)
 #include "../../common/layers/attention_batched.hpp" // batched_attention (GQA)
 

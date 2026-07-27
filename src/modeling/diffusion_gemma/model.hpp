@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <functional>
 #include <string>
 #include <vector>
@@ -7,8 +8,8 @@
 #include "config.hpp"
 #include "weights.hpp"
 #include "kv_cache.hpp"
-#include "../../common/gpu/placement.hpp"
-#include "../../common/gpu/buffer.hpp"
+#include "inference/placement.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 
 // Streaming event, fired after every denoising step and once per committed
 // canvas (committed=true; `canvas` is then the final block, EOS-truncated).
@@ -49,11 +50,17 @@ public:
     DiffusionGemmaModel(const std::string& model_dir, int max_seq_len, DiffPlacementOptions placement = {}, bool print_placement = true);
 
     // Block-diffusion generation. Returns generated token ids (prompt excluded).
+    // `cancel` (optional) is checked at the top of each denoising step; when set
+    // the loop stops at the next step boundary and returns what was committed so
+    // far. (The owning session owns the cancellation policy; the engine only
+    // provides the interruption point.)
     std::vector<int> generate(const std::vector<int>& prompt_ids,
                               int max_new_tokens, int max_denoising_steps,
                               unsigned seed, bool verbose,
                               const DiffStreamCallback& on_step = nullptr,
-                              bool ignore_eos = false);
+                              bool ignore_eos = false,
+                              const std::atomic<bool>* cancel = nullptr);
+
 
     const DiffConfig& config() const { return cfg_; }
     const DiffPerfStats& stats() const { return stats_; }   // from the last generate()

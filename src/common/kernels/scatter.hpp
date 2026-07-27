@@ -1,6 +1,6 @@
 #pragma once
 #include <sycl/sycl.hpp>
-#include "../gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 
 // Replace positions where mask[i] == true in seq_embeds with rows from modal_embeds.
 // modal_embeds rows are consumed in order of the true positions in mask.

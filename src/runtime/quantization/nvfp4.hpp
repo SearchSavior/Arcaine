@@ -17,8 +17,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <string>
-#include "buffer.hpp"
-#include "engine.hpp"
+#include "runtime/gpu/buffer.hpp"
+#include "runtime/gpu/engine.hpp"
 #ifndef DIFF_DPAS_INTRINSIC_DECL
 #define DIFF_DPAS_INTRINSIC_DECL
 using diff_dpas_v8s = short __attribute__((ext_vector_type(8)));
@@ -205,7 +205,7 @@ inline Nvfp4GraphSession* nvfp4_active_session(const sycl::queue& q) {
 }
 // True iff a Nvfp4GraphSession is currently recording on `q`. Forward-declarable
 // (no Nvfp4GraphSession definition needed) so lightweight headers such as
-// utils/profile.hpp can call it without including nvfp4.hpp's DPAS intrinsics.
+// runtime/profiling/profile.hpp can call it without including nvfp4.hpp's DPAS intrinsics.
 // Used to skip queue waits during recording (q.wait()/stream.wait() throw on a
 // recording queue: "wait cannot be called for a queue which is recording to a
 // command graph").

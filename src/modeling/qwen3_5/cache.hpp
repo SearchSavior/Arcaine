@@ -3,8 +3,8 @@
 #include <vector>
 
 #include "config.hpp"
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/engine.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
 
 struct Qwen35KvLayerCache {
     GpuBuffer<bf16> key;

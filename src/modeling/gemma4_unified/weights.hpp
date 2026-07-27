@@ -1,7 +1,7 @@
 #pragma once
 #include <variant>
 #include <vector>
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 
 struct SlidingAttnWeights {
     GpuBuffer<bf16> q_proj;  // (4096, 3840)

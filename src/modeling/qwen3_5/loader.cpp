@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
-#include "../../common/gpu/engine.hpp"
+#include "../../runtime/gpu/engine.hpp"
 
 namespace {
 

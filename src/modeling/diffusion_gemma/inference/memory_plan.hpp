@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <string>
 #include <vector>
-#include "../../modeling/diffusion_gemma/config.hpp"
+#include "../config.hpp"
 
 // ---------------------------------------------------------------------------
 // Additive memory planner — a tensor-graph model of the diffusion forward pass.

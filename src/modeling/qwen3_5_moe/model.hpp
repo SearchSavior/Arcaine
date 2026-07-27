@@ -6,7 +6,7 @@
 #include "attention.hpp"
 #include "gated_deltanet.hpp"
 #include "../../common/model_interface.hpp"
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 
 // Qwen3.5-MoE (text-only) inference model. Subclass of the architecture-
 // independent `Model` interface; registered under config.json's model_type

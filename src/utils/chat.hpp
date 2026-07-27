@@ -1,6 +1,6 @@
 #pragma once
-#include "../common/preprocess/tokenizer.hpp"
-#include "../common/preprocess/chat_template.hpp"
+#include "../preprocessing/tokenizer.hpp"
+#include "../preprocessing/chat_template.hpp"
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>

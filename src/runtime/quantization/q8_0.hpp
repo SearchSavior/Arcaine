@@ -13,8 +13,8 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include "buffer.hpp"
-#include "engine.hpp"
+#include "runtime/gpu/buffer.hpp"
+#include "runtime/gpu/engine.hpp"
 
 #ifndef DIFF_DPAS_INTRINSIC_DECL
 #define DIFF_DPAS_INTRINSIC_DECL

@@ -1,5 +1,5 @@
 #pragma once
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 #include "weights.hpp"
 
 // FFN forward: out = (GELU(x @ gate.T) * (x @ up.T)) @ down.T

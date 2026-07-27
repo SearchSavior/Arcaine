@@ -33,10 +33,10 @@
 
 #include "modeling/diffusion_gemma/model.hpp"
 #include "utils/chat.hpp"
-#include "common/gpu/expert_parallel.hpp"
-#include "common/gpu/mem_planner.hpp"
-#include "common/gpu/placement.hpp"
-#include "common/gpu/device_select.hpp"
+#include "modeling/diffusion_gemma/inference/expert_execution.hpp"
+#include "modeling/diffusion_gemma/inference/memory_plan.hpp"
+#include "modeling/diffusion_gemma/inference/placement.hpp"
+#include "runtime/gpu/device_select.hpp"
 
 namespace {
 

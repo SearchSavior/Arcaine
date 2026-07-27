@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <sycl/sycl.hpp>
-#include "../../../common/gpu/buffer.hpp"
+#include "../../../runtime/gpu/buffer.hpp"
 
 // ---------------------------------------------------------------------------
 // F2 — triple pre-norm.  All three FFN inputs normalize the SAME hidden row,

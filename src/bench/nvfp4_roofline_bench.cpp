@@ -50,10 +50,10 @@
 #include <string>
 #include <vector>
 
-#include "common/gpu/buffer.hpp"
-#include "common/gpu/device_select.hpp"
-#include "common/gpu/engine.hpp"
-#include "common/gpu/nvfp4.hpp"
+#include "runtime/gpu/buffer.hpp"
+#include "runtime/gpu/device_select.hpp"
+#include "runtime/gpu/engine.hpp"
+#include "runtime/quantization/nvfp4.hpp"
 
 using arcaine::bench::parse_int_csv;
 using arcaine::bench::split_csv;

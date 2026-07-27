@@ -11,9 +11,9 @@
 #include "common/model_interface.hpp"
 #include "common/registry.hpp"
 #include "common/sampler.hpp"
-#include "common/preprocess/chat_template.hpp"
-#include "common/preprocess/image_proc.hpp"
-#include "common/preprocess/audio_proc.hpp"
+#include "preprocessing/chat_template.hpp"
+#include "preprocessing/image_processor.hpp"
+#include "preprocessing/audio_processor.hpp"
 
 static void print_usage(const char* prog) {
     std::fprintf(stderr,

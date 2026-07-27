@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sycl/sycl.hpp>
-#include "../../../common/gpu/buffer.hpp"
+#include "../../../runtime/gpu/buffer.hpp"
 
 inline bool diff_int4_env_enabled(const char* name) {
     const char* e = std::getenv(name);

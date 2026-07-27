@@ -17,7 +17,7 @@
 //
 
 #include <sycl/sycl.hpp>
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 #include <algorithm>
 #include <cmath>
 

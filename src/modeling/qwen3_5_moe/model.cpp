@@ -2,13 +2,13 @@
 #include "loader.hpp"
 #include "kernels.hpp"
 #include "moe.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/ops.hpp"
-#include "../../common/io/quant_loader.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/gpu/ops.hpp"
+#include "../../runtime/quantization/quant_loader.hpp"
 #include "../../common/kernels/embedding.hpp"
 #include "../../common/kernels/rms_norm.hpp"
 #include "../../common/kernels/elementwise.hpp"
-#include "../../common/preprocess/chat_template.hpp"
+#include "../../preprocessing/chat_template.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>

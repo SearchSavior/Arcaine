@@ -3,9 +3,9 @@
 #include <variant>
 #include <vector>
 
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/fp8.hpp"
-#include "../../common/gpu/nvfp4.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/quantization/fp8.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"
 
 struct Qwen35FullAttentionWeights {
     bool fused_projections = false;

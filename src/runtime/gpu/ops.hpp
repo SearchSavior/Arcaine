@@ -4,8 +4,8 @@
 #include <unordered_map>
 #include <tuple>
 #include <functional>
-#include "engine.hpp"
-#include "buffer.hpp"
+#include "runtime/gpu/engine.hpp"
+#include "runtime/gpu/buffer.hpp"
 
 // ---------------------------------------------------------------------------
 // Primitive caches — keyed by (gpu_index, shape) so each GPU gets its own

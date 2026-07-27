@@ -42,10 +42,10 @@
 #include <cstring>
 #include <vector>
 
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
-#include "../../common/gpu/ops.hpp"                // matmul_bf16
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/quantization/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
+#include "../../runtime/gpu/ops.hpp"                // matmul_bf16
 #include "../../common/kernels/elementwise.hpp"    // scale_inplace, add_inplace
 
 #include "config.hpp"

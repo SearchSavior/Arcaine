@@ -3,7 +3,7 @@
 #include <algorithm>
 
 #include "config.hpp"
-#include "../../common/gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 
 // Persistent per-device scratch. Buffers are role-based and reused across all
 // layers; no layer-forward path allocates device memory.

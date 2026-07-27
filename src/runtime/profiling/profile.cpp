@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-// Forward declaration only -- defined in common/gpu/nvfp4.hpp. Avoids pulling
+// Forward declaration only -- defined in runtime/quantization/nvfp4.hpp. Avoids pulling
 // the DPAS/SPIRV intrinsics into this lightweight header. A SYCL queue that is
 // recording a command_graph cannot be waited on (throws), so the profile timers
 // skip their q.wait() while a Nvfp4GraphSession is capturing a step.

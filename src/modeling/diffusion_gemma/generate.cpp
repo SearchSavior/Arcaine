@@ -1,8 +1,8 @@
 #include "model.hpp"
 #include "sampler.hpp"
 #include "device_sampler.hpp"
-#include "../../utils/profile.hpp"
-#include "../../common/gpu/engine.hpp"
+#include "../../runtime/profiling/profile.hpp"
+#include "../../runtime/gpu/engine.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -14,7 +14,7 @@
 std::vector<int> DiffusionGemmaModel::generate(
     const std::vector<int>& prompt_ids, int max_new_tokens, int max_denoising_steps,
     unsigned seed, bool verbose, const DiffStreamCallback& on_step,
-    bool ignore_eos)
+    bool ignore_eos, const std::atomic<bool>* cancel)
 {
     enc_kv_.reset();
     stats_ = DiffPerfStats{};
@@ -121,6 +121,7 @@ std::vector<int> DiffusionGemmaModel::generate(
             std::vector<char>  accepted_h;
 
             for (int step = N; step >= 1; --step) {
+                if (cancel && cancel->load(std::memory_order_acquire)) break;
                 float temp = diff_temperature(step, N, cfg_.gen.t_min, cfg_.gen.t_max);
                 bool want_soft_next = !(skip_last_soft_next && step == 1);
                 auto td0 = Clk::now();

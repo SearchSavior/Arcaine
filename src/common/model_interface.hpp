@@ -3,8 +3,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include "preprocess/image_proc.hpp"
-#include "preprocess/audio_proc.hpp"
+#include "preprocessing/image_processor.hpp"
+#include "preprocessing/audio_processor.hpp"
 
 // ---------------------------------------------------------------------------
 // Architecture-independent inference interface.

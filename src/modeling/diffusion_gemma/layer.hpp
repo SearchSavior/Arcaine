@@ -1,6 +1,6 @@
 #pragma once
-#include "../../common/gpu/buffer.hpp"
-#include "../../common/gpu/engine.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
 #include "../../common/kernels/rms_norm.hpp"
 #include "../../common/kernels/elementwise.hpp"
 #include "config.hpp"
@@ -8,7 +8,7 @@
 #include "kv_cache.hpp"
 #include "attention.hpp"
 #include "moe.hpp"
-#include "../../utils/profile.hpp"
+#include "../../runtime/profiling/profile.hpp"
 #include "arena.hpp"
 
 namespace diff_layer_detail {

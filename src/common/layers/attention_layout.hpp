@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../gpu/buffer.hpp"
-#include "../gpu/engine.hpp"
+#include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/engine.hpp"
 
 // Attention tensor layout helpers shared by multiple model families.
 // These stay narrowly focused on reshaping and scattering buffers.

@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "kernels.hpp"
-#include "../../common/gpu/engine.hpp"
-#include "../../common/gpu/ops.hpp"
+#include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/gpu/ops.hpp"
 #include "../../common/kernels/elementwise.hpp"
 
 namespace {

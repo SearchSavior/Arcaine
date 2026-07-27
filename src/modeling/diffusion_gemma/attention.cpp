@@ -1,5 +1,5 @@
 #include "attention.hpp"
-#include "../../common/gpu/ops.hpp"
+#include "../../runtime/gpu/ops.hpp"
 #include "../../common/kernels/attention_mask.hpp"
 #include "../../common/kernels/rms_norm.hpp"
 #include "../../common/kernels/rope.hpp"
@@ -7,7 +7,7 @@
 #include "../../common/layers/attention_layout.hpp"  // transpose_q_into, scatter_ctx
 #include "linear_dispatch.hpp"
 #include "arena.hpp"
-#include "../../utils/profile.hpp"
+#include "../../runtime/profiling/profile.hpp"
 #include <algorithm>
 #include <climits>
 #include <cstdlib>

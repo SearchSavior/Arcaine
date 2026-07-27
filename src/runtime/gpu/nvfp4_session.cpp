@@ -2,7 +2,7 @@
 //
 // This function is deliberately NON-inline and lives in its own TU so that
 // every binary that may call it links exactly one external definition:
-//   - utils/profile.cpp forward-declares it (avoids pulling nvfp4.hpp's DPAS
+//   - runtime/profiling/profile.cpp forward-declares it (avoids pulling nvfp4.hpp's DPAS
 //     intrinsics into the lightweight profile header) and references it from
 //     tic/toc/ScopedGpu to skip q.wait() while a command_graph is recording;
 //   - src/common/gpu/expert_parallel.cpp references it to make run_shard's
@@ -18,7 +18,7 @@
 // the nvfp4_session_registry helpers. It touches no DPAS intrinsics itself,
 // so it needs no -Xspirv-translator spirv-ext option of its own; the device
 // link of any target it joins already requires that option for other TUs.
-#include "nvfp4.hpp"
+#include "runtime/quantization/nvfp4.hpp"
 
 bool nvfp4_session_recording(const sycl::queue& q) {
     return nvfp4_active_session(q) != nullptr;

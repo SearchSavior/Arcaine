@@ -1,6 +1,6 @@
 #pragma once
 #include <sycl/sycl.hpp>
-#include "../gpu/buffer.hpp"
+#include "../../runtime/gpu/buffer.hpp"
 
 // Standard LayerNorm with learned weight and bias (vision pipeline only).
 // Normalizes over last dim D. x/out shape: (N, D).

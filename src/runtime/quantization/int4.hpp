@@ -21,8 +21,8 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include "buffer.hpp"
-#include "engine.hpp"
+#include "runtime/gpu/buffer.hpp"
+#include "runtime/gpu/engine.hpp"
 
 struct Int4Linear {
     int in_features = 0;

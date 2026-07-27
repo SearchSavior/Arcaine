@@ -27,7 +27,7 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
-#include "common/gpu/placement.hpp"
+#include "modeling/diffusion_gemma/inference/placement.hpp"
 #include "common/model_interface.hpp"
 #include "common/registry.hpp"
 #include "common/sampler.hpp"

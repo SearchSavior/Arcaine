@@ -1,13 +1,13 @@
 #include "moe.hpp"
-#include "../../common/gpu/ops.hpp"
+#include "../../runtime/gpu/ops.hpp"
 #include "../../common/kernels/rms_norm.hpp"
 #include "../../common/kernels/elementwise.hpp"
 #include "linear_dispatch.hpp"
 #include "fusions/prenorm.hpp"
 #include "fusions/postnorm.hpp"
 #include "fusions/int4_awq.hpp"
-#include "../../common/gpu/expert_parallel.hpp"
-#include "../../utils/profile.hpp"
+#include "inference/expert_execution.hpp"
+#include "../../runtime/profiling/profile.hpp"
 #include "arena.hpp"
 #include <vector>
 #include <algorithm>
