@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
-#include "../../common/generation.hpp"   // GenerationConfig
+#include "generation.hpp"   // GenerationConfig
 
 struct RopeConfig {
     std::string rope_type;

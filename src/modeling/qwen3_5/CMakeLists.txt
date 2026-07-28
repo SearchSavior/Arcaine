@@ -6,7 +6,6 @@ add_library(arcaine_model_qwen3_5 STATIC
     loader.cpp
     vision.cpp
     model.cpp
-    register.cpp
     registration.cpp
     service.cpp
     session.cpp
@@ -27,4 +26,10 @@ target_link_libraries(arcaine_model_qwen3_5 PUBLIC
     DNNL::dnnl arcaine_contracts arcaine_preprocessing)
 arcaine_add_model(NAME qwen3_5
     TARGET arcaine_model_qwen3_5
-    REGISTRATION_DEFINE ARCAINE_MODEL_QWEN3_5)
+    REGISTRATION_DEFINE ARCAINE_MODEL_QWEN3_5
+    MODEL_BENCH_SOURCES
+        benchmarks/model_bench.cpp
+    KERNEL_BENCH_SOURCES
+        benchmarks/attention_bench.cpp
+        benchmarks/deltanet_bench.cpp
+        benchmarks/delta_decode_fusion_bench.cpp)

@@ -53,7 +53,8 @@ struct GenerationRequest {
 
     // Diffusion-specific request options. Ignored by causal models.
     int  denoising_steps  = -1;   // -1 = use model default
-    bool draft_streaming  = false;
+    // (Draft streaming is governed by StreamOptions::stream_drafts — the single
+    // authoritative field, set by the transport from `arcaine_stream_drafts`.)
 
     // Set by the transport when the client disconnects / SSE sink fails /
     // request is cancelled. The model session checks it at model-owned

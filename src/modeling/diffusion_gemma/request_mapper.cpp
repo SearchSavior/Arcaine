@@ -14,7 +14,7 @@ DiffusionGemmaInvocation map_request(
     inv.output_length    = req.max_output_tokens > 0 ? req.max_output_tokens : 256;
     inv.denoising_steps  = req.denoising_steps;  // -1 = model default (resolved at generate)
     inv.seed             = req.seed;
-    inv.stream_drafts    = req.draft_streaming;
+    inv.stream_drafts    = req.stream.stream_drafts;
     inv.has_tools        = !req.tools.empty();
     inv.stream           = req.stream.enabled;
     inv.include_usage    = req.stream.include_usage;

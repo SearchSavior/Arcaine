@@ -33,4 +33,8 @@ target_link_libraries(arcaine_model_diffusion_gemma PUBLIC
     DNNL::dnnl arcaine_contracts arcaine_preprocessing)
 arcaine_add_model(NAME diffusion_gemma
     TARGET arcaine_model_diffusion_gemma
-    REGISTRATION_DEFINE ARCAINE_MODEL_DIFFUSION_GEMMA)
+    REGISTRATION_DEFINE ARCAINE_MODEL_DIFFUSION_GEMMA
+    MODEL_BENCH_SOURCES
+        benchmarks/model_bench.cpp
+    KERNEL_BENCH_SOURCES
+        benchmarks/int4_fusion_bench.cpp)

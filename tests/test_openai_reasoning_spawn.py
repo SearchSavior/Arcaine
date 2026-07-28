@@ -17,7 +17,7 @@ DEFAULT_MODEL = "diffusiongemma-26B-A4B-it-NVFP4"
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ARCAINE_TEST_SPAWN_SERVER") != "1",
-    reason="set ARCAINE_TEST_SPAWN_SERVER=1 to launch diffusion_server",
+    reason="set ARCAINE_TEST_SPAWN_SERVER=1 to launch arcaine_server",
 )
 
 
@@ -48,7 +48,7 @@ def wait_for_server(client: OpenAI, model: str, proc: subprocess.Popen, log_path
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise AssertionError(
-                f"diffusion_server exited early with code {proc.returncode}\n\n{tail(log_path)}"
+                f"arcaine_server exited early with code {proc.returncode}\n\n{tail(log_path)}"
             )
         try:
             models = client.models.list()
@@ -58,20 +58,20 @@ def wait_for_server(client: OpenAI, model: str, proc: subprocess.Popen, log_path
             last_error = exc
         time.sleep(1.0)
     raise AssertionError(
-        f"diffusion_server did not become ready; last_error={last_error!r}\n\n{tail(log_path)}"
+        f"arcaine_server did not become ready; last_error={last_error!r}\n\n{tail(log_path)}"
     )
 
 
 @pytest.fixture(scope="session")
 def spawned_server(tmp_path_factory: pytest.TempPathFactory) -> SpawnedServer:
-    binary = Path(os.environ.get("ARCAINE_TEST_SERVER_BINARY", REPO_ROOT / "build/diffusion_server"))
+    binary = Path(os.environ.get("ARCAINE_TEST_SERVER_BINARY", REPO_ROOT / "build/arcaine_server"))
     model_dir = Path(os.environ.get("ARCAINE_TEST_MODEL_DIR", REPO_ROOT / "models" / DEFAULT_MODEL))
     model_name = os.environ.get("ARCAINE_TEST_MODEL", model_dir.name)
     api_key = os.environ.get("ARCAINE_TEST_API_KEY", "local")
     host = "127.0.0.1"
     port = int(os.environ.get("ARCAINE_TEST_SERVER_PORT", free_port()))
     base_url = f"http://{host}:{port}/v1"
-    log_path = tmp_path_factory.mktemp("arcaine_server") / "diffusion_server.log"
+    log_path = tmp_path_factory.mktemp("arcaine_server") / "arcaine_server.log"
 
     chat_template_kwargs = os.environ.get(
         "ARCAINE_TEST_CHAT_TEMPLATE_KWARGS",

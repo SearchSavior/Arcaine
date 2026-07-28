@@ -1,8 +1,8 @@
 #pragma once
 #include "../../runtime/gpu/buffer.hpp"
 #include "../../runtime/gpu/engine.hpp"
-#include "../../common/kernels/rms_norm.hpp"
-#include "../../common/kernels/elementwise.hpp"
+#include "kernels/rms_norm.hpp"
+#include "kernels/elementwise.hpp"
 #include "config.hpp"
 #include "weights.hpp"
 #include "kv_cache.hpp"

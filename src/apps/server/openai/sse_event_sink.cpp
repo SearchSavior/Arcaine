@@ -127,6 +127,8 @@ bool SseEventSink::emit(const arcaine::inference::GenerationEvent& ev) {
 }
 
 bool SseEventSink::write_done() {
+    if (wrote_done_) return true;            // idempotent: [DONE] is terminal
+    wrote_done_ = true;
     static const char done[] = "data: [DONE]\n\n";
     return write_raw(done, sizeof(done) - 1);
 }

@@ -9,7 +9,6 @@ add_library(arcaine_model_gemma4_unified STATIC
     vision_embedder.cpp
     audio_embedder.cpp
     model.cpp
-    register.cpp
     registration.cpp
     service.cpp
     session.cpp
@@ -33,4 +32,6 @@ target_link_libraries(arcaine_model_gemma4_unified PUBLIC
     DNNL::dnnl arcaine_contracts arcaine_preprocessing)
 arcaine_add_model(NAME gemma4_unified
     TARGET arcaine_model_gemma4_unified
-    REGISTRATION_DEFINE ARCAINE_MODEL_GEMMA4_UNIFIED)
+    REGISTRATION_DEFINE ARCAINE_MODEL_GEMMA4_UNIFIED
+    MODEL_BENCH_SOURCES
+        benchmarks/model_bench.cpp)

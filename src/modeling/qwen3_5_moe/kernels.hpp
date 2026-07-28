@@ -3,7 +3,7 @@
 // Qwen3.5-MoE small elementwise kernels + Qwen HF-convention RoPE.
 //
 // All ops are BF16 in/out (compute in FP32, cast at the end), header-only and
-// `inline` to match src/common/kernels/{elementwise,rms_norm,rope}.hpp. Math is
+// `inline` to match the per-model kernels/ headers (elementwise/rms_norm/rope). Math is
 // transcribed from reference/transformers/.../modeling_qwen3_5_moe.py (line refs
 // below). Runtime numerical validation is deferred to Phase 6.
 //

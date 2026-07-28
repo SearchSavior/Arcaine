@@ -43,6 +43,7 @@ private:
     arcaine::inference::GenerationMetrics          metrics_;
     bool                                            have_metrics_ = false;
     bool                                            saw_role_     = false;
+    bool                                            wrote_done_   = false;  // [DONE] is terminal + idempotent
 };
 
 }  // namespace arcaine::server

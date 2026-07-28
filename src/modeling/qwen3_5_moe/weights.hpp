@@ -6,7 +6,7 @@
 #include "../../runtime/quantization/nvfp4.hpp"
 
 // Qwen3.5-MoE device weights. NVFP4 projections are stored as Nvfp4Linear
-// (identical scheme to diffusion_gemma: weight_packed U8, weight_scale F8_E4M3
+// (identical scheme to the block-diffusion MoE: weight_packed U8, weight_scale F8_E4M3
 // transposed to [K/16, N], dst_scale = input_global * weight_global). The
 // unquantized BF16 params of Gated DeltaNet (in_proj_*, conv1d, A_log, dt_bias,
 // norm) and the MoE router / shared_expert_gate stay as GpuBuffer<bf16>.

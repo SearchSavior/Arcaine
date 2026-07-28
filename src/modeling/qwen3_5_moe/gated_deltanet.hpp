@@ -46,7 +46,7 @@
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
 #include "../../runtime/gpu/ops.hpp"                // matmul_bf16
-#include "../../common/kernels/elementwise.hpp"    // scale_inplace, add_inplace
+#include "kernels/elementwise.hpp"    // scale_inplace, add_inplace
 
 #include "config.hpp"
 #include "weights.hpp"   // QwenLinearAttn

@@ -1,10 +1,10 @@
 #include "attention.hpp"
-#include "../../common/kernels/rms_norm.hpp"
-#include "../../common/kernels/rope.hpp"
-#include "../../common/kernels/elementwise.hpp"
+#include "kernels/rms_norm.hpp"
+#include "kernels/rope.hpp"
+#include "kernels/elementwise.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/gpu/ops.hpp"
-#include "../../common/layers/attention_batched.hpp"   // batched_attention, scores conversions, ...
+#include "kernels/attention_batched.hpp"   // batched_attention, scores conversions, ...
 #include <cmath>
 #include <climits>
 #include <optional>

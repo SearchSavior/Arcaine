@@ -67,6 +67,7 @@ enable_testing()
 add_subdirectory(src/inference)
 add_subdirectory(src/preprocessing)   # tokenizer/chat-template/media/quant loader (no model logic)
 add_subdirectory(src/modeling)        # adds only enabled model subdirs; sets ARCAINE_*_MODEL_LIBS
+add_subdirectory(src/benchmarks)      # central bench registry + model-bench registry (header-only)
 add_subdirectory(tests)
 
 # ---------------------------------------------------------------------------
@@ -74,14 +75,9 @@ add_subdirectory(tests)
 # media, quant loader) and the inference contracts live in the
 # arcaine_preprocessing / arcaine_contracts libraries linked below; model
 # implementations live in per-model static libraries under src/modeling/<m>/,
-# linked via ARCAINE_*_MODEL_LIBS.
-#
-# AR apps still drive the legacy ModelRegistry (common/registry.cpp +
-# register_builtins.cpp) until the Phase 7 server cutover.
-set(ARCAINE_COMMON_SRCS
-    src/register_builtins.cpp
-    src/common/registry.cpp
-)
+# linked via ARCAINE_*_MODEL_LIBS. Every model owns its complete inference path;
+# no app links the legacy Model interface (removed) — only ModelService /
+# InferenceSession / ModelRegistry (arcaine_contracts) and the model libs.
 
 set(ARCAINE_SYCL_LIB_FLAGS
     -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
@@ -90,6 +86,8 @@ set(ARCAINE_SYCL_LINK_FLAGS
     -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
 # ---------------------------------------------------------------------------
+# Standalone auxiliary tool used by the hardware skill. Output location and
+# emission are fixed; do not gate, rename, or move this target.
 add_executable(get_device_props src/utils/gpu_check.cpp)
 target_compile_options(get_device_props PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(get_device_props PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
@@ -98,52 +96,40 @@ set_target_properties(get_device_props PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/.agents/skills/check-available-hardware")
 
 # ---------------------------------------------------------------------------
-# CLI (AR frontends, model-agnostic via the legacy ModelRegistry).
-add_executable(gemma4 src/main.cpp ${ARCAINE_COMMON_SRCS})
-target_compile_options(gemma4 PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
-target_link_options(gemma4 PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
-target_link_libraries(gemma4 PRIVATE
-    arcaine_preprocessing ${ARCAINE_AR_MODEL_LIBS} DNNL::dnnl soxr onnxruntime)
-set_target_properties(gemma4 PROPERTIES
-    BUILD_RPATH "${ORT_DIR}/lib"
-    INSTALL_RPATH "${ORT_DIR}/lib")
-
-# ---------------------------------------------------------------------------
-# --chat-template-kwargs parsing + chat-template merge. SYCL-free logic, but
-# every target must pass -fsycl under the global sycl-targets flag. Pass a
-# model dir as argv[1] to exercise the render-merge assertions.
-add_executable(test_chat_template_kwargs
-    src/utils/test_chat_template_kwargs.cpp)
-target_compile_options(test_chat_template_kwargs PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
-target_link_options(test_chat_template_kwargs PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
-target_link_libraries(test_chat_template_kwargs PRIVATE arcaine_preprocessing DNNL::dnnl)
-
-# ---------------------------------------------------------------------------
-# Inference benchmark. Goes through the legacy ModelRegistry, so it links the
-# same AR model libs + common infra as the CLI.
-add_executable(arcaine_mbench src/arcaine_mbench.cpp ${ARCAINE_COMMON_SRCS})
+# Model inference benchmark (llama-bench style). Each model owns its benchmark
+# under src/modeling/<m>/benchmarks/model_bench.cpp (collected via arcaine_add_model's
+# MODEL_BENCH_SOURCES into ARCAINE_MODEL_BENCH_SRCS). The dispatcher resolves
+# config.json::model_type and forwards argv to the model-owned bench, which drives
+# its concrete engine (forward/reset_cache/generate) directly.
+#   ./build/arcaine_mbench --list
+#   ./build/arcaine_mbench --model <dir> [-p 512,1024,2048,4096 -n 128 -d 0,512,1024,2048 ...]
+get_property(ARCAINE_MODEL_BENCH_SRCS GLOBAL PROPERTY ARCAINE_MODEL_BENCH_SRCS)
+if(ARCAINE_MODEL_LIBS)
+add_executable(arcaine_mbench src/apps/model_bench/main.cpp ${ARCAINE_MODEL_BENCH_SRCS})
 target_compile_options(arcaine_mbench PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
 target_link_options(arcaine_mbench PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
 target_link_libraries(arcaine_mbench PRIVATE
-    arcaine_preprocessing ${ARCAINE_AR_MODEL_LIBS} DNNL::dnnl soxr onnxruntime)
+    arcaine_contracts arcaine_preprocessing arcaine_benchmarks
+    ${ARCAINE_MODEL_LIBS} DNNL::dnnl soxr onnxruntime)
 set_target_properties(arcaine_mbench PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
     INSTALL_RPATH "${ORT_DIR}/lib")
+endif()
 
 # ---------------------------------------------------------------------------
-# DiffusionGemma driver + throughput bench. Gated on diffusion_gemma being
-# enabled (the diffusion lib is self-contained for its GPU helpers).
+# DiffusionGemma developer driver (visualization + interactive tooling).
+# Direct DiffusionGemmaModel construction (NOT ModelService — the viz/--chat/
+# --stream/--dry-run-placement surface is model-internal dev tooling with no
+# server/mbench equivalent). viz.* lives inside the diffusion module. Gated on
+# diffusion_gemma being enabled.
+#   ./build/diffusion_gemma_dev --model <dir> (--prompt <text> | --chat) [--viz ... --steps ...]
 if(ARCAINE_DIFFUSION_MODEL_LIB)
-add_executable(diffusion_gemma src/diffusion_main.cpp src/utils/viz.cpp)
-target_compile_options(diffusion_gemma PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
-target_link_options(diffusion_gemma PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
-target_link_libraries(diffusion_gemma PRIVATE
-    arcaine_preprocessing ${ARCAINE_DIFFUSION_MODEL_LIB} DNNL::dnnl)
-
-add_executable(diffusion_bench src/diffusion_bench.cpp)
-target_compile_options(diffusion_bench PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
-target_link_options(diffusion_bench PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
-target_link_libraries(diffusion_bench PRIVATE
+add_executable(diffusion_gemma_dev
+    src/apps/diffusion/main.cpp
+    src/modeling/diffusion_gemma/viz.cpp)
+target_compile_options(diffusion_gemma_dev PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(diffusion_gemma_dev PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(diffusion_gemma_dev PRIVATE
     arcaine_preprocessing ${ARCAINE_DIFFUSION_MODEL_LIB} DNNL::dnnl)
 endif()
 
@@ -174,20 +160,20 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Unified kernel benchmark. Each kernel bench registers itself via
-# REGISTER_BENCH() in its TU; a new kernel bench is added by dropping a .cpp
-# into src/bench/ and appending it to KBENCH_SRCS. Each bench keeps its own
+# REGISTER_BENCH() in its TU and lives beside its model under
+# src/modeling/<m>/benchmarks/ (collected via arcaine_add_model's
+# KERNEL_BENCH_SOURCES into ARCAINE_KERNEL_BENCH_SRCS). The central roofline
+# bench is not model-owned and is appended here. Each bench keeps its own
 # env-var AB gating.
 #   ./build/arcaine_kbench --list
 #   ./build/arcaine_kbench <name> [opts]
-set(KBENCH_SRCS
-    src/arcaine_kbench.cpp
-    src/bench/qwen35_nvfp4_mlp_bench.cpp
-    src/bench/qwen35_attention_bench.cpp
-    src/bench/qwen35_deltanet_bench.cpp
-    src/bench/qwen35_delta_decode_fusion_bench.cpp
-    src/bench/nvfp4_roofline_bench.cpp
-    src/bench/diffusion_int4_fusion_bench.cpp)
-add_executable(arcaine_kbench ${KBENCH_SRCS})
+get_property(ARCAINE_KERNEL_BENCH_SRCS GLOBAL PROPERTY ARCAINE_KERNEL_BENCH_SRCS)
+# Central (not model-owned) kernel bench.
+list(APPEND ARCAINE_KERNEL_BENCH_SRCS
+    ${CMAKE_SOURCE_DIR}/src/benchmarks/nvfp4_roofline_bench.cpp)
+if(ARCAINE_KERNEL_BENCH_SRCS)
+add_executable(arcaine_kbench src/apps/kernel_bench/main.cpp ${ARCAINE_KERNEL_BENCH_SRCS})
 target_compile_options(arcaine_kbench PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
 target_link_options(arcaine_kbench PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
-target_link_libraries(arcaine_kbench PRIVATE arcaine_preprocessing DNNL::dnnl)
+target_link_libraries(arcaine_kbench PRIVATE arcaine_preprocessing arcaine_benchmarks DNNL::dnnl)
+endif()

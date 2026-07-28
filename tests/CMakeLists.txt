@@ -18,6 +18,16 @@ foreach(test ${ARCAINE_TESTS})
     add_test(NAME ${test} COMMAND ${target})
 endforeach()
 
+# Chat-template-kwargs parsing + chat-template render/merge assertions. Pure
+# C++ (no SYCL); pass a model dir as argv[1] to exercise the render-merge. Runs
+# against the bundled arcaine_preprocessing (tokenizer + chat template).
+add_executable(arcaine_test_chat_template_kwargs
+    ${CMAKE_CURRENT_SOURCE_DIR}/contracts/test_chat_template_kwargs.cpp)
+target_link_libraries(arcaine_test_chat_template_kwargs PRIVATE
+    arcaine_preprocessing DNNL::dnnl)
+add_test(NAME contracts/chat_template_kwargs
+         COMMAND arcaine_test_chat_template_kwargs)
+
 # Pure-C++ output-parser unit tests (no GPU, no model load). Each links only
 # the owning model target (which pulls in arcaine_contracts/preprocessing).
 if(TARGET arcaine_model_qwen3_5)

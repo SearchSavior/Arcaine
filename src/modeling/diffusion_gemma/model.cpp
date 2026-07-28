@@ -7,7 +7,7 @@
 #include "fusions/int4_awq.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"
-#include "../../common/kernels/embedding.hpp"
+#include "kernels/embedding.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

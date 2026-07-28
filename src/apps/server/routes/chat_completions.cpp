@@ -59,20 +59,30 @@ void handle_chat_completions(const httplib::Request& req, httplib::Response& res
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [gen, created, session, cancel]
+                [gen, created, session, cancel, &mu = app.generate_mu]
                 (size_t, httplib::DataSink& sink) -> bool {
                     SseEventSink sse(sink, gen.request_id, created,
                                      gen.served_model_name, gen.stream.include_usage,
                                      cancel.get());
+                    // Hold the single-generation mutex for the whole generate()
+                    // call. The handler's lock_guard released when this provider
+                    // was *registered* (set_chunked_content_provider returns
+                    // immediately); the actual generation runs here, in the
+                    // provider, so the mutex must be taken here to serialize
+                    // concurrent streaming generations.
+                    std::lock_guard<std::mutex> gen_lock(mu);
                     try {
                         session->generate(gen, sse);
                     } catch (const std::exception& e) {
                         json err = error_body(e.what(), "server_error", "internal_error");
                         sse.write_sse(err, "error");
                         sse.write_done();
+                        sink.done();   // terminate the httplib chunked-provider loop
                         return false;
                     }
-                    return sse.write_done();
+                    bool ok = sse.write_done();
+                    sink.done();       // signal completion; otherwise httplib re-invokes the provider
+                    return ok;
                 });
         } else {
             CollectingGenerationSink sink;

@@ -5,9 +5,9 @@
 #include <stdexcept>
 #include <sycl/ext/intel/esimd.hpp>
 
-#include "../../runtime/gpu/buffer.hpp"
-#include "../../runtime/quantization/nvfp4.hpp"
-#include "../qwen3_5_moe/kernels.hpp"
+#include "runtime/gpu/buffer.hpp"
+#include "runtime/quantization/nvfp4.hpp"
+#include "kernels/qwen_kernels.hpp"
 
 inline void qwen35_add_bias(sycl::queue& queue, bf16* x, const bf16* bias,
                             int rows, int cols) {

@@ -3,7 +3,7 @@
 #include "../arena.hpp"
 #include "../fusions/int4_awq.hpp"
 #include "../../../runtime/gpu/ops.hpp"
-#include "../../../common/kernels/elementwise.hpp"
+#include "../kernels/elementwise.hpp"
 #include "../../../runtime/profiling/profile.hpp"
 #include <algorithm>
 #include <cstdlib>

@@ -99,7 +99,7 @@ def parser_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
     harness.write_text(
         textwrap.dedent(
             r'''
-            #include "utils/gemma4_tool_call_parser.hpp"
+            #include "modeling/gemma4_unified/output_parser.hpp"
             #include <nlohmann/json.hpp>
             #include <iostream>
             #include <iterator>
@@ -108,7 +108,7 @@ def parser_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
             int main() {
                 std::string input((std::istreambuf_iterator<char>(std::cin)),
                                   std::istreambuf_iterator<char>());
-                ParsedAssistantOutput parsed = parse_assistant_output(input);
+                auto parsed = arcaine::gemma4_unified::parse_assistant_output(input);
                 nlohmann::ordered_json out;
                 out["content"] = parsed.content;
                 out["tool_calls"] = nlohmann::ordered_json::array();
@@ -130,16 +130,15 @@ def parser_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "g++",
             "-std=c++17",
             str(harness),
-            str(REPO_ROOT / "src/utils/gemma4_tool_call_parser.cpp"),
-            str(REPO_ROOT / "src/common/preprocess/tokenizer.cpp"),
+            str(REPO_ROOT / "src/modeling/gemma4_unified/output_parser.cpp"),
+            str(REPO_ROOT / "src/preprocessing/tokenizer.cpp"),
             # tokenizer.cpp depends on the ported llama.cpp unicode helpers
             # (unicode_len_utf8, unicode_utf8_to_byte, unicode_cpts_from_utf8,
             # unicode_regex_split_custom_qwen2, unicode_cpt_to_utf8,
             # unicode_byte_to_utf8). These are the same UNICODE_SRCS linked
-            # into every CMake target that compiles tokenizer.cpp — see
-            # CMakeLists.txt:50-53.
+            # into every CMake target that compiles tokenizer.cpp.
             str(REPO_ROOT / "src/preprocessing/unicode.cpp"),
-            str(REPO_ROOT / "src/common/preprocess/unicode-data.cpp"),
+            str(REPO_ROOT / "src/preprocessing/unicode-data.cpp"),
             "-I",
             str(REPO_ROOT / "src"),
             "-I",

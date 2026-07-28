@@ -14,8 +14,8 @@
 #include "../../runtime/quantization/fp8.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"
 #include "../../runtime/gpu/ops.hpp"
-#include "../../common/kernels/elementwise.hpp"
-#include "../../common/kernels/rms_norm.hpp"
+#include "kernels/elementwise.hpp"
+#include "kernels/rms_norm.hpp"
 
 inline bool qwen35_nvfp4_dpas_enabled() {
     static bool enabled = [] {

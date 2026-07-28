@@ -5,9 +5,9 @@
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/gpu/ops.hpp"
 #include "../../runtime/quantization/quant_loader.hpp"
-#include "../../common/kernels/embedding.hpp"
-#include "../../common/kernels/rms_norm.hpp"
-#include "../../common/kernels/elementwise.hpp"
+#include "kernels/embedding.hpp"
+#include "kernels/rms_norm.hpp"
+#include "kernels/elementwise.hpp"
 #include "../../preprocessing/chat_template.hpp"
 #include <cstdio>
 #include <cstdlib>

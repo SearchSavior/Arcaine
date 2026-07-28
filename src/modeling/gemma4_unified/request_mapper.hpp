@@ -5,7 +5,7 @@
 
 class Gemma4Model;      // global (modeling/gemma4_unified/model.hpp)
 class TokenizerBridge;  // global (utils/chat.hpp)
-struct ModelInfo;       // global (common/model_interface.hpp)
+struct ModelInfo;       // global (modeling/gemma4_unified/model.hpp)
 
 namespace arcaine::gemma4_unified {
 

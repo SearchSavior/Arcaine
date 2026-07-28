@@ -1,10 +1,10 @@
 #include "attention.hpp"
 #include "../../runtime/gpu/ops.hpp"
-#include "../../common/kernels/attention_mask.hpp"
-#include "../../common/kernels/rms_norm.hpp"
-#include "../../common/kernels/rope.hpp"
+#include "kernels/attention_mask.hpp"
+#include "kernels/rms_norm.hpp"
+#include "kernels/rope.hpp"
 #include "attention_kernels.hpp"  // fused norm+rope / softmax leaf kernels + AB knobs
-#include "../../common/layers/attention_layout.hpp"  // transpose_q_into, scatter_ctx
+#include "kernels/attention_layout.hpp"  // transpose_q_into, scatter_ctx
 #include "linear_dispatch.hpp"
 #include "arena.hpp"
 #include "../../runtime/profiling/profile.hpp"

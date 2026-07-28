@@ -7,7 +7,6 @@
 add_library(arcaine_model_qwen3_5_moe STATIC
     loader.cpp
     model.cpp
-    register.cpp
     registration.cpp
     service.cpp
     session.cpp
@@ -28,4 +27,8 @@ target_link_libraries(arcaine_model_qwen3_5_moe PUBLIC
     DNNL::dnnl arcaine_contracts arcaine_preprocessing)
 arcaine_add_model(NAME qwen3_5_moe
     TARGET arcaine_model_qwen3_5_moe
-    REGISTRATION_DEFINE ARCAINE_MODEL_QWEN3_5_MOE)
+    REGISTRATION_DEFINE ARCAINE_MODEL_QWEN3_5_MOE
+    MODEL_BENCH_SOURCES
+        benchmarks/model_bench.cpp
+    KERNEL_BENCH_SOURCES
+        benchmarks/nvfp4_mlp_bench.cpp)

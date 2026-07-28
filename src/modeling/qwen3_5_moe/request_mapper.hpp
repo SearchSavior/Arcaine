@@ -5,7 +5,7 @@
 
 class QwenModel;      // global (modeling/qwen3_5_moe/model.hpp)
 class TokenizerBridge;  // global (utils/chat.hpp)
-struct ModelInfo;       // global (common/model_interface.hpp)
+struct ModelInfo;       // global (modeling/qwen3_5_moe/model.hpp)
 
 namespace arcaine::qwen3_5_moe {
 

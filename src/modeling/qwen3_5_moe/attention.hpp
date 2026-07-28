@@ -16,7 +16,7 @@
 //   attn_output *= sigmoid(gate)  (elementwise per (s, h, j))   [line 717]
 //   o_proj: nq*head_dim (4096) -> H (2048).
 //
-// All NVFP4 projections reuse the diffusion_gemma matmul_nvfp4 path; the only
+// All NVFP4 projections reuse the shared NVFP4 matmul path (runtime/quantization); the only
 // Qwen-specific device kernels are split_q_gate (deinterleave) plus the
 // kernels.hpp helpers (apply_qwen_rope, mul_sigmoid_inplace). Numerical
 // validation vs the HF reference is Phase 6 (deferred).
@@ -30,8 +30,8 @@
 #include "../../runtime/gpu/buffer.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
-#include "../../common/kernels/rms_norm.hpp"       // rms_norm (plain w*x; +1 baked)
-#include "../../common/layers/attention_batched.hpp" // batched_attention (GQA)
+#include "kernels/rms_norm.hpp"       // rms_norm (plain w*x; +1 baked)
+#include "kernels/attention_batched.hpp" // batched_attention (GQA)
 
 #include "config.hpp"
 #include "weights.hpp"   // QwenFullAttn

@@ -7,7 +7,7 @@
 //   1. Router:  scores = hidden @ router_gate.T            -> [S, 256]
 //               probs  = softmax(scores, fp32)             -> [S, 256]
 //               top8   = topk(probs); renorm /= sum(top8)   -> idx[S,8], wgt[S,8]
-//               (NO per-expert scale — unlike diffusion_gemma.)
+//               (NO per-expert scale — unlike the block-diffusion MoE.)
 //   2. Routed experts (expert-major, reference lines 752-776):
 //               for each active expert e: gather its tokens,
 //                 h_e = silu(gate_up_e[:inter]) * gate_up_e[inter:]   (SwiGLU)
@@ -44,7 +44,7 @@
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
 #include "../../runtime/gpu/ops.hpp"                // matmul_bf16
-#include "../../common/kernels/elementwise.hpp"    // add_inplace
+#include "kernels/elementwise.hpp"    // add_inplace
 
 #include "config.hpp"
 #include "weights.hpp"   // QwenMoE
