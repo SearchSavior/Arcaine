@@ -86,6 +86,29 @@ static bool g_trace = std::getenv("DIFF_LOAD_TRACE") != nullptr ||
 // buffer: the CPU memcpy fault path gets kernel readahead (GB/s) and the
 // device copy from malloc'd memory runs at full PCIe speed.
 // ---------------------------------------------------------------------------
+static float f16_bits_to_float(uint16_t h) {
+    uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x03ffu;
+    uint32_t out;
+    if (exp == 0) {
+        if (mant == 0) out = sign;
+        else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) { mant <<= 1; --exp; }
+            mant &= 0x03ffu;
+            out = sign | ((exp + 112u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (mant << 13);
+    } else {
+        out = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
 GpuBuffer<bf16> upload(const TensorView& tv, sycl::queue& q, const char* name) {
     size_t n = tv.numel();
     if (g_trace) std::fprintf(stderr, "[trace] alloc+upload %s (%.1f MB)\n",
@@ -99,29 +122,8 @@ GpuBuffer<bf16> upload(const TensorView& tv, sycl::queue& q, const char* name) {
         for (size_t i = 0; i < n; ++i) staging[i] = float_to_bf16(src[i]);
     } else if (tv.dtype == "F16") {
         const uint16_t* src = static_cast<const uint16_t*>(tv.data);
-        for (size_t i = 0; i < n; ++i) {
-            uint16_t h = src[i];
-            uint32_t sign = (h & 0x8000u) << 16;
-            uint32_t exp = (h >> 10) & 0x1fu;
-            uint32_t mant = h & 0x03ffu;
-            uint32_t out;
-            if (exp == 0) {
-                if (mant == 0) out = sign;
-                else {
-                    exp = 1;
-                    while ((mant & 0x0400u) == 0) { mant <<= 1; --exp; }
-                    mant &= 0x03ffu;
-                    out = sign | ((exp + 112u) << 23) | (mant << 13);
-                }
-            } else if (exp == 31) {
-                out = sign | 0x7f800000u | (mant << 13);
-            } else {
-                out = sign | ((exp + 112u) << 23) | (mant << 13);
-            }
-            float f;
-            std::memcpy(&f, &out, sizeof(f));
-            staging[i] = float_to_bf16(f);
-        }
+        for (size_t i = 0; i < n; ++i)
+            staging[i] = float_to_bf16(f16_bits_to_float(src[i]));
     } else {
         throw std::runtime_error(std::string("Expected BF16/F16/F32 for ") + name + ", got " + tv.dtype);
     }
@@ -145,8 +147,12 @@ GpuBuffer<bf16> upload_plus_one(const TensorView& tv, sycl::queue& q, const char
         const float* src = static_cast<const float*>(tv.data);
         for (size_t i = 0; i < n; ++i)
             staging[i] = float_to_bf16(src[i] + 1.0f);
+    } else if (tv.dtype == "F16") {
+        const uint16_t* src = static_cast<const uint16_t*>(tv.data);
+        for (size_t i = 0; i < n; ++i)
+            staging[i] = float_to_bf16(f16_bits_to_float(src[i]) + 1.0f);
     } else {
-        throw std::runtime_error(std::string("Expected BF16/F32 for +1 norm ") + name + ", got " + tv.dtype);
+        throw std::runtime_error(std::string("Expected BF16/F16/F32 for +1 norm ") + name + ", got " + tv.dtype);
     }
     GpuBuffer<bf16> buf(n, q);
     buf.upload(staging.data(), n);

@@ -153,3 +153,5 @@ static int run(int argc, char* argv[]) {
 }
 
 REGISTER_MODEL_BENCH("qwen3_5_moe_text", "Qwen3.5-MoE NVFP4 AR (PP/TG KV-depth throughput)", run)
+static ::arcaine::bench::ModelBenchRegistrar arcaine_model_bench_registrar_wrapped(
+    "qwen3_5_moe", "Qwen3.5-MoE (wrapped VLM config, text-only) AR (PP/TG KV-depth throughput)", run);

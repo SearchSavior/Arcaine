@@ -28,9 +28,8 @@
 // qwen_routed_experts_forward behind an env var (AB test); the swap point is the
 // single function below.
 //
-// NVFP4 expert projections reuse matmul_nvfp4 (handles its own input packing).
-// All routed+shared expert weights are NVFP4; router_gate and shared_expert_gate
-// are BF16. Numerical validation vs HF is Phase 6 (deferred).
+// Expert projections dispatch through qwen_matmul_proj (NVFP4 / AWQ INT4 / dense).
+// router_gate and shared_expert_gate are BF16.
 //
 
 #include <algorithm>
@@ -93,13 +92,13 @@ inline void qwen_routed_experts_forward(
 
         // gate_up: [M, 2*inter]  (gate in [0,inter), up in [inter,2*inter))
         GpuBuffer<bf16> d_gu((size_t)M * 2 * inter, q);
-        matmul_nvfp4(d_sub.data(), M, H, w.experts_gate_up[e], d_gu.data(), ctx);
+        qwen_matmul_proj(d_sub.data(), M, H, w.experts_gate_up[e], d_gu.data(), ctx);
         // SwiGLU -> [M, inter]
         GpuBuffer<bf16> d_act((size_t)M * inter, q);
         swiglu_strided(q, d_gu.data(), d_act.data(), M, inter);
         // down -> [M, H]
         GpuBuffer<bf16> d_dn((size_t)M * H, q);
-        matmul_nvfp4(d_act.data(), M, inter, w.experts_down[e], d_dn.data(), ctx);
+        qwen_matmul_proj(d_act.data(), M, inter, w.experts_down[e], d_dn.data(), ctx);
 
         std::vector<bf16> dn_h((size_t)M * H);
         d_dn.download(dn_h.data(), (size_t)M * H);
@@ -174,11 +173,11 @@ inline void qwen_moe_forward(
 
     // ---- 3. Shared expert (device) ----
     GpuBuffer<bf16> sgu((size_t)S * 2 * inter, q);
-    matmul_nvfp4(hidden, S, H, w.shared_gate_up, sgu.data(), ctx);
+    qwen_matmul_proj(hidden, S, H, w.shared_gate_up, sgu.data(), ctx);
     GpuBuffer<bf16> sact((size_t)S * inter, q);
     swiglu_strided(q, sgu.data(), sact.data(), S, inter);
     GpuBuffer<bf16> sdn((size_t)S * H, q);
-    matmul_nvfp4(sact.data(), S, inter, w.shared_down, sdn.data(), ctx);
+    qwen_matmul_proj(sact.data(), S, inter, w.shared_down, sdn.data(), ctx);
 
     // shared_expert_gate: hidden @ gate.T -> [S,1]; scale shared_out by sigmoid.
     GpuBuffer<bf16> glogit((size_t)S, q);

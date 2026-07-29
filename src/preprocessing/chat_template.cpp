@@ -64,7 +64,20 @@ TokenizerMetadata load_tokenizer_metadata(const std::string& model_dir) {
     if (t.contains("video_token")) {
         meta.video_token = string_or_empty(t, "video_token");
     } else if (t.contains("extra_special_tokens") && !t.at("extra_special_tokens").empty()) {
-        meta.video_token = t.at("extra_special_tokens").at(0).get<std::string>();
+        const auto& est = t.at("extra_special_tokens");
+        if (est.is_object()) {
+            // Qwen VL-style named dict; the keys are fixed for the
+            // architecture family (image/video/vision/audio tokens).
+            if (meta.image_token.empty()) meta.image_token = string_or_empty(est, "image_token");
+            meta.video_token = string_or_empty(est, "video_token");
+            if (meta.boi_token.empty()) meta.boi_token = string_or_empty(est, "vision_bos_token");
+            if (meta.eoi_token.empty()) meta.eoi_token = string_or_empty(est, "vision_eos_token");
+            if (meta.boa_token.empty()) meta.boa_token = string_or_empty(est, "audio_bos_token");
+            if (meta.eoa_token.empty()) meta.eoa_token = string_or_empty(est, "audio_eos_token");
+            if (meta.audio_token.empty()) meta.audio_token = string_or_empty(est, "audio_token");
+        } else {
+            meta.video_token = est.at(0).get<std::string>();
+        }
     }
     return meta;
 }
@@ -129,8 +142,8 @@ PromptBuildResult render_chat_prompt(
     out.tokens = tok.encode(rendered, /*add_bos=*/false);
     out.mm_token_type_ids.reserve(out.tokens.size());
 
-    const int image_id = meta.image_token.empty() ? -1 : tok.token_id(meta.image_token);
-    const int audio_id = meta.audio_token.empty() ? -1 : tok.token_id(meta.audio_token);
+    const int image_id = meta.image_token.empty() || !tok.has_token(meta.image_token) ? -1 : tok.token_id(meta.image_token);
+    const int audio_id = meta.audio_token.empty() || !tok.has_token(meta.audio_token) ? -1 : tok.token_id(meta.audio_token);
     const int video_id = meta.video_token.empty() || !tok.has_token(meta.video_token) ? -1 : tok.token_id(meta.video_token);
     for (int token_id : out.tokens) {
         if (token_id == image_id) {

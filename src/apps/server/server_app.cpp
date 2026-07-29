@@ -78,6 +78,12 @@ int run_server(AppState& app) {
     });
 
     server.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+        // Route handlers already set an OpenAI-style error body with the real
+        // message; only synthesize a generic one when the body is empty.
+        if (!res.body.empty()) {
+            log_line("error", request_label(req) + " -> HTTP " + std::to_string(res.status));
+            return;
+        }
         log_line("error", request_label(req) + " -> HTTP " + std::to_string(res.status) + " not_found");
         res.set_content(arcaine::openai::error_body("not found", "invalid_request_error",
                                                     "not_found").dump(),

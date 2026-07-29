@@ -55,11 +55,23 @@ Tokenizer Tokenizer::from_json(const std::string& path) {
                   });
     }
 
-    // merges: [["piece_a", "piece_b"], ...] — array of 2-element arrays
+    // merges: either [["piece_a", "piece_b"], ...] (older) or
+    // ["piece_a piece_b", ...] (newer HF format, space-joined). Byte-level
+    // vocab maps literal spaces to Ġ, so the join space is unambiguous.
     auto& merges = model["merges"];
     for (int i = 0; i < (int)merges.size(); ++i) {
-        std::string a = merges[i][0].get<std::string>();
-        std::string b = merges[i][1].get<std::string>();
+        std::string a, b;
+        if (merges[i].is_string()) {
+            std::string s = merges[i].get<std::string>();
+            auto sp = s.find(' ');
+            if (sp == std::string::npos)
+                throw std::runtime_error("Malformed merge entry: " + s);
+            a = s.substr(0, sp);
+            b = s.substr(sp + 1);
+        } else {
+            a = merges[i][0].get<std::string>();
+            b = merges[i][1].get<std::string>();
+        }
         tok.merge_rank_[a + " " + b] = i;
     }
 

@@ -497,7 +497,7 @@ inline void qwen_linear_attn_forward(
     gated_rmsnorm(q, core.data(), zbuf.data(), w.norm.data(), core.data(),
                   S * n_v, d_v, cfg.rms_norm_eps);
 
-    // 9. out_proj: [S, value_dim] -> [S, H] (NVFP4).
-    matmul_nvfp4(core.data(), S, value_dim, w.out_proj, out, ctx);
+    // 9. out_proj: [S, value_dim] -> [S, H].
+    qwen_matmul_proj(core.data(), S, value_dim, w.out_proj, out, ctx);
     q.wait();
 }

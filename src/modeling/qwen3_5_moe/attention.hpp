@@ -123,7 +123,7 @@ inline void qwen_full_attention_forward(
 
     // q_proj: [S, H] -> [S, nq*2*hd] (8192), then deinterleave into Q | gate.
     GpuBuffer<bf16> qproj((size_t)seq_len * nq * 2 * hd, q);
-    matmul_nvfp4(hidden, seq_len, H, w.q_proj, qproj.data(), ctx);
+    qwen_matmul_proj(hidden, seq_len, H, w.q_proj, qproj.data(), ctx);
 
     GpuBuffer<bf16> query((size_t)seq_len * nq * hd, q);
     GpuBuffer<bf16> gate((size_t)seq_len * nq * hd, q);
@@ -132,8 +132,8 @@ inline void qwen_full_attention_forward(
     // k_proj / v_proj: [S, H] -> [S, nkv*hd] (512). No v_norm in Qwen3.5.
     GpuBuffer<bf16> K((size_t)seq_len * nkv * hd, q);
     GpuBuffer<bf16> V((size_t)seq_len * nkv * hd, q);
-    matmul_nvfp4(hidden, seq_len, H, w.k_proj, K.data(), ctx);
-    matmul_nvfp4(hidden, seq_len, H, w.v_proj, V.data(), ctx);
+    qwen_matmul_proj(hidden, seq_len, H, w.k_proj, K.data(), ctx);
+    qwen_matmul_proj(hidden, seq_len, H, w.v_proj, V.data(), ctx);
 
     // Per-head RMSNorm of Q and K (weights have +1 baked -> plain rms_norm).
     rms_norm(q, query.data(), w.q_norm.data(), query.data(), seq_len * nq,  hd, cfg.rms_norm_eps);
@@ -166,5 +166,5 @@ inline void qwen_full_attention_forward(
     mul_sigmoid_inplace(q, attn.data(), gate.data(), (size_t)seq_len * nq * hd);
 
     // o_proj: [S, nq*hd] (4096) -> [S, H] (2048).
-    matmul_nvfp4(attn.data(), seq_len, nq * hd, w.o_proj, out, ctx);
+    qwen_matmul_proj(attn.data(), seq_len, nq * hd, w.o_proj, out, ctx);
 }

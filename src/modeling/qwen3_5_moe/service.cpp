@@ -11,7 +11,9 @@ namespace arcaine::qwen3_5_moe {
 
 arcaine::inference::ModelDescriptor qwen_moe_descriptor() {
     arcaine::inference::ModelDescriptor d;
-    d.model_types        = {"qwen3_5_moe_text"};
+    // "qwen3_5_moe" is the wrapped VLM config (text-only loading; see
+    // QwenConfig::from_dir).
+    d.model_types        = {"qwen3_5_moe_text", "qwen3_5_moe"};
     d.implementation_id  = "qwen3_5_moe";
     d.inference_contract = arcaine::inference::InferenceContract::CausalGenerationV1;
     d.input_capabilities = static_cast<std::uint32_t>(

@@ -88,6 +88,16 @@ struct QwenConfig {
         auto j = nlohmann::json::parse(f);
 
         cfg.model_type = j.at("model_type").get<std::string>();
+        if (cfg.model_type == "qwen3_5_moe") {
+            // Wrapped VLM config (Qwen3_5MoeForConditionalGeneration): text
+            // params live under text_config; quantization_config stays
+            // top-level. The vision tower is not loaded (text-only scope).
+            auto t = j.at("text_config");
+            if (!t.contains("quantization_config") && j.contains("quantization_config"))
+                t["quantization_config"] = j["quantization_config"];
+            j = std::move(t);
+            cfg.model_type = j.at("model_type").get<std::string>();
+        }
         if (cfg.model_type != "qwen3_5_moe_text")
             throw std::runtime_error("Expected model_type=qwen3_5_moe_text, got " + cfg.model_type);
 

@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include "runtime/gpu/buffer.hpp"
 #include "runtime/gpu/engine.hpp"
+#include "runtime/gpu/ops.hpp"
 
 struct Int4Linear {
     int in_features = 0;
@@ -34,6 +35,19 @@ struct Int4Linear {
     // BF16 per-group scales transposed for oneDNN, logical shape
     // (in_features / group_size, out_features).
     GpuBuffer<bf16> weight_scale;
+
+    // Asymmetric zero-point correction, logical shape
+    // (in_features / group_size, out_features) BF16:
+    //   zp_offset[g,n] = scale[g,n] * (zp_u[g,n] - 8)
+    // where zp_u is the checkpoint's unsigned stored zero-point nibble
+    // (compressed-tensors pack-quantized packs zp along the output dim N).
+    // The packed weights are still rebased q' = q_u - 8 (XOR 0x88) so oneDNN's
+    // s4 path runs unchanged; matmul_int4 subtracts the residual
+    // rowsum(A)[m,g] * zp_offset[g,n] afterwards. Empty when the checkpoint is
+    // symmetric (zp_u == 8 everywhere) — the correction is then a no-op.
+    GpuBuffer<bf16> zp_offset;
+
+    bool has_zp() const { return !zp_offset.empty(); }
 
     // oneDNN impl-preferred weight layout, materialized once on first use under
     // DIFF_INT4_WEIGHT_LAYOUT=any. The raw tag::ba layout forces oneDNN's
@@ -180,4 +194,36 @@ inline void matmul_int4(
         {DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
             dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
+
+    if (W.has_zp()) {
+        // True dequant is w = scale * (q_u - zp_u); the s4 GEMM above computed
+        // scale * (q_u - 8), so subtract scale * (zp_u - 8) summed over each
+        // K-group: C[m,n] -= rowsum(A)[m,g] * zp_offset[g,n].
+        GpuBuffer<bf16> rowsum((size_t)M * G, ctx.queue);
+        const bf16* A_ptr = A;
+        bf16* R_ptr = rowsum.data();
+        int Kc = K, gs = W.group_size;
+        ctx.queue.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::range<2>((size_t)M, (size_t)G),
+                           [=](sycl::id<2> id) {
+                size_t m = id[0], g = id[1];
+                float acc = 0.0f;
+                const bf16* row = A_ptr + m * (size_t)Kc + g * (size_t)gs;
+                for (int k = 0; k < gs; ++k) acc += bf16_to_float(row[k]);
+                R_ptr[m * (size_t)G + g] = float_to_bf16(acc);
+            });
+        });
+
+        GpuBuffer<bf16> corr((size_t)M * N, ctx.queue);
+        matmul_bf16_nn(rowsum.data(), M, G, W.zp_offset.data(), N, corr.data(), ctx);
+
+        bf16* C_ptr = C;
+        const bf16* corr_ptr = corr.data();
+        ctx.queue.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::range<1>((size_t)M * N), [=](sycl::id<1> id) {
+                C_ptr[id[0]] = float_to_bf16(
+                    bf16_to_float(C_ptr[id[0]]) - bf16_to_float(corr_ptr[id[0]]));
+            });
+        });
+    }
 }
