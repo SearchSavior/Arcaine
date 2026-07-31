@@ -34,7 +34,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <numeric>
 #include <utility>
 #include <vector>
@@ -44,10 +46,24 @@
 #include "../../runtime/quantization/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
 #include "../../runtime/gpu/ops.hpp"                // matmul_bf16
 #include "kernels/elementwise.hpp"    // add_inplace
+#include "kernels/int4_grouped_moe.hpp"   // grouped DPAS INT4 routed path
 
 #include "config.hpp"
 #include "weights.hpp"   // QwenMoE
 #include "kernels.hpp"    // swiglu_strided, scale_rows_by_sigmoid
+
+// Routed-expert INT4 implementation selector (AB test). "dpas" runs the
+// grouped W4A16 DPAS kernels (device routing, no host round trips); anything
+// else falls back to the per-expert oneDNN + host scatter path.
+inline bool qwen_moe_int4_use_dpas()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = std::getenv("QWEN35_MOE_INT4_IMPL");
+        cached = (v && std::strcmp(v, "dpas") == 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
 
 // Host-orchestrated routed-experts path (correctness / decode). See file header.
 // idx/wgt are [S*top_k] row-major (token-major, slot within token).
@@ -116,6 +132,113 @@ inline void qwen_routed_experts_forward(
     }
 }
 
+// Grouped DPAS INT4 routed-experts path (AWQ checkpoints, w.dpas_tables_ready()).
+// Everything after the host top-k runs on device: route build, fused
+// gate/up+SwiGLU (routing weight folded in), down, and the top-k combine
+// into `out`. Scratch buffers are cached across calls (grow-only) — the MoE
+// runs once per layer per token, so per-call USM allocation would dominate
+// launch overhead; a mutex serializes host-side reuse across sessions.
+namespace qwen_moe_dpas_detail {
+struct Scratch {
+    GpuBuffer<int>     idx;
+    GpuBuffer<float>   wgt;
+    GpuBuffer<int32_t> offsets;
+    GpuBuffer<int32_t> tokens;
+    GpuBuffer<int32_t> active;
+    GpuBuffer<bf16>    inter;
+    GpuBuffer<bf16>    pair_out;
+    size_t pairs_cap = 0;
+    size_t active_cap = 0;
+    int    experts_cap = 0;
+};
+inline Scratch& scratch()
+{
+    static Scratch s;
+    return s;
+}
+inline std::mutex& scratch_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+} // namespace qwen_moe_dpas_detail
+
+inline void qwen_routed_experts_forward_dpas(
+    GpuEngine& ctx, const QwenMoE& w,
+    const bf16* hidden,                // device [S, H]
+    const std::vector<int>& idx,        // host [S*top_k]  expert ids
+    const std::vector<float>& wgt,      // host [S*top_k]  renormed weights
+    bf16* out,                          // device [S, H]  (output)
+    int S, const QwenConfig& cfg)
+{
+    auto& q = ctx.queue;
+    int H     = cfg.hidden_size;
+    int E     = cfg.num_experts;
+    int top_k = cfg.num_experts_per_tok;
+    int inter = cfg.moe_intermediate_size;
+    int pairs = S * top_k;
+
+    std::lock_guard<std::mutex> lock(qwen_moe_dpas_detail::scratch_mutex());
+    auto& sc = qwen_moe_dpas_detail::scratch();
+    if (sc.pairs_cap < (size_t)pairs) {
+        sc.idx      = GpuBuffer<int>((size_t)pairs, q);
+        sc.wgt      = GpuBuffer<float>((size_t)pairs, q);
+        sc.tokens   = GpuBuffer<int32_t>((size_t)pairs, q);
+        sc.inter    = GpuBuffer<bf16>((size_t)pairs * inter, q);
+        sc.pair_out = GpuBuffer<bf16>((size_t)pairs * H, q);
+        sc.pairs_cap = (size_t)pairs;
+    }
+    if (sc.experts_cap < E) {
+        sc.offsets = GpuBuffer<int32_t>((size_t)E + 1, q);
+        sc.experts_cap = E;
+    }
+    // In-order queue: async uploads are ordered before the kernels below.
+    q.memcpy(sc.idx.data(), idx.data(), (size_t)pairs * sizeof(int));
+    q.memcpy(sc.wgt.data(), wgt.data(), (size_t)pairs * sizeof(float));
+
+    qwen_int4_grouped_build_routes(q, sc.idx.data(), E, pairs,
+                                   sc.offsets.data(), sc.tokens.data());
+
+    // Compact the active-expert list on host (idx is host data here anyway)
+    // and launch the GEMMs over it, sliced for the DPAS wedge: no idle-expert
+    // work-groups and the minimum number of submissions. At decode sizes this
+    // is the difference between ~30 mostly-idle submissions and ~5 total.
+    std::vector<int32_t> active_h;
+    {
+        std::vector<char> seen((size_t)E, 0);
+        for (int p = 0; p < pairs; ++p) {
+            int e = idx[(size_t)p];
+            if (e >= 0 && e < E && !seen[(size_t)e]) {
+                seen[(size_t)e] = 1;
+                active_h.push_back((int32_t)e);
+            }
+        }
+    }
+    const int num_active = (int)active_h.size();
+    if (sc.active_cap < (size_t)std::max(1, num_active)) {
+        sc.active = GpuBuffer<int32_t>((size_t)std::max(1, num_active), q);
+        sc.active_cap = (size_t)std::max(1, num_active);
+    }
+    if (num_active > 0)
+        q.memcpy(sc.active.data(), active_h.data(),
+                 (size_t)num_active * sizeof(int32_t));
+
+    qwen_int4_grouped_dpas_gateup_swiglu(
+        q, hidden, H, w.dpas_gu_w.data(), w.dpas_gu_s.data(),
+        w.dpas_gu_zp.data(), sc.offsets.data(), sc.tokens.data(),
+        sc.wgt.data(), E, pairs, top_k, inter, cfg.quant_group_size,
+        sc.inter.data(), sc.active.data(), num_active);
+
+    qwen_int4_grouped_dpas_down(
+        q, sc.inter.data(), inter, w.dpas_dn_w.data(), w.dpas_dn_s.data(),
+        w.dpas_dn_zp.data(), sc.offsets.data(), sc.tokens.data(),
+        E, pairs, H, cfg.quant_group_size, sc.pair_out.data(),
+        sc.active.data(), num_active);
+
+    // Top-k combine, weights pre-folded (fp32 accumulate, one bf16 rounding).
+    qwen_int4_grouped_combine(q, sc.pair_out.data(), S, top_k, H, out);
+}
+
 // Full MoE block forward. `out` is the caller-allocated device [S, H] buffer;
 // written with routed + shared.
 inline void qwen_moe_forward(
@@ -162,14 +285,19 @@ inline void qwen_moe_forward(
         for (int s = 0; s < top_k; ++s) wgt[(size_t)t * top_k + s] *= sinv;
     }
 
-    // ---- 2. Routed experts (host-orchestrated) -> fp32 accumulator ----
-    std::vector<float> out_h((size_t)S * H, 0.0f);
-    qwen_routed_experts_forward(ctx, w, hidden, idx, wgt, out_h, S, cfg);
+    // ---- 2. Routed experts -> `out` ----
+    if (qwen_moe_int4_use_dpas() && w.dpas_tables_ready()) {
+        qwen_routed_experts_forward_dpas(ctx, w, hidden, idx, wgt, out, S, cfg);
+    } else {
+        // Host-orchestrated per-expert path (oneDNN / dense / NVFP4).
+        std::vector<float> out_h((size_t)S * H, 0.0f);
+        qwen_routed_experts_forward(ctx, w, hidden, idx, wgt, out_h, S, cfg);
 
-    // Upload routed (bf16) into `out`.
-    std::vector<bf16> out_b((size_t)S * H);
-    for (size_t i = 0; i < (size_t)S * H; ++i) out_b[i] = float_to_bf16(out_h[i]);
-    q.memcpy(out, out_b.data(), (size_t)S * H * sizeof(bf16));
+        // Upload routed (bf16) into `out`.
+        std::vector<bf16> out_b((size_t)S * H);
+        for (size_t i = 0; i < (size_t)S * H; ++i) out_b[i] = float_to_bf16(out_h[i]);
+        q.memcpy(out, out_b.data(), (size_t)S * H * sizeof(bf16));
+    }
 
     // ---- 3. Shared expert (device) ----
     GpuBuffer<bf16> sgu((size_t)S * 2 * inter, q);

@@ -78,6 +78,18 @@ struct QwenMoE {
     QwenProj                   shared_gate_up;       // fused [1024, 2048]
     QwenProj                   shared_down;          // [2048, 512]
     GpuBuffer<bf16>            shared_expert_gate;   // [1, 2048]
+
+    // Persistent per-expert device pointer tables for the grouped DPAS INT4
+    // path (QWEN35_MOE_INT4_IMPL=dpas; AWQ checkpoints only, built by the
+    // loader). zp entries are null for experts without asymmetric zero-points.
+    GpuBuffer<const uint8_t*>  dpas_gu_w;            // [E] packed gate_up rows
+    GpuBuffer<const uint8_t*>  dpas_dn_w;            // [E] packed down rows
+    GpuBuffer<const bf16*>     dpas_gu_s;            // [E] scales [G, 2*inter]
+    GpuBuffer<const bf16*>     dpas_dn_s;            // [E] scales [G, H]
+    GpuBuffer<const bf16*>     dpas_gu_zp;           // [E] zp_offset [G, 2*inter]
+    GpuBuffer<const bf16*>     dpas_dn_zp;           // [E] zp_offset [G, H]
+
+    bool dpas_tables_ready() const { return !dpas_gu_w.empty(); }
 };
 
 struct QwenLayer {
