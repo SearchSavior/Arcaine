@@ -38,14 +38,17 @@
 
 #include "runtime/gpu/buffer.hpp" // bf16, bf16_to_float, float_to_bf16
 
-inline bool qwen_gdn_use_device()
+// 0 = host scalar reference, 1 = device scalar SYCL, 2 = device XMX (DPAS).
+inline int qwen_gdn_impl()
 {
     static int cached = -1;
     if (cached < 0) {
         const char* v = std::getenv("QWEN35_GDN_IMPL");
-        cached = (v && std::strcmp(v, "host") == 0) ? 0 : 1;
+        if (v && std::strcmp(v, "host") == 0)       cached = 0;
+        else if (v && std::strcmp(v, "device") == 0) cached = 1;
+        else                                        cached = 2; // "xmx" / unset
     }
-    return cached == 1;
+    return cached;
 }
 
 inline constexpr int kQwenGdnChunk = 64;

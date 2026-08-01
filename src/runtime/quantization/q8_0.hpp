@@ -36,6 +36,7 @@ using q8_v8i = diff_dpas_v8i;
 using q8_v8f = diff_dpas_v8f;
 
 static constexpr int kQ8DpasBF16 = 0x3000;
+static constexpr int kQ8DpasFP16 = 0x0C00;
 
 struct Q8Linear {
     int in_features = 0;

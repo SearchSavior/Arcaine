@@ -51,7 +51,8 @@
 #include "config.hpp"
 #include "weights.hpp"   // QwenLinearAttn
 #include "kernels.hpp"    // l2norm, gated_rmsnorm, sigmoid_inplace
-#include "kernels/gated_delta_chunk.hpp" // qwen_gdn_device_chunk
+#include "kernels/gated_delta_chunk.hpp"     // qwen_gdn_device_chunk, qwen_gdn_impl
+#include "kernels/gated_delta_chunk_xmx.hpp" // qwen_gdn_device_chunk_xmx
 
 // ---------------------------------------------------------------------------
 // Per-layer linear-attention cache. conv_state holds the last k-1 pre-conv
@@ -486,7 +487,12 @@ inline void qwen_linear_attn_forward(
                                      bbuf.data(), gbuf.data(),
                                      cache.ssm_state.data(), core.data(),
                                      n_v, d_k, d_v);
-    } else if (qwen_gdn_use_device() && d_k == 128 && d_v == 128) {
+    } else if (qwen_gdn_impl() == 2 && d_k == 128 && d_v == 128) {
+        qwen_gdn_device_chunk_xmx(q, qbuf.data(), kbuf.data(), vbuf.data(),
+                                  bbuf.data(), gbuf.data(),
+                                  cache.ssm_state.data(), core.data(),
+                                  S, n_v, d_k, d_v, 64);
+    } else if (qwen_gdn_impl() == 1 && d_k == 128 && d_v == 128) {
         qwen_gdn_device_chunk(q, qbuf.data(), kbuf.data(), vbuf.data(),
                               bbuf.data(), gbuf.data(),
                               cache.ssm_state.data(), core.data(),

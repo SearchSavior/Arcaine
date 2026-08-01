@@ -2,15 +2,16 @@
 // weight-free (q/k/v/beta/g are activations), so no checkpoint is needed;
 // synthetic inputs mirror the production layout: q,k l2-normalized per head
 // (q pre-scaled by 1/sqrt(d_k)), beta in (0,1), g < 0 (log decay).
-//   host:   host_chunk_gated_delta_rule  (download + scalar fp32 + upload)
-//   device: qwen_gdn_device_chunk        (SYCL chunked kernel, one WG/head)
-// This is the exact region swapped by QWEN35_GDN_IMPL=host|device in
+//   host:   host_chunk_gated_delta_rule   (download + scalar fp32 + upload)
+//   device: qwen_gdn_device_chunk         (SYCL chunked kernel, one WG/head)
+//   xmx:    qwen_gdn_device_chunk_xmx     (same, matmuls on XMX via DPAS)
+// This is the exact region swapped by QWEN35_GDN_IMPL=host|device|xmx in
 // qwen_linear_attn_forward. Numerics are checked against the host path
 // (core output bf16 + final fp32 SSM state). Never end-to-end inference.
 // Registered as `qwen35-gdn` in the unified kernel_bench binary.
 //
 // Run:
-//   ./build/kernel_bench qwen35-gdn -p 512,1024,2048,4096 --kernels host,device
+//   ./build/arcaine_kbench qwen35-gdn -p 512,1024,2048,4096 --kernels host,device,xmx
 
 #include "benchmarks/registry.hpp"
 #include "benchmarks/util.hpp"
@@ -48,7 +49,7 @@ void usage(const char* program) {
         "  -n, --n <N>       operations per timed sample  (default: 1)\n"
         "  -w, --w <N>       warmup runs per cell         (default: 1)\n"
         "  -r, --r <N>       timed runs per cell          (default: 2)\n"
-        "  --kernels <csv>   host,device                  (default: both)\n"
+        "  --kernels <csv>   host,device,xmx              (default: all three)\n"
         "  --device <N>      visible GPU via ZE_AFFINITY_MASK\n"
         "  --seed <S>        synthetic input seed         (default: 42)\n"
         "  --md              emit a markdown table\n",
@@ -58,7 +59,7 @@ void usage(const char* program) {
 int run(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string p_csv = "512,1024,2048,4096";
-    std::string kernels_csv = "host,device";
+    std::string kernels_csv = "host,device,xmx";
     std::string device;
     int warmup = 1;
     int runs = 2;
@@ -108,8 +109,8 @@ int run(int argc, char** argv) {
         for (int tokens : token_counts)
             if (tokens <= 0) throw std::runtime_error("-p values must be positive");
         for (const std::string& k : kernels)
-            if (k != "host" && k != "device")
-                throw std::runtime_error("unknown kernel '" + k + "' (use: host, device)");
+            if (k != "host" && k != "device" && k != "xmx")
+                throw std::runtime_error("unknown kernel '" + k + "' (use: host, device, xmx)");
         if (!device.empty()) gpu_device_control::apply_device_index(device);
 
         auto& context = GpuEngine::get(0);
@@ -192,11 +193,17 @@ int run(int argc, char** argv) {
             for (const std::string& kernel : kernels) {
                 auto run_once = [&] {
                     ssm.upload(state0.data(), state_elems);
-                    if (kernel == "device") {
-                        qwen_gdn_device_chunk(queue, qbuf.data(), kbuf.data(),
-                                              vbuf.data(), bbuf.data(), gbuf.data(),
-                                              ssm.data(), core.data(),
-                                              tokens, kNV, kDK, kDV, kChunk);
+                    if (kernel == "device" || kernel == "xmx") {
+                        if (kernel == "xmx")
+                            qwen_gdn_device_chunk_xmx(queue, qbuf.data(), kbuf.data(),
+                                                      vbuf.data(), bbuf.data(), gbuf.data(),
+                                                      ssm.data(), core.data(),
+                                                      tokens, kNV, kDK, kDV, kChunk);
+                        else
+                            qwen_gdn_device_chunk(queue, qbuf.data(), kbuf.data(),
+                                                  vbuf.data(), bbuf.data(), gbuf.data(),
+                                                  ssm.data(), core.data(),
+                                                  tokens, kNV, kDK, kDV, kChunk);
                         queue.wait();
                     } else {
                         host_chunk_gated_delta_rule(context, qbuf.data(), kbuf.data(),
