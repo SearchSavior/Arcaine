@@ -40,6 +40,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "../../runtime/gpu/buffer.hpp"
@@ -53,6 +54,9 @@
 #include "kernels.hpp"    // l2norm, gated_rmsnorm, sigmoid_inplace
 #include "kernels/gated_delta_chunk.hpp"     // qwen_gdn_device_chunk, qwen_gdn_impl
 #include "kernels/gated_delta_chunk_xmx.hpp" // qwen_gdn_device_chunk_xmx
+#include "kernels/gated_delta_chunk_hybrid.hpp" // qwen_gdn_device_chunk_hybrid
+
+using namespace qwen35moe_kernels;
 
 // ---------------------------------------------------------------------------
 // Per-layer linear-attention cache. conv_state holds the last k-1 pre-conv
@@ -104,10 +108,16 @@ struct QwenLinearAttnCaches {
 // Device kernels
 // ===========================================================================
 
-// Causal depthwise conv1d (k=4) + silu for prefill (zero left-pad).
+// Causal depthwise conv1d (k=4) + silu for prefill. The leading k-1 source
+// positions come from conv_state ([conv_dim, k-1], oldest->newest; zeroed at
+// init/reset), matching llama.cpp's concat(conv_state, x) — so continuation
+// prefill (a segment following earlier tokens) gets the true context instead
+// of a zero left-pad.
 //   mixed: [S, conv_dim] BF16 in.  conv_w: [conv_dim, k] BF16.
-//   out[t, c] = silu( sum_j conv_w[c, j] * mixed[t-(k-1)+j, c] ), mixed[neg]=0.
+//   out[t, c] = silu( sum_j conv_w[c, j] * x[t-(k-1)+j, c] ),
+//   x[neg] = conv_state[c, idx + k-1].
 inline void conv1d_causal_prefill(sycl::queue& q, const bf16* mixed, const bf16* conv_w,
+                                  const bf16* conv_state,
                                   bf16* out, int S, int conv_dim, int k) {
     int km1 = k - 1;
     int total = S * conv_dim;
@@ -121,6 +131,9 @@ inline void conv1d_causal_prefill(sycl::queue& q, const bf16* mixed, const bf16*
                 if (idx >= 0 && idx < S)
                     acc += bf16_to_float(conv_w[c * k + j]) *
                            bf16_to_float(mixed[(size_t)idx * conv_dim + c]);
+                else if (idx < 0)
+                    acc += bf16_to_float(conv_w[c * k + j]) *
+                           bf16_to_float(conv_state[(size_t)c * km1 + (idx + km1)]);
             }
             out[(size_t)t * conv_dim + c] = float_to_bf16(acc / (1.0f + sycl::exp(-acc)));
         });
@@ -418,6 +431,49 @@ inline void host_chunk_gated_delta_rule(
 }
 
 // ===========================================================================
+// Grow-only scratch for the per-layer GDN intermediates. The linear-attn
+// forward runs once per GDN layer (30 of 40) per call; per-call USM
+// alloc/free would serialize the pipeline (DPC++ sycl::free(ptr, q) syncs
+// with the queue). Guarded by a mutex across the whole forward since the
+// scratch feeds kernels enqueued throughout.
+// ===========================================================================
+namespace qwen_gdn_detail {
+struct Scratch {
+    GpuBuffer<bf16> mixed;    // [S, conv_dim]
+    GpuBuffer<bf16> conv_out; // [S, conv_dim]
+    GpuBuffer<bf16> qbuf;     // [S, n_v*d_k]
+    GpuBuffer<bf16> kbuf;     // [S, n_v*d_k]
+    GpuBuffer<bf16> vbuf;     // [S, n_v*d_v]
+    GpuBuffer<bf16> zbuf;     // [S, value_dim]
+    GpuBuffer<bf16> babuf;    // [S, 2*n_v] (b in [0,n_v), a in [n_v,2n_v))
+    GpuBuffer<bf16> gbuf;     // [S, n_v]
+    GpuBuffer<bf16> core;     // [S, n_v*d_v]
+    size_t cap = 0;           // rows S covered
+};
+inline Scratch& scratch()
+{
+    static Scratch s;
+    return s;
+}
+inline std::mutex& scratch_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+// Worst-case grow-only scratch bytes for one qwen_linear_attn_forward call at
+// seq_len=S. Mirrors the alloc block in qwen_linear_attn_forward exactly;
+// used by QwenModel's max_seq preflight. Keep in sync.
+inline size_t qwen_gdn_scratch_bytes(int S, int conv_dim, int n_v, int d_k,
+                                     int d_v, int value_dim)
+{
+    const size_t elems = (size_t)S *
+        (2 * conv_dim + 2 * n_v * d_k + 2 * n_v * d_v + value_dim + 3 * n_v);
+    return elems * sizeof(bf16);
+}
+} // namespace qwen_gdn_detail
+
+// ===========================================================================
 // Gated DeltaNet forward for one linear-attn layer.
 //   hidden: [S, H] (already input_layernorm-ed). out: [S, H] (pre-residual).
 //   past_len: cached tokens before this call (0 for the first prefill).
@@ -439,77 +495,91 @@ inline void qwen_linear_attn_forward(
     float scale   = 1.0f / std::sqrt((float)d_k);
     int S = seq_len;
 
+    std::lock_guard<std::mutex> lock(qwen_gdn_detail::scratch_mutex());
+    auto& sc = qwen_gdn_detail::scratch();
+    if (sc.cap < (size_t)S) {
+        sc.mixed    = GpuBuffer<bf16>((size_t)S * conv_dim, q);
+        sc.conv_out = GpuBuffer<bf16>((size_t)S * conv_dim, q);
+        sc.qbuf     = GpuBuffer<bf16>((size_t)S * n_v * d_k, q);
+        sc.kbuf     = GpuBuffer<bf16>((size_t)S * n_v * d_k, q);
+        sc.vbuf     = GpuBuffer<bf16>((size_t)S * n_v * d_v, q);
+        sc.zbuf     = GpuBuffer<bf16>((size_t)S * value_dim, q);
+        sc.babuf    = GpuBuffer<bf16>((size_t)S * 2 * n_v, q);
+        sc.gbuf     = GpuBuffer<bf16>((size_t)S * n_v, q);
+        sc.core     = GpuBuffer<bf16>((size_t)S * n_v * d_v, q);
+        sc.cap      = (size_t)S;
+    }
+    bf16* bbuf = sc.babuf.data();
+    bf16* abuf = sc.babuf.data() + (size_t)S * n_v;
+
     // 1. in_proj_qkv: [S, H] -> [S, conv_dim].
-    GpuBuffer<bf16> mixed((size_t)S * conv_dim, q);
-    matmul_bf16(hidden, S, H, w.in_proj_qkv.data(), conv_dim, mixed.data(), ctx);
+    matmul_bf16(hidden, S, H, w.in_proj_qkv.data(), conv_dim, sc.mixed.data(), ctx);
 
     // 2. conv1d (depthwise causal k=4 + silu). Decode uses conv_state; prefill
-    //    zero-left-pads and saves the last k-1 pre-conv inputs.
-    GpuBuffer<bf16> conv_out((size_t)S * conv_dim, q);
+    //    reads the leading k-1 positions from conv_state (zeroed when fresh,
+    //    so the first call is a zero left-pad) and saves the last k-1 pre-conv
+    //    inputs.
     if (S == 1 && cache.has_state) {
-        conv1d_causal_decode(q, mixed.data(), w.conv1d.data(),
-                             cache.conv_state.data(), conv_out.data(), conv_dim, kk);
+        conv1d_causal_decode(q, sc.mixed.data(), w.conv1d.data(),
+                             cache.conv_state.data(), sc.conv_out.data(), conv_dim, kk);
     } else {
-        conv1d_causal_prefill(q, mixed.data(), w.conv1d.data(),
-                             conv_out.data(), S, conv_dim, kk);
-        save_conv_state(q, mixed.data(), cache.conv_state.data(), S, conv_dim, kk);
+        conv1d_causal_prefill(q, sc.mixed.data(), w.conv1d.data(),
+                              cache.conv_state.data(),
+                              sc.conv_out.data(), S, conv_dim, kk);
+        save_conv_state(q, sc.mixed.data(), cache.conv_state.data(), S, conv_dim, kk);
     }
 
     // 3. split + repeat q,k (->32 heads); v already 32 heads. -> [S, n_v, d].
-    GpuBuffer<bf16> qbuf((size_t)S * n_v * d_k, q);
-    GpuBuffer<bf16> kbuf((size_t)S * n_v * d_k, q);
-    GpuBuffer<bf16> vbuf((size_t)S * n_v * d_v, q);
-    extract_qkv_repeat(q, conv_out.data(), qbuf.data(), kbuf.data(), vbuf.data(),
+    extract_qkv_repeat(q, sc.conv_out.data(), sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
                        S, n_k, d_k, d_v, key_dim, conv_dim);
 
     // 4. l2norm q,k (per head over d); scale q by 1/sqrt(d).
-    l2norm(q, qbuf.data(), qbuf.data(), S * n_v, d_k, cfg.rms_norm_eps);
-    l2norm(q, kbuf.data(), kbuf.data(), S * n_v, d_k, cfg.rms_norm_eps);
-    scale_inplace(q, qbuf.data(), S * n_v * d_k, scale);
+    l2norm(q, sc.qbuf.data(), sc.qbuf.data(), S * n_v, d_k, cfg.rms_norm_eps);
+    l2norm(q, sc.kbuf.data(), sc.kbuf.data(), S * n_v, d_k, cfg.rms_norm_eps);
+    scale_inplace(q, sc.qbuf.data(), S * n_v * d_k, scale);
 
     // 5. z = in_proj_z(hidden) -> [S, value_dim] (gate for the output norm).
-    GpuBuffer<bf16> zbuf((size_t)S * value_dim, q);
-    matmul_bf16(hidden, S, H, w.in_proj_z.data(), value_dim, zbuf.data(), ctx);
+    matmul_bf16(hidden, S, H, w.in_proj_z.data(), value_dim, sc.zbuf.data(), ctx);
 
     // 6. b,a -> beta=sigmoid(b); g=-exp(A_log)*softplus(a+dt_bias).
-    GpuBuffer<bf16> bbuf((size_t)S * n_v, q);
-    GpuBuffer<bf16> abuf((size_t)S * n_v, q);
-    matmul_bf16(hidden, S, H, w.in_proj_b.data(), n_v, bbuf.data(), ctx);
-    matmul_bf16(hidden, S, H, w.in_proj_a.data(), n_v, abuf.data(), ctx);
-    sigmoid_inplace(q, bbuf.data(), S * n_v);
-    GpuBuffer<bf16> gbuf((size_t)S * n_v, q);
-    compute_g(q, abuf.data(), w.A_log.data(), w.dt_bias.data(), gbuf.data(), S, n_v);
+    matmul_bf16(hidden, S, H, w.in_proj_b.data(), n_v, bbuf, ctx);
+    matmul_bf16(hidden, S, H, w.in_proj_a.data(), n_v, abuf, ctx);
+    sigmoid_inplace(q, bbuf, S * n_v);
+    compute_g(q, abuf, w.A_log.data(), w.dt_bias.data(), sc.gbuf.data(), S, n_v);
 
     // 7. core gated delta rule.
-    GpuBuffer<bf16> core((size_t)S * n_v * d_v, q);
     if (S == 1 && cache.has_state) {
-        recurrent_gated_delta_decode(q, qbuf.data(), kbuf.data(), vbuf.data(),
-                                     bbuf.data(), gbuf.data(),
-                                     cache.ssm_state.data(), core.data(),
+        recurrent_gated_delta_decode(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                                     bbuf, sc.gbuf.data(),
+                                     cache.ssm_state.data(), sc.core.data(),
                                      n_v, d_k, d_v);
+    } else if (qwen_gdn_impl() == 3 && d_k == 128 && d_v == 128) {
+        qwen_gdn_device_chunk_hybrid(ctx, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                                     bbuf, sc.gbuf.data(),
+                                     cache.ssm_state.data(), sc.core.data(),
+                                     S, n_v, d_k, d_v, 64);
     } else if (qwen_gdn_impl() == 2 && d_k == 128 && d_v == 128) {
-        qwen_gdn_device_chunk_xmx(q, qbuf.data(), kbuf.data(), vbuf.data(),
-                                  bbuf.data(), gbuf.data(),
-                                  cache.ssm_state.data(), core.data(),
+        qwen_gdn_device_chunk_xmx(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                                  bbuf, sc.gbuf.data(),
+                                  cache.ssm_state.data(), sc.core.data(),
                                   S, n_v, d_k, d_v, 64);
     } else if (qwen_gdn_impl() == 1 && d_k == 128 && d_v == 128) {
-        qwen_gdn_device_chunk(q, qbuf.data(), kbuf.data(), vbuf.data(),
-                              bbuf.data(), gbuf.data(),
-                              cache.ssm_state.data(), core.data(),
+        qwen_gdn_device_chunk(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                              bbuf, sc.gbuf.data(),
+                              cache.ssm_state.data(), sc.core.data(),
                               S, n_v, d_k, d_v, 64);
     } else {
-        host_chunk_gated_delta_rule(ctx, qbuf.data(), kbuf.data(), vbuf.data(),
-                                    bbuf.data(), gbuf.data(),
-                                    cache.ssm_state.data(), core.data(),
+        host_chunk_gated_delta_rule(ctx, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                                    bbuf, sc.gbuf.data(),
+                                    cache.ssm_state.data(), sc.core.data(),
                                     S, n_v, d_k, d_v, 64);
     }
     cache.has_state = true;
 
     // 8. gated rmsnorm: (norm * rmsnorm_D(core)) * silu(z), over d_v.
-    gated_rmsnorm(q, core.data(), zbuf.data(), w.norm.data(), core.data(),
+    gated_rmsnorm(q, sc.core.data(), sc.zbuf.data(), w.norm.data(), sc.core.data(),
                   S * n_v, d_v, cfg.rms_norm_eps);
 
     // 9. out_proj: [S, value_dim] -> [S, H].
-    qwen_matmul_proj(core.data(), S, value_dim, w.out_proj, out, ctx);
-    q.wait();
+    qwen_matmul_proj(sc.core.data(), S, value_dim, w.out_proj, out, ctx);
 }

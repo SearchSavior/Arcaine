@@ -2,6 +2,12 @@
 #include <sycl/sycl.hpp>
 #include "runtime/gpu/buffer.hpp"
 
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
+
 // RMSNorm: out[row, d] = x[row, d] / rms(x[row, :]) * weight[d]
 // x and out may alias (in-place ok).
 // If weight is nullptr, uses identity scale (v_norm).
@@ -169,3 +175,5 @@ inline void rms_norm_add_scale(
             });
     });
 }
+
+} // namespace qwen35moe_kernels

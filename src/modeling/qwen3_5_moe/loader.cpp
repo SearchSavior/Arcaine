@@ -53,9 +53,6 @@ QwenDenseLinear upload_dense_linear_pair(const TensorSource& sf,
 
 }  // namespace
 
-using qwen_awq::upload_linear;
-using qwen_awq::upload_linear_pair;
-
 QwenWeights load_qwen_weights(const TensorSource& sf, const QwenConfig& cfg,
                               sycl::queue& q, int max_layers) {
     const int nl = cfg.num_hidden_layers;
@@ -134,13 +131,13 @@ QwenWeights load_qwen_weights(const TensorSource& sf, const QwenConfig& cfg,
         m.router_gate = upload(sf.get(mp + "gate.weight"), q, (mp + "gate.weight").c_str());
         m.experts_gate_up.reserve(cfg.num_experts);
         m.experts_down.reserve(cfg.num_experts);
-        for (int e = 0; e < cfg.num_experts; ++e) {
-            const std::string ep = mp + "experts." + std::to_string(e) + ".";
-            if (awq_int4) {
-                m.experts_gate_up.push_back(
-                    upload_linear_pair(sf, ep + "gate_proj", ep + "up_proj", q));
-                m.experts_down.push_back(upload_linear(sf, ep + "down_proj", q));
-            } else {
+        if (awq_int4) {
+            // Canonical contiguous raw-u4 expert storage (grouped oneDNN +
+            // DPAS fallback + per-expert u4zp reference all read slices).
+            m.grouped = qwen_awq::upload_experts_grouped(sf, mp, cfg.num_experts, q);
+        } else {
+            for (int e = 0; e < cfg.num_experts; ++e) {
+                const std::string ep = mp + "experts." + std::to_string(e) + ".";
                 m.experts_gate_up.push_back(
                     upload_nvfp4_linear_pair(sf, ep + "gate_proj", ep + "up_proj", q));
                 m.experts_down.push_back(upload_nvfp4_linear(sf, ep + "down_proj", q));
@@ -151,36 +148,6 @@ QwenWeights load_qwen_weights(const TensorSource& sf, const QwenConfig& cfg,
             m.shared_gate_up = upload_dense_linear_pair(sf, sep + "gate_proj",
                                                         sep + "up_proj", q);
             m.shared_down    = upload_dense_linear(sf, sep + "down_proj", q);
-
-            // Persistent grouped-DPAS pointer tables (one upload per layer;
-            // entries point into the Int4Linear buffers loaded above, whose
-            // storage is stable: the experts vectors were reserve()d and
-            // GpuBuffer moves transfer the same USM pointer).
-            const int E = cfg.num_experts;
-            std::vector<const uint8_t*> gu_w(E), dn_w(E);
-            std::vector<const bf16*> gu_s(E), dn_s(E), gu_zp(E), dn_zp(E);
-            for (int e = 0; e < E; ++e) {
-                const auto& gu = std::get<Int4Linear>(m.experts_gate_up[e]);
-                const auto& dn = std::get<Int4Linear>(m.experts_down[e]);
-                gu_w[e]  = gu.weight_packed.data();
-                dn_w[e]  = dn.weight_packed.data();
-                gu_s[e]  = gu.weight_scale.data();
-                dn_s[e]  = dn.weight_scale.data();
-                gu_zp[e] = gu.has_zp() ? gu.zp_offset.data() : nullptr;
-                dn_zp[e] = dn.has_zp() ? dn.zp_offset.data() : nullptr;
-            }
-            m.dpas_gu_w  = GpuBuffer<const uint8_t*>(E, q);
-            m.dpas_dn_w  = GpuBuffer<const uint8_t*>(E, q);
-            m.dpas_gu_s  = GpuBuffer<const bf16*>(E, q);
-            m.dpas_dn_s  = GpuBuffer<const bf16*>(E, q);
-            m.dpas_gu_zp = GpuBuffer<const bf16*>(E, q);
-            m.dpas_dn_zp = GpuBuffer<const bf16*>(E, q);
-            m.dpas_gu_w.upload(gu_w.data(), E);
-            m.dpas_dn_w.upload(dn_w.data(), E);
-            m.dpas_gu_s.upload(gu_s.data(), E);
-            m.dpas_dn_s.upload(dn_s.data(), E);
-            m.dpas_gu_zp.upload(gu_zp.data(), E);
-            m.dpas_dn_zp.upload(dn_zp.data(), E);
         } else {
             m.shared_gate_up = upload_nvfp4_linear_pair(sf, sep + "gate_proj",
                                                         sep + "up_proj", q);

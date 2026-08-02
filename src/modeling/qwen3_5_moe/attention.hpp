@@ -24,6 +24,7 @@
 
 #include <climits>
 #include <cmath>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -36,6 +37,8 @@
 #include "config.hpp"
 #include "weights.hpp"   // QwenFullAttn
 #include "kernels.hpp"    // apply_qwen_rope, mul_sigmoid_inplace
+
+using namespace qwen35moe_kernels;
 
 // ---------------------------------------------------------------------------
 // KV cache for the full-attention layers (10 of 40). Time-major
@@ -95,6 +98,30 @@ inline void split_q_gate(sycl::queue& q, const bf16* qproj, bf16* query, bf16* g
 }
 
 // ---------------------------------------------------------------------------
+// Grow-only scratch for the per-layer projection intermediates. The full
+// attention forward runs once per full-attention layer per call; per-call USM
+// alloc/free would dominate launch overhead at decode (S=1). Guarded by the
+// batched-attention scratch mutex (single lock ordering, held by
+// qwen_full_attention_forward for its whole body).
+// ---------------------------------------------------------------------------
+namespace qwen_full_attn_detail {
+struct Scratch {
+    GpuBuffer<bf16> qproj;  // [S, nq*2*hd]
+    GpuBuffer<bf16> query;  // [S, nq*hd]
+    GpuBuffer<bf16> gate;   // [S, nq*hd]
+    GpuBuffer<bf16> k;      // [S, nkv*hd]
+    GpuBuffer<bf16> v;      // [S, nkv*hd]
+    size_t q_cap = 0;       // rows S covered for qproj/query/gate
+    size_t kv_cap = 0;      // rows S covered for k/v
+};
+inline Scratch& scratch()
+{
+    static Scratch s;
+    return s;
+}
+} // namespace qwen_full_attn_detail
+
+// ---------------------------------------------------------------------------
 // Full-attention forward for one full-attention layer.
 //   hidden: [S, H]  (already input_layernorm-ed by the caller)
 //   out:    [S, H]  (caller-allocated; attention output, PRE-residual)
@@ -121,50 +148,61 @@ inline void qwen_full_attention_forward(
     if (kv.filled + seq_len > kv.max_seq)
         throw std::runtime_error("Qwen KV cache overflow");
 
-    // q_proj: [S, H] -> [S, nq*2*hd] (8192), then deinterleave into Q | gate.
-    GpuBuffer<bf16> qproj((size_t)seq_len * nq * 2 * hd, q);
-    qwen_matmul_proj(hidden, seq_len, H, w.q_proj, qproj.data(), ctx);
+    // Held for the whole forward: guards the projection scratch below and the
+    // batched_attention scratch whose ctx_tm pointer is consumed by
+    // mul_sigmoid_inplace / o_proj at the end of this function.
+    std::lock_guard<std::mutex> lock(qwen_attn_batched_detail::scratch_mutex());
+    auto& sc = qwen_full_attn_detail::scratch();
+    if (sc.q_cap < (size_t)seq_len) {
+        sc.qproj = GpuBuffer<bf16>((size_t)seq_len * nq * 2 * hd, q);
+        sc.query = GpuBuffer<bf16>((size_t)seq_len * nq * hd, q);
+        sc.gate  = GpuBuffer<bf16>((size_t)seq_len * nq * hd, q);
+        sc.q_cap = (size_t)seq_len;
+    }
+    if (sc.kv_cap < (size_t)seq_len) {
+        sc.k = GpuBuffer<bf16>((size_t)seq_len * nkv * hd, q);
+        sc.v = GpuBuffer<bf16>((size_t)seq_len * nkv * hd, q);
+        sc.kv_cap = (size_t)seq_len;
+    }
 
-    GpuBuffer<bf16> query((size_t)seq_len * nq * hd, q);
-    GpuBuffer<bf16> gate((size_t)seq_len * nq * hd, q);
-    split_q_gate(q, qproj.data(), query.data(), gate.data(), seq_len, nq, hd);
+    // q_proj: [S, H] -> [S, nq*2*hd] (8192), then deinterleave into Q | gate.
+    qwen_matmul_proj(hidden, seq_len, H, w.q_proj, sc.qproj.data(), ctx);
+    split_q_gate(q, sc.qproj.data(), sc.query.data(), sc.gate.data(), seq_len, nq, hd);
 
     // k_proj / v_proj: [S, H] -> [S, nkv*hd] (512). No v_norm in Qwen3.5.
-    GpuBuffer<bf16> K((size_t)seq_len * nkv * hd, q);
-    GpuBuffer<bf16> V((size_t)seq_len * nkv * hd, q);
-    qwen_matmul_proj(hidden, seq_len, H, w.k_proj, K.data(), ctx);
-    qwen_matmul_proj(hidden, seq_len, H, w.v_proj, V.data(), ctx);
+    qwen_matmul_proj(hidden, seq_len, H, w.k_proj, sc.k.data(), ctx);
+    qwen_matmul_proj(hidden, seq_len, H, w.v_proj, sc.v.data(), ctx);
 
     // Per-head RMSNorm of Q and K (weights have +1 baked -> plain rms_norm).
-    rms_norm(q, query.data(), w.q_norm.data(), query.data(), seq_len * nq,  hd, cfg.rms_norm_eps);
-    rms_norm(q, K.data(),     w.k_norm.data(), K.data(),     seq_len * nkv, hd, cfg.rms_norm_eps);
+    rms_norm(q, sc.query.data(), w.q_norm.data(), sc.query.data(), seq_len * nq, hd, cfg.rms_norm_eps);
+    rms_norm(q, sc.k.data(),     w.k_norm.data(), sc.k.data(),     seq_len * nkv, hd, cfg.rms_norm_eps);
 
     // Partial RoPE (rotary_dim=64) applied to Q and K.
-    apply_qwen_rope(q, query.data(), K.data(), seq_len, past_len, nq, nkv, hd, rdim, theta);
+    apply_qwen_rope(q, sc.query.data(), sc.k.data(), seq_len, past_len, nq, nkv, hd, rdim, theta);
 
     // Append K, V to the per-layer cache (time-major (kv_len, nkv, hd)).
     {
         size_t row   = (size_t)nkv * hd;
         size_t off   = (size_t)past_len * row;
         size_t bytes = (size_t)seq_len * row * sizeof(bf16);
-        q.memcpy(kv.k.data() + off, K.data(), bytes);
-        q.memcpy(kv.v.data() + off, V.data(), bytes);
+        q.memcpy(kv.k.data() + off, sc.k.data(), bytes);
+        q.memcpy(kv.v.data() + off, sc.v.data(), bytes);
         kv.filled = past_len + seq_len;
     }
 
     int kv_len = kv.filled;
     // GQA attention: no sliding window (INT_MAX => pure causal); for decode
     // (seq_len==1) the causal mask is all-zero so it can be skipped.
-    auto attn = batched_attention(ctx,
-        query.data(), seq_len, nq, hd,
+    bf16* attn = batched_attention(ctx,
+        sc.query.data(), seq_len, nq, hd,
         kv.k.data(), kv.v.data(), kv_len, nkv, hd,
         past_len, INT_MAX,
         scale, /*skip_mask=*/(seq_len == 1));
 
     // attn is [S, nq, hd] time-major == [S, nq*hd] flat; gate has the same layout.
     // attn_output *= sigmoid(gate), elementwise per (s, h, j).  (ref line 717)
-    mul_sigmoid_inplace(q, attn.data(), gate.data(), (size_t)seq_len * nq * hd);
+    mul_sigmoid_inplace(q, attn, sc.gate.data(), (size_t)seq_len * nq * hd);
 
     // o_proj: [S, nq*hd] (4096) -> [S, H] (2048).
-    qwen_matmul_proj(attn.data(), seq_len, nq * hd, w.o_proj, out, ctx);
+    qwen_matmul_proj(attn, seq_len, nq * hd, w.o_proj, out, ctx);
 }

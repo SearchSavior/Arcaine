@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <stdexcept>
@@ -22,6 +23,13 @@ inline uint16_t float_to_bf16(float f) {
     return static_cast<uint16_t>((u + rounding_bias) >> 16);
 }
 
+// Process-wide live device bytes allocated through GpuBuffer (all T).
+// Used by model preflight checks to estimate free device memory.
+inline std::atomic<size_t>& gpu_buffer_live_bytes() {
+    static std::atomic<size_t> b{0};
+    return b;
+}
+
 template<typename T>
 class GpuBuffer {
 public:
@@ -31,13 +39,17 @@ public:
     explicit GpuBuffer(size_t n, sycl::queue& q = GpuEngine::get().queue)
         : count_(n), q_(&q)
     {
-        ptr_ = sycl::malloc_device<T>(n, q);
-        if (!ptr_) throw std::runtime_error("GpuBuffer: device alloc failed");
-    }
+          ptr_ = sycl::malloc_device<T>(n, q);
+          if (!ptr_) throw std::runtime_error("GpuBuffer: device alloc failed");
+          gpu_buffer_live_bytes().fetch_add(n * sizeof(T), std::memory_order_relaxed);
+      }
 
-    ~GpuBuffer() {
-        if (ptr_ && q_) sycl::free(ptr_, *q_);
-    }
+      ~GpuBuffer() {
+          if (ptr_ && q_) {
+              sycl::free(ptr_, *q_);
+              gpu_buffer_live_bytes().fetch_sub(count_ * sizeof(T), std::memory_order_relaxed);
+          }
+      }
 
     // Non-copyable
     GpuBuffer(const GpuBuffer&) = delete;
@@ -48,9 +60,12 @@ public:
         o.ptr_ = nullptr; o.count_ = 0; o.q_ = nullptr;
     }
     GpuBuffer& operator=(GpuBuffer&& o) noexcept {
-        if (this != &o) {
-            if (ptr_ && q_) sycl::free(ptr_, *q_);
-            ptr_ = o.ptr_; count_ = o.count_; q_ = o.q_;
+          if (this != &o) {
+              if (ptr_ && q_) {
+                  sycl::free(ptr_, *q_);
+                  gpu_buffer_live_bytes().fetch_sub(count_ * sizeof(T), std::memory_order_relaxed);
+              }
+              ptr_ = o.ptr_; count_ = o.count_; q_ = o.q_;
             o.ptr_ = nullptr; o.count_ = 0; o.q_ = nullptr;
         }
         return *this;

@@ -10,17 +10,20 @@
 //   weight_zero_point I32 [N/8, G]   8 unsigned nibbles per word packed along
 //                                    the OUTPUT dim N (zp_u = zp + 8)
 //   weight_shape      I64 [2]        original [N, K] (cross-check only)
-// True dequant: w = scale * (q_u - zp_u). The packed weights are rebased to
-// two's-complement s4 (XOR 0x88, i.e. q_u - 8) for oneDNN; the residual
-// scale * (zp_u - 8) is folded into Int4Linear::zp_offset (see int4.hpp).
+// True dequant: w = scale * (q_u - zp_u). The canonical device storage keeps
+// the checkpoint's original unsigned nibbles and zero points verbatim (raw
+// u4, no XOR-0x88 rebase, no zp_offset precomputation) as one contiguous
+// tensor per projection across all experts — directly consumable by oneDNN's
+// grouped W4A16 matmul with native u4 zero points and by the custom DPAS
+// fallback (see kernels/int4_grouped_onednn.hpp / int4_grouped_moe.hpp).
 
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "../../runtime/quantization/int4.hpp"         // Int4Linear, bf16 helpers
 #include "../../runtime/quantization/quant_loader.hpp" // TensorSource/TensorView
+#include "weights.hpp"                                 // QwenInt4ExpertsGrouped
 
 namespace qwen_awq {
 
@@ -46,33 +49,6 @@ inline float f16_bits_to_float(uint16_t h) {
     std::memcpy(&f, &out, sizeof(f));
     return f;
 }
-
-inline GpuBuffer<uint8_t> upload_packed_rebased(const void* a_data, size_t a_bytes,
-                                                const void* b_data, size_t b_bytes,
-                                                sycl::queue& q) {
-    size_t total = a_bytes + b_bytes;
-    static std::vector<uint8_t> staging;
-    if (staging.size() < total) staging.resize(total);
-    std::memcpy(staging.data(), a_data, a_bytes);
-    if (b_bytes) std::memcpy(staging.data() + a_bytes, b_data, b_bytes);
-
-    GpuBuffer<uint8_t> buf(total, q);
-    uint8_t* dst = buf.data();
-    sycl::event copy_done = q.memcpy(buf.data(), staging.data(), total);
-    q.submit([&](sycl::handler& h) {
-        h.depends_on(copy_done);
-        h.parallel_for(sycl::range<1>(total),
-                       [=](sycl::id<1> id) { dst[id[0]] ^= 0x88; });
-    }).wait();
-    return buf;
-}
-
-// Host-side per-expert AWQ parameters for one or two (fused) projections.
-// Produces oneDNN-layout scales (G, N) BF16 and the zp correction (G, N) BF16.
-struct HostParams {
-    std::vector<bf16> scales_t;   // [G, N]
-    std::vector<bf16> zp_offset;  // [G, N], empty if symmetric (all zp_u == 8)
-};
 
 // Read one projection's scale (F16/BF16 [N, G]) into floats, row-major [N, G].
 inline std::vector<float> read_scale_f32(const TensorView& scale, int N, int G,
@@ -105,30 +81,6 @@ inline std::vector<uint8_t> read_zp_u4(const TensorView& zp, int N, int G,
                 (uint8_t)(((uint32_t)words[(size_t)(n / 8) * G + g] >> (4 * (n % 8))) & 0xF);
     }
     return out;
-}
-
-inline HostParams build_host_params(const std::vector<std::vector<float>>& scales_f,
-                                    const std::vector<std::vector<uint8_t>>& zps_u,
-                                    int N_half, int G) {
-    // N rows per part, concatenated along the output dim.
-    int parts = (int)scales_f.size();
-    int N = N_half * parts;
-    HostParams p;
-    p.scales_t.resize((size_t)G * N);
-    p.zp_offset.resize((size_t)G * N);
-    bool any_asym = false;
-    for (int g = 0; g < G; ++g) {
-        for (int n = 0; n < N; ++n) {
-            int part = n / N_half, ln = n % N_half;
-            float s = scales_f[part][(size_t)ln * G + g];
-            int zp  = zps_u[part][(size_t)ln * G + g];
-            p.scales_t[(size_t)g * N + n] = float_to_bf16(s);
-            if (zp != 8) any_asym = true;
-            p.zp_offset[(size_t)g * N + n] = float_to_bf16(s * (float)(zp - 8));
-        }
-    }
-    if (!any_asym) p.zp_offset.clear();
-    return p;
 }
 
 inline GpuBuffer<bf16> upload_bf16(const std::vector<bf16>& host, sycl::queue& q) {
@@ -167,49 +119,86 @@ inline AwqTensors read_tensors(const TensorSource& sf, const std::string& prefix
     return t;
 }
 
-inline Int4Linear upload_linear(const TensorSource& sf, const std::string& prefix,
-                                sycl::queue& q) {
+// Host staging for one projection across all experts (canonical raw layout).
+struct GroupedProjHost {
+    std::vector<uint8_t> q;       // [E][N][K/2]   raw packed u4, K innermost
+    std::vector<bf16>    scales;  // [E][G][N]     BF16
+    std::vector<uint8_t> zp;      // [E][G][N/2]   raw u4 packed along N
+    bool any_asym = false;
+    int N = 0, K = 0, G = 0;
+};
+
+// Append one expert's projection (prefix.gate_proj style) to the staging.
+inline void append_expert_proj(const TensorSource& sf, const std::string& prefix,
+                               GroupedProjHost& p) {
     AwqTensors t = read_tensors(sf, prefix);
-    Int4Linear lin;
-    lin.out_features = t.N;
-    lin.in_features  = t.K;
-    lin.group_size   = t.K / t.G;
-    lin.weight_packed =
-        upload_packed_rebased(t.packed->data, t.packed->nbytes, nullptr, 0, q);
+    if (p.N == 0) {
+        p.N = t.N; p.K = t.K; p.G = t.G;
+    } else if (p.N != t.N || p.K != t.K || p.G != t.G) {
+        throw std::runtime_error("AWQ expert shape mismatch: " + prefix);
+    }
+    const size_t q_bytes = (size_t)t.N * t.K / 2;
+    const uint8_t* q_src = static_cast<const uint8_t*>(t.packed->data);
+    p.q.insert(p.q.end(), q_src, q_src + q_bytes);
+
     auto scales_f = read_scale_f32(*t.scale, t.N, t.G, prefix + ".weight_scale");
     auto zps_u    = read_zp_u4(*t.zp, t.N, t.G, prefix + ".weight_zero_point");
-    HostParams p = build_host_params({scales_f}, {zps_u}, t.N, t.G);
-    lin.weight_scale = upload_bf16(p.scales_t, q);
-    if (!p.zp_offset.empty()) lin.zp_offset = upload_bf16(p.zp_offset, q);
-    return lin;
+    size_t base_s = p.scales.size();
+    size_t base_z = p.zp.size();
+    p.scales.resize(base_s + (size_t)t.G * t.N);
+    p.zp.resize(base_z + (size_t)t.G * (t.N / 2));
+    for (int g = 0; g < t.G; ++g) {
+        for (int n = 0; n < t.N; ++n) {
+            p.scales[base_s + (size_t)g * t.N + n] =
+                float_to_bf16(scales_f[(size_t)n * t.G + g]);
+            int z = zps_u[(size_t)n * t.G + g];
+            if (z != 8) p.any_asym = true;
+            uint8_t& byte = p.zp[base_z + (size_t)g * (t.N / 2) + n / 2];
+            if (n & 1) byte |= uint8_t(z << 4);
+            else       byte  = uint8_t(z);
+        }
+    }
 }
 
-// Fused gate+up AWQ: packed rows concatenate directly ([N,K/8] row-major);
-// scales and zp offsets concatenate along the output dim to match
-// (gate in outputs [0,N), up in [N,2N)).
-inline Int4Linear upload_linear_pair(const TensorSource& sf,
-                                     const std::string& gate_prefix,
-                                     const std::string& up_prefix,
-                                     sycl::queue& q) {
-    AwqTensors g = read_tensors(sf, gate_prefix);
-    AwqTensors u = read_tensors(sf, up_prefix);
-    if (g.K != u.K || g.G != u.G || g.N != u.N)
-        throw std::runtime_error("AWQ pair shape mismatch: " + gate_prefix + " / " +
-                                 up_prefix);
-    Int4Linear lin;
-    lin.out_features = 2 * g.N;
-    lin.in_features  = g.K;
-    lin.group_size   = g.K / g.G;
-    lin.weight_packed = upload_packed_rebased(g.packed->data, g.packed->nbytes,
-                                              u.packed->data, u.packed->nbytes, q);
-    auto gs = read_scale_f32(*g.scale, g.N, g.G, gate_prefix + ".weight_scale");
-    auto us = read_scale_f32(*u.scale, u.N, u.G, up_prefix + ".weight_scale");
-    auto gz = read_zp_u4(*g.zp, g.N, g.G, gate_prefix + ".weight_zero_point");
-    auto uz = read_zp_u4(*u.zp, u.N, u.G, up_prefix + ".weight_zero_point");
-    HostParams p = build_host_params({gs, us}, {gz, uz}, g.N, g.G);
-    lin.weight_scale = upload_bf16(p.scales_t, q);
-    if (!p.zp_offset.empty()) lin.zp_offset = upload_bf16(p.zp_offset, q);
-    return lin;
+// Load all routed experts of one MoE block into canonical contiguous storage:
+// gate/up/down as separate [E, N, K]-logical raw u4 tensors + scales + zero
+// points (dropped when fully symmetric).
+inline QwenInt4ExpertsGrouped upload_experts_grouped(const TensorSource& sf,
+                                                     const std::string& moe_prefix,
+                                                     int E, sycl::queue& q) {
+    GroupedProjHost gate, up, down;
+    for (int e = 0; e < E; ++e) {
+        const std::string ep = moe_prefix + "experts." + std::to_string(e) + ".";
+        append_expert_proj(sf, ep + "gate_proj", gate);
+        append_expert_proj(sf, ep + "up_proj", up);
+        append_expert_proj(sf, ep + "down_proj", down);
+    }
+    if (gate.K != up.K || gate.N != up.N || gate.G != up.G || down.N == 0)
+        throw std::runtime_error("AWQ expert projection mismatch: " + moe_prefix);
+
+    QwenInt4ExpertsGrouped g;
+    g.E = E;
+    g.hidden = gate.K;
+    g.inter = gate.N;
+    g.group_size = gate.K / gate.G;
+    if (down.K != gate.N || down.G != gate.N / g.group_size)
+        throw std::runtime_error("AWQ down_proj group mismatch: " + moe_prefix);
+
+    auto up_u8 = [&](const std::vector<uint8_t>& h) {
+        GpuBuffer<uint8_t> b(h.size(), q);
+        b.upload(h.data(), h.size());
+        return b;
+    };
+    g.gate_q = up_u8(gate.q);
+    g.up_q   = up_u8(up.q);
+    g.down_q = up_u8(down.q);
+    g.gate_s = upload_bf16(gate.scales, q);
+    g.up_s   = upload_bf16(up.scales, q);
+    g.down_s = upload_bf16(down.scales, q);
+    if (gate.any_asym) g.gate_zp = up_u8(gate.zp);
+    if (up.any_asym)   g.up_zp   = up_u8(up.zp);
+    if (down.any_asym) g.down_zp = up_u8(down.zp);
+    return g;
 }
 
 }  // namespace qwen_awq

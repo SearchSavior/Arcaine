@@ -21,6 +21,12 @@
 #include <algorithm>
 #include <cmath>
 
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
+
 // ---------------------------------------------------------------------------
 // Elementwise activations
 // ---------------------------------------------------------------------------
@@ -229,3 +235,5 @@ inline void l2norm(sycl::queue& q, const bf16* x, bf16* out, int N, int D, float
             });
     });
 }
+
+} // namespace qwen35moe_kernels

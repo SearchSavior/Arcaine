@@ -49,6 +49,12 @@
 #include "runtime/gpu/buffer.hpp"
 #include "runtime/quantization/q8_0.hpp" // DPAS builtin declaration / vector operand types.
 
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
+
 inline uint16_t float_to_f16_bits(float f) {
     return sycl::bit_cast<uint16_t>((sycl::half)f);
 }
@@ -182,10 +188,16 @@ inline void qwen_gdn_device_chunk_xmx(
                     }
 
                     // -- 3. stage sTb = bf16(T+I), sW = bf16[beta*V | sw*K] --
+                    // Mask explicitly: the T-solve only defines sT's strict
+                    // lower triangle; the upper/diagonal hold stale SLM from
+                    // the previous chunk's sVn (same M2 union) and must never
+                    // be read — step 5's full matmul reads every column.
                     bf16* sTb = (bf16*)(base_ + OFF_M1); // sA dead
                     for (int idx = lane; idx < C * C; idx += WG) {
                         int i = idx >> 6, j = idx & 63;
-                        sTb[idx] = to_op(sT[idx] + (i == j ? 1.0f : 0.0f));
+                        sTb[idx] = (j < i)  ? to_op(sT[idx])
+                                 : (i == j) ? to_op(1.0f)
+                                            : (bf16)0;
                     }
                     for (int idx = lane; idx < C * 256; idx += WG) {
                         int a = idx >> 8, col = idx & 255;
@@ -351,3 +363,5 @@ inline void qwen_gdn_device_chunk_xmx(
             });
     });
 }
+
+} // namespace qwen35moe_kernels

@@ -38,15 +38,26 @@
 
 #include "runtime/gpu/buffer.hpp" // bf16, bf16_to_float, float_to_bf16
 
-// 0 = host scalar reference, 1 = device scalar SYCL, 2 = device XMX (DPAS).
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
+
+// 0 = host scalar reference, 1 = device scalar SYCL, 2 = device XMX (DPAS),
+// 3 = hybrid (oneDNN batched Gram + parallel T-solve + 2-WG/head state pass).
 inline int qwen_gdn_impl()
 {
     static int cached = -1;
     if (cached < 0) {
         const char* v = std::getenv("QWEN35_GDN_IMPL");
-        if (v && std::strcmp(v, "host") == 0)       cached = 0;
+        if (v && std::strcmp(v, "host") == 0)        cached = 0;
         else if (v && std::strcmp(v, "device") == 0) cached = 1;
-        else                                        cached = 2; // "xmx" / unset
+        else if (v && std::strcmp(v, "hybrid") == 0) cached = 3;
+        else                                           cached = 3; // "hybrid" / unset.
+        // Hybrid is faster than xmx at prefill-relevant sizes (p>=512:
+        // oneDNN Gram + cross-chunk parallelism vs the xmx path's serialized
+        // per-head chunk loop); e2e pp sweep is within noise either way.
     }
     return cached;
 }
@@ -238,3 +249,5 @@ inline void qwen_gdn_device_chunk(
             });
     });
 }
+
+} // namespace qwen35moe_kernels

@@ -98,7 +98,6 @@ static int run(int argc, char* argv[]) {
     std::printf("\nload    : %.1f s\n", load_s);
 
     const int bos_id = info.bos_token_id;
-    const std::vector<int> single(1, bos_id);
     arcaine::bench::print_pp_tg_header();
 
     for (int pp : pp_list) {
@@ -107,7 +106,10 @@ static int run(int argc, char* argv[]) {
             std::printf(" %-18s %9s   [skip: pp=%d > max_seq=%d]\n", name, "—", pp, max_seq);
             continue;
         }
-        const std::vector<int> prompt(pp, bos_id);
+        // Varied-but-deterministic prompt (all-BOS overflows to NaN at long S).
+        // Keep ids well inside vocab regardless of bos_id.
+        std::vector<int> prompt(pp);
+        for (int i = 0; i < pp; ++i) prompt[i] = 1000 + (int)((i * 2654435761u) % 100000);
         std::vector<double> times;
         for (int r = 0; r < warmup + reps; ++r) {
             model.reset_cache();
@@ -131,17 +133,27 @@ static int run(int argc, char* argv[]) {
             std::vector<double> times;
             for (int r = 0; r < warmup + reps; ++r) {
                 model.reset_cache();
+                std::vector<float> logits;
                 if (depth > 0) {
                     constexpr int CHUNK = 512;
                     for (int pos = 0; pos < depth; pos += CHUNK) {
                         int sz = std::min(CHUNK, depth - pos);
                         std::vector<int> chunk(sz, bos_id);
-                        model.forward(ForwardInput{chunk, pos});
+                        logits = model.forward(ForwardInput{chunk, pos});
                     }
                 }
+                // Greedy-chain the model's own (junk) tokens through decode
+                // instead of a constant BOS: realistic per-step inputs and
+                // routing, first token taken from the prefill's logits.
+                int next = bos_id;
+                if (!logits.empty())
+                    next = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
                 double t = now_ms();
-                for (int step = 0; step < tg; ++step)
-                    model.forward(ForwardInput{single, depth + step});
+                for (int step = 0; step < tg; ++step) {
+                    std::vector<int> in(1, next);
+                    logits = model.forward(ForwardInput{in, depth + step});
+                    next = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+                }
                 double dt = now_ms() - t;
                 if (r >= warmup) times.push_back(dt);
             }

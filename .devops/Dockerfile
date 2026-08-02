@@ -41,6 +41,7 @@ RUN set -eux; \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=icx \
         -DCMAKE_CXX_COMPILER=icpx \
+        -DONEDNN_EXPERIMENTAL_GROUPED_MEMORY=ON \
         -DDNNL_CPU_RUNTIME=SYCL \
         -DDNNL_GPU_RUNTIME=SYCL \
         -DDNNL_BUILD_TESTS=OFF \

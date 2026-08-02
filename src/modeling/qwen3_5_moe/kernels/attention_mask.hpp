@@ -3,6 +3,12 @@
 #include <limits>
 #include <climits>
 
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
+
 // Fill a float mask buffer (q_len × kv_len) with 0.0 or -inf.
 // Masking rules (applied together):
 //   causal:  kv_j > q_global_pos  → -inf   (future token)
@@ -71,3 +77,5 @@ inline void fill_causal_mask_with_block_ids(
         });
     });
 }
+
+} // namespace qwen35moe_kernels

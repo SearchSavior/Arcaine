@@ -25,6 +25,8 @@
 #include "runtime/quantization/quant_loader.hpp"
 #include "modeling/qwen3_5_moe/kernels.hpp"
 
+using namespace qwen35moe_kernels;
+
 using arcaine::bench::aggregate;
 using arcaine::bench::parse_int_csv;
 using arcaine::bench::split_csv;

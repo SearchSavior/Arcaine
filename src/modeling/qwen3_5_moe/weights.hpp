@@ -5,7 +5,6 @@
 #include "../../runtime/gpu/buffer.hpp"
 #include "../../runtime/gpu/ops.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"
-#include "../../runtime/quantization/int4.hpp"
 
 // Qwen3.5-MoE device weights. NVFP4 projections are stored as Nvfp4Linear
 // (identical scheme to the block-diffusion MoE: weight_packed U8, weight_scale F8_E4M3
@@ -16,9 +15,9 @@
 // Projection weights are a per-checkpoint variant: the NVFP4 sibling quantizes
 // every Linear to Nvfp4Linear, while the AWQ INT4 checkpoint
 // (compressed-tensors pack-quantized, group_size=32, asymmetric zero-points)
-// quantizes ONLY the routed experts (Int4Linear with zp_offset) and keeps
-// attention/out_proj/shared-expert projections dense (QwenDenseLinear,
-// F16->BF16 at upload).
+// quantizes ONLY the routed experts (QwenInt4ExpertsGrouped, raw u4 + native
+// u4 zero points) and keeps attention/out_proj/shared-expert projections
+// dense (QwenDenseLinear, F16->BF16 at upload).
 
 // Dense (unquantized) projection uploaded from a plain .weight tensor.
 struct QwenDenseLinear {
@@ -28,20 +27,44 @@ struct QwenDenseLinear {
 };
 
 // A projection weight in whichever representation the checkpoint carries.
-using QwenProj = std::variant<Nvfp4Linear, Int4Linear, QwenDenseLinear>;
+using QwenProj = std::variant<Nvfp4Linear, QwenDenseLinear>;
 
 // C(M,N) = A(M,K) @ dequant(W)^T for any supported projection representation.
 inline void qwen_matmul_proj(const bf16* A, int M, int K, const QwenProj& W,
                              bf16* C, GpuEngine& ctx) {
     if (const auto* p = std::get_if<Nvfp4Linear>(&W)) {
         matmul_nvfp4(A, M, K, *p, C, ctx);
-    } else if (const auto* p = std::get_if<Int4Linear>(&W)) {
-        matmul_int4(A, M, K, *p, C, ctx);
     } else {
         const auto& d = std::get<QwenDenseLinear>(W);
         matmul_bf16(A, M, K, d.weight.data(), d.out_features, C, ctx);
     }
 }
+
+// Canonical AWQ INT4 routed-expert storage: ONE contiguous device tensor per
+// projection across all experts, raw unsigned nibbles (q_u, no XOR-0x88
+// rebase) and raw unsigned zero points (zp_u, packed along N). True dequant:
+//   w = scale * (q_u - zp_u)
+// Consumed directly by the oneDNN grouped W4A16 path (weights u4 tag::acb,
+// scales/zp mask 7, groups {group_size, 1}) and by the custom DPAS fallback
+// (base pointer + per-expert stride). zp buffers are empty when the whole
+// projection is symmetric (zp_u == 8 everywhere).
+struct QwenInt4ExpertsGrouped {
+    int E = 0, hidden = 0, inter = 0, group_size = 0;
+    GpuBuffer<uint8_t> gate_q;   // [E, inter, hidden/2]   u4, K innermost
+    GpuBuffer<uint8_t> up_q;     // [E, inter, hidden/2]
+    GpuBuffer<uint8_t> down_q;   // [E, hidden, inter/2]
+    GpuBuffer<bf16>    gate_s;   // [E, hidden/gs, inter]
+    GpuBuffer<bf16>    up_s;     // [E, hidden/gs, inter]
+    GpuBuffer<bf16>    down_s;   // [E, inter/gs, hidden]
+    GpuBuffer<uint8_t> gate_zp;  // [E, hidden/gs, inter/2]  u4 packed along N
+    GpuBuffer<uint8_t> up_zp;    // [E, hidden/gs, inter/2]
+    GpuBuffer<uint8_t> down_zp;  // [E, inter/gs, hidden/2]
+
+    bool ready() const { return !gate_q.empty(); }
+    bool gate_has_zp() const { return !gate_zp.empty(); }
+    bool up_has_zp() const { return !up_zp.empty(); }
+    bool down_has_zp() const { return !down_zp.empty(); }
+};
 
 // Full attention (Qwen3_5MoeAttention): GQA 16:2, head_dim 256, partial RoPE
 // (rotary_dim 64), q/k RMSNorm per head, sigmoid/swish output gate taken from
@@ -79,17 +102,11 @@ struct QwenMoE {
     QwenProj                   shared_down;          // [2048, 512]
     GpuBuffer<bf16>            shared_expert_gate;   // [1, 2048]
 
-    // Persistent per-expert device pointer tables for the grouped DPAS INT4
-    // path (QWEN35_MOE_INT4_IMPL=dpas; AWQ checkpoints only, built by the
-    // loader). zp entries are null for experts without asymmetric zero-points.
-    GpuBuffer<const uint8_t*>  dpas_gu_w;            // [E] packed gate_up rows
-    GpuBuffer<const uint8_t*>  dpas_dn_w;            // [E] packed down rows
-    GpuBuffer<const bf16*>     dpas_gu_s;            // [E] scales [G, 2*inter]
-    GpuBuffer<const bf16*>     dpas_dn_s;            // [E] scales [G, H]
-    GpuBuffer<const bf16*>     dpas_gu_zp;           // [E] zp_offset [G, 2*inter]
-    GpuBuffer<const bf16*>     dpas_dn_zp;           // [E] zp_offset [G, H]
-
-    bool dpas_tables_ready() const { return !dpas_gu_w.empty(); }
+    // AWQ INT4 checkpoints only: contiguous per-projection expert tensors
+    // (raw u4 + native u4 zero points). experts_gate_up/experts_down stay
+    // empty in this mode; the grouped oneDNN path, the DPAS fallback and the
+    // per-expert reference path all read slices of this storage.
+    QwenInt4ExpertsGrouped     grouped;
 };
 
 struct QwenLayer {

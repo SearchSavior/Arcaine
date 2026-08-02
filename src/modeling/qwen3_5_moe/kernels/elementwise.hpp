@@ -3,6 +3,12 @@
 #include "runtime/gpu/buffer.hpp"
 #include <cmath>
 
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
+
 // GELU with tanh approximation. Applied in-place.
 inline void gelu_tanh_inplace(sycl::queue& q, bf16* x, int n) {
     constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
@@ -102,3 +108,5 @@ inline void add_inplace(sycl::queue& q, bf16* a, const bf16* b, int n) {
         });
     });
 }
+
+} // namespace qwen35moe_kernels

@@ -7,14 +7,12 @@
 // (reports/llm-scaler-grouped-moe.md):
 //
 //   * SwiGLU epilogue (silu(gate) * up) instead of DiffusionGemma's GeGLU;
-//   * exact per-element asymmetric zero-point handling. The packed weights
-//     are two's-complement s4 (q_u - 8, GPU XOR 0x88 at load) but true
-//     dequant is scale * (q_u - zp_u) = scale * q_s4 - zp_offset with
-//     zp_offset[g,n] = scale[g,n] * (zp_u[g,n] - 8) precomputed by the
-//     loader. The DPAS B operand is bf16(scale * q_s4 - zp_offset) directly
-//     (zp_offset is constant across a group's 32 elements, so it costs one
-//     load + one subtract per element), matching the oneDNN path's math
-//     without a rowsum + correction pass;
+//   * exact per-element asymmetric zero-point handling from the canonical
+//     raw storage: weights stay unsigned nibbles q_u and zero points are the
+//     checkpoint's original unsigned nibbles zp_u (packed along N). The DPAS
+//     B operand is bf16((q_u - zp_u) * scale) directly — one exact integer
+//     subtract and one bf16 rounding per element, matching the oneDNN
+//     grouped path's math without a rowsum + correction pass;
 //   * Qwen top-k pair indexing: pair p = token * top_k + slot;
 //   * 64-lane work-groups (4 subgroups of 16), one 16-wide output tile per
 //     subgroup — 4x fewer work-groups than one-subgroup WGs (better XeCore
@@ -34,17 +32,25 @@
 //   * packed weight rows read as one aligned uint64 per K-tile instead of
 //     eight byte loads.
 //
-// Layout (identical to Int4Linear): packed s4 rows [N, K/2] low-nibble first
-// along K, scales BF16 [G, N], zp_offset BF16 [G, N] (nullptr per expert when
-// that expert is symmetric, i.e. zp_u == 8 everywhere). Names are
+// Layout (canonical QwenInt4ExpertsGrouped): contiguous per-projection expert
+// tensors, packed u4 rows [E][N][K/2] low-nibble first along K, scales BF16
+// [E][K/gs][N], zero points u4 [E][K/gs][N/2] packed along N (nullptr when
+// the projection is symmetric, i.e. zp_u == 8 everywhere). Kernels take base
+// pointers + compile-time-constant per-expert strides. Names are
 // qwen_-prefixed: kernel_bench links several models into one binary and the
 // DiffusionGemma originals are inline with external linkage.
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
-#include "runtime/quantization/int4.hpp"
+#include "runtime/gpu/buffer.hpp"
 #include "runtime/quantization/q8_0.hpp" // DPAS builtin declaration / vector operand types.
+
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
 
 static constexpr int kQwenInt4GroupedDpasBF16 = 0x3000;
 
@@ -58,9 +64,11 @@ static constexpr int kQwenInt4GroupedDpasBF16 = 0x3000;
 // Launching the expert dimension in slices (in-order queue serializes them)
 // caps concurrent DPAS work far below the wedge threshold at negligible
 // cost. 0 disables slicing. The GEMMs launch over the compacted active-
-// expert list (`active_experts`, device buffer, host-computed from the
-// top-k idx the caller already holds), sliced in chunks of `estep` — no
-// idle-expert work-groups and the minimum number of submissions.
+// expert list (`active_experts` + device `active_count`, built on device by
+// qwen_moe_compact_active from the router's idx), sliced in chunks of
+// `estep`. The grid is sized by the host-side upper bound
+// max_active = min(E, pairs) and work-groups past *active_count exit
+// immediately — no host readback, no idle-expert work beyond the bound.
 inline int qwen_int4_dpas_expert_slice()
 {
     static int cached = -1;
@@ -135,44 +143,52 @@ inline void qwen_int4_grouped_build_routes(
 // Fused gate/up W4A16 grouped GEMM + SwiGLU + routing-weight fold.
 // One 64-lane work-group (4 subgroups) covers one local expert and 64
 // intermediate channels (16 per subgroup), looping over its compacted pair
-// list in eight-row DPAS tiles. `gate_w` points at raw packed
-// [2*inter, hidden/2] rows (gate rows [0,inter), up rows [inter,2*inter));
-// `gate_s`/`gate_zp` at [hidden/group, 2*inter]. Writes
+// list in eight-row DPAS tiles. `gate_q`/`up_q` are the canonical contiguous
+// packed u4 expert tensors ([E][inter][hidden/2] each), `gate_s`/`up_s` the
+// [E][hidden/gs][inter] BF16 scales and `gate_zp`/`up_zp` the raw u4 zero
+// points [E][hidden/gs][inter/2] (nullptr = symmetric, zp_u == 8). Writes
 // intermediate[pair * inter + n] = pair_wgt[pair] * silu(gate) * up.
 inline void qwen_int4_grouped_dpas_gateup_swiglu(
     sycl::queue& q,
     const bf16* input, int hidden,
-    const uint8_t* const* gate_w, const bf16* const* gate_s,
-    const bf16* const* gate_zp,
+    const uint8_t* gate_q, const uint8_t* up_q,
+    const bf16* gate_s, const bf16* up_s,
+    const uint8_t* gate_zp, const uint8_t* up_zp,
     const int32_t* expert_offsets, const int32_t* expert_tokens,
     const float* pair_wgt,
     int local_experts, int pairs, int top_k, int inter, int group_size,
-    bf16* intermediate, const int32_t* active_experts, int num_active)
+    bf16* intermediate, const int32_t* active_experts,
+    const int32_t* active_count, int max_active)
 {
     if (hidden % 16 || inter % 64 || hidden % group_size || group_size != 32)
         throw std::runtime_error("qwen grouped INT4 DPAS requires H % 16, I % 64 and AWQ group_size=32");
-    if (pairs <= 0 || num_active <= 0) return;
+    if (pairs <= 0 || max_active <= 0) return;
     const int slice = qwen_int4_dpas_expert_slice();
-    const int estep = slice > 0 ? slice : num_active;
-    for (int a0 = 0; a0 < num_active; a0 += estep) {
-        const int ec = std::min(estep, num_active - a0);
+    const int estep = slice > 0 ? slice : max_active;
+    for (int a0 = 0; a0 < max_active; a0 += estep) {
+        const int ec = std::min(estep, max_active - a0);
         q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<2>(sycl::range<2>((size_t)ec, (size_t)inter),
                               sycl::range<2>(1, 64)),
             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                int e = active_experts[a0 + (int)it.get_group(0)];
+                int a = a0 + (int)it.get_group(0);
+                if (a >= *active_count) return;
+                int e = active_experts[a];
                 int lane = (int)(it.get_local_id(1) & 15);
                 int n = (int)it.get_global_id(1);
                 int t0 = expert_offsets[e];
                 int t1 = expert_offsets[e + 1];
                 if (t0 >= t1) return;
 
-                const uint8_t* w = gate_w[e];
-                const bf16* s = gate_s[e];
-                const bf16* zp = gate_zp[e];
                 const int packed_k = hidden / 2;
-                const int out_features = 2 * inter;
+                const int kg_n = hidden / group_size;   // groups along K
+                const uint8_t* w_g = gate_q + (size_t)e * inter * packed_k;
+                const uint8_t* w_u = up_q + (size_t)e * inter * packed_k;
+                const bf16* s_g = gate_s + (size_t)e * kg_n * inter;
+                const bf16* s_u = up_s + (size_t)e * kg_n * inter;
+                const uint8_t* z_g = gate_zp ? gate_zp + (size_t)e * kg_n * (inter / 2) : nullptr;
+                const uint8_t* z_u = up_zp ? up_zp + (size_t)e * kg_n * (inter / 2) : nullptr;
 
                 for (int m0 = t0; m0 < t1; m0 += 8) {
                     // Hoisted per-tile pair/token ids (min-clamped tail:
@@ -187,25 +203,32 @@ inline void qwen_int4_grouped_dpas_gateup_swiglu(
                     diff_dpas_v8f cu = {0,0,0,0,0,0,0,0};
                     for (int k0 = 0; k0 < hidden; k0 += 16) {
                         int kg = k0 / group_size;
-                        float sg = bf16_to_float(s[(size_t)kg * out_features + n]);
-                        float su = bf16_to_float(s[(size_t)kg * out_features + inter + n]);
-                        float zg = zp ? bf16_to_float(zp[(size_t)kg * out_features + n]) : 0.0f;
-                        float zu = zp ? bf16_to_float(zp[(size_t)kg * out_features + inter + n]) : 0.0f;
+                        float sg = bf16_to_float(s_g[(size_t)kg * inter + n]);
+                        float su = bf16_to_float(s_u[(size_t)kg * inter + n]);
+                        int zg = 8, zu = 8;
+                        if (z_g) {
+                            uint8_t b = z_g[(size_t)kg * (inter / 2) + n / 2];
+                            zg = (n & 1) ? (b >> 4) : (b & 0xF);
+                        }
+                        if (z_u) {
+                            uint8_t b = z_u[(size_t)kg * (inter / 2) + n / 2];
+                            zu = (n & 1) ? (b >> 4) : (b & 0xF);
+                        }
                         uint64_t gw, uw;
-                        std::memcpy(&gw, w + (size_t)n * packed_k + k0 / 2, 8);
-                        std::memcpy(&uw, w + (size_t)(inter + n) * packed_k + k0 / 2, 8);
+                        std::memcpy(&gw, w_g + (size_t)n * packed_k + k0 / 2, 8);
+                        std::memcpy(&uw, w_u + (size_t)n * packed_k + k0 / 2, 8);
                         diff_dpas_v8i bg, bu;
                         for (int j = 0; j < 8; ++j) {
                             uint8_t gbyte = (uint8_t)(gw >> (8 * j));
                             uint8_t ubyte = (uint8_t)(uw >> (8 * j));
-                            int g0 = (int)(gbyte & 0x0f); if (g0 >= 8) g0 -= 16;
-                            int g1 = (int)(gbyte >> 4);   if (g1 >= 8) g1 -= 16;
-                            int u0 = (int)(ubyte & 0x0f); if (u0 >= 8) u0 -= 16;
-                            int u1 = (int)(ubyte >> 4);   if (u1 >= 8) u1 -= 16;
-                            uint16_t g0b = float_to_bf16((float)g0 * sg - zg);
-                            uint16_t g1b = float_to_bf16((float)g1 * sg - zg);
-                            uint16_t u0b = float_to_bf16((float)u0 * su - zu);
-                            uint16_t u1b = float_to_bf16((float)u1 * su - zu);
+                            int g0 = (int)(gbyte & 0x0f) - zg;
+                            int g1 = (int)(gbyte >> 4) - zg;
+                            int u0 = (int)(ubyte & 0x0f) - zu;
+                            int u1 = (int)(ubyte >> 4) - zu;
+                            uint16_t g0b = float_to_bf16((float)g0 * sg);
+                            uint16_t g1b = float_to_bf16((float)g1 * sg);
+                            uint16_t u0b = float_to_bf16((float)u0 * su);
+                            uint16_t u1b = float_to_bf16((float)u1 * su);
                             bg[j] = (int)((uint32_t)g0b | ((uint32_t)g1b << 16));
                             bu[j] = (int)((uint32_t)u0b | ((uint32_t)u1b << 16));
                         }
@@ -230,41 +253,46 @@ inline void qwen_int4_grouped_dpas_gateup_swiglu(
     }
 }
 
-// Grouped W4A16 down projection with per-element zp folding. Rows keep the
-// original pair index; routing weights are already folded into the
-// intermediate, so the top-k combine is a plain sum.
+// Grouped W4A16 down projection with per-element native zero points. Rows
+// keep the original pair index; routing weights are already folded into the
+// intermediate, so the top-k combine is a plain sum. `down_q` is [E][hidden]
+// [inter/2] u4, `down_s` [E][inter/gs][hidden] BF16, `down_zp`
+// [E][inter/gs][hidden/2] u4 (nullptr = symmetric).
 inline void qwen_int4_grouped_dpas_down(
     sycl::queue& q,
     const bf16* intermediate, int inter,
-    const uint8_t* const* down_w, const bf16* const* down_s,
-    const bf16* const* down_zp,
+    const uint8_t* down_q, const bf16* down_s, const uint8_t* down_zp,
     const int32_t* expert_offsets, const int32_t* expert_tokens,
     int local_experts, int pairs, int hidden, int group_size,
-    bf16* output, const int32_t* active_experts, int num_active)
+    bf16* output, const int32_t* active_experts,
+    const int32_t* active_count, int max_active)
 {
     if (hidden % 64 || inter % 16 || inter % group_size || group_size != 32)
         throw std::runtime_error("qwen grouped INT4 DPAS requires H % 64, I % 16 and AWQ group_size=32");
-    if (pairs <= 0 || num_active <= 0) return;
+    if (pairs <= 0 || max_active <= 0) return;
     const int slice = qwen_int4_dpas_expert_slice();
-    const int estep = slice > 0 ? slice : num_active;
-    for (int a0 = 0; a0 < num_active; a0 += estep) {
-        const int ec = std::min(estep, num_active - a0);
+    const int estep = slice > 0 ? slice : max_active;
+    for (int a0 = 0; a0 < max_active; a0 += estep) {
+        const int ec = std::min(estep, max_active - a0);
         q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<2>(sycl::range<2>((size_t)ec, (size_t)hidden),
                               sycl::range<2>(1, 64)),
             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                int e = active_experts[a0 + (int)it.get_group(0)];
+                int a = a0 + (int)it.get_group(0);
+                if (a >= *active_count) return;
+                int e = active_experts[a];
                 int lane = (int)(it.get_local_id(1) & 15);
                 int n = (int)it.get_global_id(1);
                 int t0 = expert_offsets[e];
                 int t1 = expert_offsets[e + 1];
                 if (t0 >= t1) return;
 
-                const uint8_t* w = down_w[e];
-                const bf16* s = down_s[e];
-                const bf16* zp = down_zp[e];
                 const int packed_k = inter / 2;
+                const int kg_n = inter / group_size;
+                const uint8_t* w = down_q + (size_t)e * hidden * packed_k;
+                const bf16* s = down_s + (size_t)e * kg_n * hidden;
+                const uint8_t* zp = down_zp ? down_zp + (size_t)e * kg_n * (hidden / 2) : nullptr;
                 for (int m0 = t0; m0 < t1; m0 += 8) {
                     int pair[8];
                     for (int m = 0; m < 8; ++m) {
@@ -275,16 +303,20 @@ inline void qwen_int4_grouped_dpas_down(
                     for (int k0 = 0; k0 < inter; k0 += 16) {
                         int kg = k0 / group_size;
                         float scale = bf16_to_float(s[(size_t)kg * hidden + n]);
-                        float z = zp ? bf16_to_float(zp[(size_t)kg * hidden + n]) : 0.0f;
+                        int z = 8;
+                        if (zp) {
+                            uint8_t b = zp[(size_t)kg * (hidden / 2) + n / 2];
+                            z = (n & 1) ? (b >> 4) : (b & 0xF);
+                        }
                         uint64_t wv;
                         std::memcpy(&wv, w + (size_t)n * packed_k + k0 / 2, 8);
                         diff_dpas_v8i bv;
                         for (int j = 0; j < 8; ++j) {
                             uint8_t byte = (uint8_t)(wv >> (8 * j));
-                            int v0 = (int)(byte & 0x0f); if (v0 >= 8) v0 -= 16;
-                            int v1 = (int)(byte >> 4);   if (v1 >= 8) v1 -= 16;
-                            uint16_t b0 = float_to_bf16((float)v0 * scale - z);
-                            uint16_t b1 = float_to_bf16((float)v1 * scale - z);
+                            int v0 = (int)(byte & 0x0f) - z;
+                            int v1 = (int)(byte >> 4) - z;
+                            uint16_t b0 = float_to_bf16((float)v0 * scale);
+                            uint16_t b1 = float_to_bf16((float)v1 * scale);
                             bv[j] = (int)((uint32_t)b0 | ((uint32_t)b1 << 16));
                         }
                         diff_dpas_v8s av;
@@ -320,3 +352,5 @@ inline void qwen_int4_grouped_combine(
         });
     });
 }
+
+} // namespace qwen35moe_kernels

@@ -3,6 +3,12 @@
 #include "runtime/gpu/buffer.hpp"
 #include "runtime/gpu/engine.hpp"
 
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
+
 // Attention tensor layout helpers shared by multiple model families.
 // These stay narrowly focused on reshaping and scattering buffers.
 
@@ -33,22 +39,32 @@ inline GpuBuffer<bf16> transpose_q(
 }
 
 // Expand K or V from (kv_len, nkv, hd) time-major to (nq, kv_len, hd) head-major
-// with GQA repetition: expanded[h, t, d] = src[t, h/gqa_ratio, d].
-inline GpuBuffer<bf16> expand_kv(
+// with GQA repetition, into a caller-provided buffer (lets callers reuse
+// grow-only scratch instead of allocating per call).
+inline void expand_kv_into(
     sycl::queue& q,
-    const bf16* src, int kv_len, int nkv, int nq, int hd,
-    sycl::queue& alloc_q
+    bf16* dst,
+    const bf16* src, int kv_len, int nkv, int nq, int hd
 ) {
     int gqa_ratio = nq / nkv;
-    GpuBuffer<bf16> out((size_t)nq * kv_len * hd, alloc_q);
     q.submit([&](sycl::handler& h) {
-        bf16* dst = out.data();
         h.parallel_for(sycl::range<3>(nq, kv_len, hd), [=](sycl::id<3> id) {
             int qh = id[0], t = id[1], d = id[2];
             int kvh = qh / gqa_ratio;
             dst[(qh * kv_len + t) * hd + d] = src[(t * nkv + kvh) * hd + d];
         });
     });
+}
+
+// Expand K or V from (kv_len, nkv, hd) time-major to (nq, kv_len, hd) head-major
+// with GQA repetition: expanded[h, t, d] = src[t, h/gqa_ratio, d].
+inline GpuBuffer<bf16> expand_kv(
+    sycl::queue& q,
+    const bf16* src, int kv_len, int nkv, int nq, int hd,
+    sycl::queue& alloc_q
+) {
+    GpuBuffer<bf16> out((size_t)nq * kv_len * hd, alloc_q);
+    expand_kv_into(q, out.data(), src, kv_len, nkv, nq, hd);
     return out;
 }
 
@@ -65,3 +81,5 @@ inline void scatter_ctx(
         });
     });
 }
+
+} // namespace qwen35moe_kernels

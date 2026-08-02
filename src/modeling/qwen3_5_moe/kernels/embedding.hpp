@@ -3,6 +3,12 @@
 #include "runtime/gpu/buffer.hpp"
 #include <cmath>
 
+// Model-local namespace: these kernels are per-model COPIES (see
+// AGENTS.md model isolation). Global-scope inline functions with
+// identical names in other models would ODR-merge at link time;
+// divergent bodies (e.g. tiled attention) then crash at runtime.
+namespace qwen35moe_kernels {
+
 // Embedding lookup with scaling.
 // out[i, :] = table[ids[i], :] * scale
 // scale = sqrt(hidden_size) per Gemma convention.
@@ -24,3 +30,5 @@ inline void embedding_lookup(
         });
     });
 }
+
+} // namespace qwen35moe_kernels

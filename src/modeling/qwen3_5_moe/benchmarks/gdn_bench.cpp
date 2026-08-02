@@ -5,13 +5,15 @@
 //   host:   host_chunk_gated_delta_rule   (download + scalar fp32 + upload)
 //   device: qwen_gdn_device_chunk         (SYCL chunked kernel, one WG/head)
 //   xmx:    qwen_gdn_device_chunk_xmx     (same, matmuls on XMX via DPAS)
-// This is the exact region swapped by QWEN35_GDN_IMPL=host|device|xmx in
+//   hybrid: qwen_gdn_device_chunk_hybrid  (oneDNN batched Gram + parallel
+//           T-solve + 2-WG/head persistent fp32-SLM state pass)
+// This is the exact region swapped by QWEN35_GDN_IMPL=host|device|xmx|hybrid in
 // qwen_linear_attn_forward. Numerics are checked against the host path
 // (core output bf16 + final fp32 SSM state). Never end-to-end inference.
 // Registered as `qwen35-gdn` in the unified kernel_bench binary.
 //
 // Run:
-//   ./build/arcaine_kbench qwen35-gdn -p 512,1024,2048,4096 --kernels host,device,xmx
+//   ./build/arcaine_kbench qwen35-gdn -p 512,1024,2048,4096 --kernels host,device,xmx,hybrid
 
 #include "benchmarks/registry.hpp"
 #include "benchmarks/util.hpp"
@@ -49,7 +51,7 @@ void usage(const char* program) {
         "  -n, --n <N>       operations per timed sample  (default: 1)\n"
         "  -w, --w <N>       warmup runs per cell         (default: 1)\n"
         "  -r, --r <N>       timed runs per cell          (default: 2)\n"
-        "  --kernels <csv>   host,device,xmx              (default: all three)\n"
+        "  --kernels <csv>   host,device,xmx,hybrid        (default: all four)\n"
         "  --device <N>      visible GPU via ZE_AFFINITY_MASK\n"
         "  --seed <S>        synthetic input seed         (default: 42)\n"
         "  --md              emit a markdown table\n",
@@ -59,7 +61,7 @@ void usage(const char* program) {
 int run(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string p_csv = "512,1024,2048,4096";
-    std::string kernels_csv = "host,device,xmx";
+    std::string kernels_csv = "host,device,xmx,hybrid";
     std::string device;
     int warmup = 1;
     int runs = 2;
@@ -109,8 +111,8 @@ int run(int argc, char** argv) {
         for (int tokens : token_counts)
             if (tokens <= 0) throw std::runtime_error("-p values must be positive");
         for (const std::string& k : kernels)
-            if (k != "host" && k != "device" && k != "xmx")
-                throw std::runtime_error("unknown kernel '" + k + "' (use: host, device, xmx)");
+            if (k != "host" && k != "device" && k != "xmx" && k != "hybrid")
+                throw std::runtime_error("unknown kernel '" + k + "' (use: host, device, xmx, hybrid)");
         if (!device.empty()) gpu_device_control::apply_device_index(device);
 
         auto& context = GpuEngine::get(0);
@@ -193,12 +195,17 @@ int run(int argc, char** argv) {
             for (const std::string& kernel : kernels) {
                 auto run_once = [&] {
                     ssm.upload(state0.data(), state_elems);
-                    if (kernel == "device" || kernel == "xmx") {
+                    if (kernel == "device" || kernel == "xmx" || kernel == "hybrid") {
                         if (kernel == "xmx")
                             qwen_gdn_device_chunk_xmx(queue, qbuf.data(), kbuf.data(),
                                                       vbuf.data(), bbuf.data(), gbuf.data(),
                                                       ssm.data(), core.data(),
                                                       tokens, kNV, kDK, kDV, kChunk);
+                        else if (kernel == "hybrid")
+                            qwen_gdn_device_chunk_hybrid(context, qbuf.data(), kbuf.data(),
+                                                         vbuf.data(), bbuf.data(), gbuf.data(),
+                                                         ssm.data(), core.data(),
+                                                         tokens, kNV, kDK, kDV, kChunk);
                         else
                             qwen_gdn_device_chunk(queue, qbuf.data(), kbuf.data(),
                                                   vbuf.data(), bbuf.data(), gbuf.data(),
@@ -235,6 +242,32 @@ int run(int argc, char** argv) {
                     float error = std::fabs(actual_state[i] - ref_state[i]);
                     state_rel = std::max(state_rel,
                                          error / std::max(1e-3f, std::fabs(ref_state[i])));
+                }
+
+                // QWEN35_GDN_DUMP=<dir>: dump per-kernel ref/actual state+core
+                // (f32 binaries) for offline error localization.
+                if (const char* dir = std::getenv("QWEN35_GDN_DUMP")) {
+                    auto dump = [&](const char* tag, const float* p, size_t n) {
+                        std::string f = std::string(dir) + "/" + tag + ".f32";
+                        if (FILE* fp = std::fopen(f.c_str(), "wb")) {
+                            std::fwrite(p, sizeof(float), n, fp);
+                            std::fclose(fp);
+                        }
+                    };
+                    std::vector<float> rc(core_elems), ac(core_elems);
+                    for (size_t i = 0; i < core_elems; ++i) {
+                        rc[i] = bf16_to_float(ref_core[i]);
+                        ac[i] = bf16_to_float(actual[i]);
+                    }
+                    char tag[256];
+                    std::snprintf(tag, sizeof tag, "state_p%d_%s_ref", tokens, kernel.c_str());
+                    dump(tag, ref_state.data(), state_elems);
+                    std::snprintf(tag, sizeof tag, "state_p%d_%s_act", tokens, kernel.c_str());
+                    dump(tag, actual_state.data(), state_elems);
+                    std::snprintf(tag, sizeof tag, "core_p%d_%s_ref", tokens, kernel.c_str());
+                    dump(tag, rc.data(), core_elems);
+                    std::snprintf(tag, sizeof tag, "core_p%d_%s_act", tokens, kernel.c_str());
+                    dump(tag, ac.data(), core_elems);
                 }
 
                 for (int i = 0; i < warmup; ++i)

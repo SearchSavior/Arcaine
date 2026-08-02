@@ -1,10 +1,13 @@
 // Qwen3.5-MoE AWQ INT4 routed-experts kernel benchmark. Loads one real MoE
 // layer from the AWQ checkpoint (router + 256 INT4 routed experts) and
 // benchmarks only the routed-expert stage (host top-k already done):
-//   onednn: per-expert matmul_int4 + host scatter (qwen_routed_experts_forward)
-//   dpas:   grouped W4A16 DPAS kernels (qwen_routed_experts_forward_dpas)
+//   onednn:  per-expert oneDNN u4zp matmuls + host scatter
+//            (qwen_routed_experts_forward; the numerical reference)
+//   dpas:    grouped W4A16 DPAS kernels (qwen_routed_experts_forward_dpas)
+//   grouped: oneDNN experimental grouped W4A16 matmuls
+//            (qwen_routed_experts_forward_grouped)
 // never end-to-end inference. This is the exact region swapped by
-// QWEN35_MOE_INT4_IMPL=onednn|dpas in qwen_moe_forward.
+// QWEN35_MOE_INT4_IMPL=onednn|dpas|grouped in qwen_moe_forward.
 // Registered as `qwen35-awq-int4-moe` in the unified kernel_bench binary.
 //
 // Run:
@@ -49,7 +52,7 @@ void usage(const char* program) {
         "  -n, --n <N>       operations per timed sample  (default: 1)\n"
         "  -w, --w <N>       warmup runs per cell         (default: 1)\n"
         "  -r, --r <N>       timed runs per cell          (default: 3)\n"
-        "  --kernels <csv>   onednn,dpas                  (default: both)\n"
+        "  --kernels <csv>   onednn,dpas,grouped           (default: all three)\n"
         "  --layer <N>       decoder layer to load        (default: 0)\n"
         "  --device <N>      visible GPU via ZE_AFFINITY_MASK\n"
         "  --seed <S>        synthetic input seed         (default: 42)\n"
@@ -89,7 +92,7 @@ int run(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string model = "/workspace/models/cyankiwi_Qwen-AgentWorld-35B-A3B-AWQ-INT4";
     std::string p_csv = "1,8,64,512";
-    std::string kernels_csv = "onednn,dpas";
+    std::string kernels_csv = "onednn,dpas,grouped";
     std::string device;
     int warmup = 1;
     int runs = 3;
@@ -144,8 +147,8 @@ int run(int argc, char** argv) {
         for (int tokens : token_counts)
             if (tokens <= 0) throw std::runtime_error("-p values must be positive");
         for (const std::string& k : kernels)
-            if (k != "onednn" && k != "dpas")
-                throw std::runtime_error("unknown kernel '" + k + "' (use: onednn, dpas)");
+            if (k != "onednn" && k != "dpas" && k != "grouped")
+                throw std::runtime_error("unknown kernel '" + k + "' (use: onednn, dpas, grouped)");
         if (!device.empty()) gpu_device_control::apply_device_index(device);
 
         QwenConfig cfg = QwenConfig::from_dir(model);
@@ -167,43 +170,7 @@ int run(int argc, char** argv) {
         QwenMoE w;
         w.router_gate = upload(checkpoint.get(mp + "gate.weight"), queue,
                                (mp + "gate.weight").c_str());
-        w.experts_gate_up.reserve(E);
-        w.experts_down.reserve(E);
-        for (int e = 0; e < E; ++e) {
-            const std::string ep = mp + "experts." + std::to_string(e) + ".";
-            w.experts_gate_up.push_back(
-                qwen_awq::upload_linear_pair(checkpoint, ep + "gate_proj",
-                                             ep + "up_proj", queue));
-            w.experts_down.push_back(
-                qwen_awq::upload_linear(checkpoint, ep + "down_proj", queue));
-        }
-        // Grouped-DPAS pointer tables (same construction as loader.cpp).
-        {
-            std::vector<const uint8_t*> gu_w(E), dn_w(E);
-            std::vector<const bf16*> gu_s(E), dn_s(E), gu_zp(E), dn_zp(E);
-            for (int e = 0; e < E; ++e) {
-                const auto& gu = std::get<Int4Linear>(w.experts_gate_up[e]);
-                const auto& dn = std::get<Int4Linear>(w.experts_down[e]);
-                gu_w[e]  = gu.weight_packed.data();
-                dn_w[e]  = dn.weight_packed.data();
-                gu_s[e]  = gu.weight_scale.data();
-                dn_s[e]  = dn.weight_scale.data();
-                gu_zp[e] = gu.has_zp() ? gu.zp_offset.data() : nullptr;
-                dn_zp[e] = dn.has_zp() ? dn.zp_offset.data() : nullptr;
-            }
-            w.dpas_gu_w  = GpuBuffer<const uint8_t*>(E, queue);
-            w.dpas_dn_w  = GpuBuffer<const uint8_t*>(E, queue);
-            w.dpas_gu_s  = GpuBuffer<const bf16*>(E, queue);
-            w.dpas_dn_s  = GpuBuffer<const bf16*>(E, queue);
-            w.dpas_gu_zp = GpuBuffer<const bf16*>(E, queue);
-            w.dpas_dn_zp = GpuBuffer<const bf16*>(E, queue);
-            w.dpas_gu_w.upload(gu_w.data(), E);
-            w.dpas_dn_w.upload(dn_w.data(), E);
-            w.dpas_gu_s.upload(gu_s.data(), E);
-            w.dpas_dn_s.upload(dn_s.data(), E);
-            w.dpas_gu_zp.upload(gu_zp.data(), E);
-            w.dpas_dn_zp.upload(dn_zp.data(), E);
-        }
+        w.grouped = qwen_awq::upload_experts_grouped(checkpoint, mp, E, queue);
 
         // Synthetic hidden states (post-attention-normed magnitude ~[-1, 1)).
         std::vector<bf16> host_input((size_t)max_tokens * H);
@@ -241,6 +208,13 @@ int run(int argc, char** argv) {
             std::vector<float> wgt((size_t)pairs);
             host_route(scores_h, tokens, E, top_k, idx, wgt);
 
+            // Device routing buffers: the grouped/dpas production paths
+            // consume device idx/wgt (qwen_moe_router_topk output).
+            GpuBuffer<int32_t> idx_d((size_t)pairs, queue);
+            GpuBuffer<float>   wgt_d((size_t)pairs, queue);
+            idx_d.upload(reinterpret_cast<const int32_t*>(idx.data()), pairs);
+            wgt_d.upload(wgt.data(), pairs);
+
             // Reference: production oneDNN per-expert path (host fp32 accum).
             std::vector<float> ref_h((size_t)tokens * H, 0.0f);
             qwen_routed_experts_forward(context, w, hidden.data(), idx, wgt,
@@ -253,8 +227,13 @@ int run(int argc, char** argv) {
                 auto run = [&] {
                     if (kernel == "dpas") {
                         qwen_routed_experts_forward_dpas(
-                            context, w, hidden.data(), idx, wgt, out.data(),
-                            tokens, cfg);
+                            context, w, hidden.data(), idx_d.data(),
+                            wgt_d.data(), out.data(), tokens, cfg);
+                        queue.wait();
+                    } else if (kernel == "grouped") {
+                        qwen_routed_experts_forward_grouped(
+                            context, w.grouped, hidden.data(), idx_d.data(),
+                            wgt_d.data(), out.data(), tokens, top_k);
                         queue.wait();
                     } else {
                         std::vector<float> acc((size_t)tokens * H, 0.0f);
@@ -323,5 +302,5 @@ int run(int argc, char** argv) {
 }  // namespace
 
 REGISTER_BENCH("qwen35-awq-int4-moe",
-    "Qwen3.5-MoE AWQ INT4 routed experts (onednn per-expert / grouped xe2-dpas)",
+    "Qwen3.5-MoE AWQ INT4 routed experts (onednn per-expert u4zp / grouped xe2-dpas / onednn grouped)",
     run)
