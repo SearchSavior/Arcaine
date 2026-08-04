@@ -151,6 +151,50 @@ int resolve_diffusion_split_layer(const DiffConfig& cfg, const DiffPlacementOpti
     return split_layer;
 }
 
+std::vector<int> parse_expert_ranges(const std::string& csv) {
+    std::vector<int> counts;
+    size_t pos = 0;
+    while (pos <= csv.size()) {
+        size_t comma = csv.find(',', pos);
+        std::string tok = csv.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (tok.empty())
+            throw std::runtime_error("--experts ranges: expected comma-separated counts, got '" + csv + "'");
+        int n;
+        try {
+            n = std::stoi(tok);
+        } catch (...) {
+            throw std::runtime_error("--experts ranges: invalid count '" + tok + "'");
+        }
+        if (n < 0)
+            throw std::runtime_error("--experts ranges: counts must be non-negative, got '" + tok + "'");
+        counts.push_back(n);
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return counts;
+}
+
+std::vector<std::pair<int, int>> expert_shard_bounds(int E, int G, const std::vector<int>& counts) {
+    std::vector<std::pair<int, int>> bounds(G);
+    if (counts.empty()) {
+        for (int g = 0; g < G; ++g)
+            bounds[g] = {g * E / G, (g + 1) * E / G};
+        return bounds;
+    }
+    if ((int)counts.size() != G)
+        throw std::runtime_error("--experts ranges: got " + std::to_string(counts.size()) +
+                                 " counts but " + std::to_string(G) + " GPU engine(s) are available");
+    int first = 0;
+    for (int g = 0; g < G; ++g) {
+        bounds[g] = {first, first + counts[g]};
+        first += counts[g];
+    }
+    if (first != E)
+        throw std::runtime_error("--experts ranges: counts sum to " + std::to_string(first) +
+                                 " but the model has " + std::to_string(E) + " experts");
+    return bounds;
+}
+
 void print_diffusion_placement(const DiffConfig& cfg, int split_layer, const DiffPlacementOptions& placement) {
     int G = GpuEngine::count();
     int L = cfg.text.num_hidden_layers;
@@ -167,11 +211,9 @@ void print_diffusion_placement(const DiffConfig& cfg, int split_layer, const Dif
 
     size_t expert_layer = expert_bytes_per_layer(cfg.text, cfg.is_nvfp4_quantized());
     if (expert_mode == DiffExpertPlacementMode::Shard) {
-        for (int g = 0; g < G; ++g) {
-            int first = g * E / G;
-            int last = (g + 1) * E / G;
-            expert_bytes[g] = expert_layer * (size_t)(last - first) / (size_t)E * (size_t)L;
-        }
+        auto bounds = expert_shard_bounds(E, G, placement.expert_counts);
+        for (int g = 0; g < G; ++g)
+            expert_bytes[g] = expert_layer * (size_t)(bounds[g].second - bounds[g].first) / (size_t)E * (size_t)L;
     } else {
         for (int l = 0; l < L; ++l) {
             int owner = (l < split_layer) ? 0 : 1;
@@ -206,11 +248,9 @@ void print_diffusion_placement(const DiffConfig& cfg, int split_layer, const Dif
 
     std::printf("[placement] experts:\n");
     if (expert_mode == DiffExpertPlacementMode::Shard) {
-        for (int g = 0; g < G; ++g) {
-            int first = g * E / G;
-            int last = (g + 1) * E / G;
-            std::printf("[placement]   GPU%d: experts [%d, %d) for each MoE layer\n", g, first, last);
-        }
+        auto bounds = expert_shard_bounds(E, G, placement.expert_counts);
+        for (int g = 0; g < G; ++g)
+            std::printf("[placement]   GPU%d: experts [%d, %d) for each MoE layer\n", g, bounds[g].first, bounds[g].second);
     } else {
         for (int l = 0; l < L; ++l) {
             int owner = (l < split_layer) ? 0 : 1;

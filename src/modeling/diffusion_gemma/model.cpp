@@ -120,7 +120,8 @@ DiffusionGemmaModel::DiffusionGemmaModel(const std::string& model_dir, int max_s
 
     embed_scale_ = bf16_to_float(float_to_bf16(std::sqrt((float)cfg_.text.hidden_size)));
 
-    w_      = load_diffusion_weights(model_dir, cfg_, split_layer_, resolved_placement.expert_mode);
+    w_      = load_diffusion_weights(model_dir, cfg_, split_layer_, resolved_placement.expert_mode,
+                                     resolved_placement.expert_counts);
     enc_kv_ = DiffKvCache(cfg_, max_seq_len, split_layer_);
     reserve_activation_arenas(cfg_, max_seq_len);
 }

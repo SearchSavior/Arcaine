@@ -8,6 +8,11 @@ set(ARCAINE_SYCL_TARGETS "" CACHE STRING
     "Optional DPC++ SYCL AOT target list, e.g. intel_gpu_bmg_g31")
 if(ARCAINE_SYCL_TARGETS)
     set(ARCAINE_SYCL_TARGET_FLAG "-fsycl-targets=${ARCAINE_SYCL_TARGETS}")
+    # AOT gen targets use the spir64_gen triple; icpx cannot deduce the triple
+    # for -Xspirv-translator when explicit -fsycl-targets are given.
+    set(ARCAINE_SPIRV_TRANSLATOR_FLAG "-Xspirv-translator=spir64_gen")
+else()
+    set(ARCAINE_SPIRV_TRANSLATOR_FLAG "-Xspirv-translator")
 endif()
 
 # Build with the Intel DPC++/SYCL compiler. Configure with:
@@ -104,7 +109,7 @@ target_compile_options(gemma4 PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2
 target_link_options(gemma4   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # ARCH_SRCS now pulls qwen3_5_moe (NVFP4 loader) + common/quant_loader.cpp, both
 # of which include nvfp4.hpp -> __spirv_SubgroupMatrixMultiplyAccumulateINTEL.
-target_link_options(gemma4 PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(gemma4 PRIVATE ${ARCAINE_SPIRV_TRANSLATOR_FLAG} -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(gemma4 PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(gemma4 PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
@@ -130,7 +135,7 @@ add_executable(arcaine_mbench src/arcaine_mbench.cpp ${COMMON_SRCS} ${ARCH_SRCS}
 target_compile_options(arcaine_mbench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_mbench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # See gemma4: ARCH_SRCS / COMMON_SRCS include nvfp4.hpp-bearing loader TUs.
-target_link_options(arcaine_mbench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(arcaine_mbench PRIVATE ${ARCAINE_SPIRV_TRANSLATOR_FLAG} -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(arcaine_mbench PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(arcaine_mbench PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
@@ -161,7 +166,7 @@ set(DIFFUSION_SRCS
 add_executable(diffusion_gemma src/diffusion_main.cpp ${DIFFUSION_SRCS})
 target_compile_options(diffusion_gemma PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_gemma   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(diffusion_gemma PRIVATE ${ARCAINE_SPIRV_TRANSLATOR_FLAG} -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
 # OpenAI-compatible HTTP API server. Single binary serving every registered
 # architecture: dispatches by config.json::model_type at startup.
@@ -182,13 +187,13 @@ add_executable(arcaine_server
     src/register_builtins.cpp)
 target_compile_options(arcaine_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(arcaine_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(arcaine_server PRIVATE ${ARCAINE_SPIRV_TRANSLATOR_FLAG} -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
 # llama-bench style throughput benchmark (loads once, sweeps expert kernels).
 add_executable(diffusion_bench src/diffusion_bench.cpp ${DIFFUSION_SRCS})
 target_compile_options(diffusion_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_bench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(diffusion_bench PRIVATE ${ARCAINE_SPIRV_TRANSLATOR_FLAG} -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
 target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
 target_link_libraries(arcaine_server PRIVATE DNNL::dnnl soxr onnxruntime)
@@ -212,6 +217,7 @@ set(KBENCH_SRCS
     src/bench/qwen35_delta_decode_fusion_bench.cpp
     src/bench/nvfp4_roofline_bench.cpp
     src/bench/diffusion_int4_fusion_bench.cpp
+    src/bench/diffusion_int4_grouped_moe_bench.cpp
     # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
     src/common/gpu/nvfp4_session.cpp)
@@ -220,7 +226,6 @@ target_compile_options(arcaine_kbench PRIVATE
     -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_kbench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_kbench PRIVATE
-    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+    ${ARCAINE_SPIRV_TRANSLATOR_FLAG} -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 target_link_libraries(arcaine_kbench PRIVATE DNNL::dnnl)
-
 
