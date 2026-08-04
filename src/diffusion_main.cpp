@@ -104,7 +104,10 @@ static void apply_experts_spec(const std::string& value, DiffPlacementOptions& p
         placement.expert_mode = DiffExpertPlacementMode::Shard;
     } else if (value == "local") {
         throw std::runtime_error("--experts local was renamed; use --experts layer-owner");
-    } else if (value == "replicate" || value.rfind("ranges:", 0) == 0 || value.rfind("gpus:", 0) == 0) {
+    } else if (value.rfind("ranges:", 0) == 0) {
+        placement.expert_mode = DiffExpertPlacementMode::Shard;
+        placement.expert_counts = parse_expert_ranges(value.substr(7));
+    } else if (value == "replicate" || value.rfind("gpus:", 0) == 0) {
         unsupported_placement_value("--experts", value);
     } else {
         throw std::runtime_error("--experts must be one of: auto, layer-owner, replicate, shard, ranges:N,N,..., gpus:N");

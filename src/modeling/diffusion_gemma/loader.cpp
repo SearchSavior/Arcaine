@@ -616,7 +616,8 @@ static std::vector<float> host_floats(const TensorView& tv) {
 DiffWeights load_diffusion_weights(const std::string& model_dir,
                                    const DiffConfig& cfg,
                                    int split_layer,
-                                   DiffExpertPlacementMode expert_mode) {
+                                   DiffExpertPlacementMode expert_mode,
+                                   const std::vector<int>& expert_counts) {
     std::unique_ptr<TensorSource> source;
     const char* gguf_path = std::getenv("DIFF_GGUF_Q8_WEIGHTS");
     if (gguf_path && gguf_path[0]) {
@@ -715,6 +716,10 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
             int E = cfg.text.num_experts;
             DiffExpertPlacementMode resolved_experts = resolve_expert_placement(expert_mode);
             int G = (resolved_experts == DiffExpertPlacementMode::Shard) ? GpuEngine::count() : 1;
+            std::vector<std::pair<int, int>> bounds =
+                (resolved_experts == DiffExpertPlacementMode::Shard)
+                    ? expert_shard_bounds(E, G, expert_counts)
+                    : std::vector<std::pair<int, int>>{{0, E}};
             bool experts_q8     = sf.has(p + "experts.gate_up_proj") &&
                 sf.get(p + "experts.gate_up_proj").dtype == "Q8_0";
             bool experts_packed = sf.has(p + "experts.0.gate_proj.weight_packed");
@@ -723,8 +728,8 @@ DiffWeights load_diffusion_weights(const std::string& model_dir,
             bool experts_nvfp4  = experts_packed && !experts_int4;
             lw.moe.expert_shards.reserve(G);
             for (int eg = 0; eg < G; ++eg) {
-                int first = (resolved_experts == DiffExpertPlacementMode::Shard) ? eg * E / G : 0;
-                int last  = (resolved_experts == DiffExpertPlacementMode::Shard) ? (eg + 1) * E / G : E;
+                int first = bounds[eg].first;
+                int last  = bounds[eg].second;
                 if (first == last) continue;
                 int shard_gpu = (resolved_experts == DiffExpertPlacementMode::Shard) ? eg : gpu;
                 auto& eq = GpuEngine::get(shard_gpu).queue;

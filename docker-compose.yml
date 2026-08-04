@@ -13,7 +13,7 @@ services:
       dockerfile: .devops/Dockerfile
       args:
         ONEAPI_VERSION: 2025.3.3-0-devel-ubuntu24.04
-        ONEDNN_VERSION: v3.12
+        ONEDNN_VERSION: main
         INSTALL_RUST: "1"
     image: arcaine:latest
 
