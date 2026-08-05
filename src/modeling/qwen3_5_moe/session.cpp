@@ -52,23 +52,6 @@ arcaine::inference::GenerationResult QwenMoeSession::generate(
                                             service_.tokenizer(),
                                             sink, cancel_);
 
-    // Streaming with tools: emit the buffered output as a final delta.
-    bool ok = true;
-    if (inv.stream && inv.has_tools) {
-        if (!r.parsed.tool_calls.empty()) {
-            for (size_t i = 0; i < r.parsed.tool_calls.size() && ok; ++i) {
-                arcaine::inference::ToolCallDeltaEvent tc;
-                tc.index           = static_cast<int>(i);
-                tc.id              = r.parsed.tool_calls[i].id;
-                tc.name            = r.parsed.tool_calls[i].name;
-                tc.arguments_delta = r.parsed.tool_calls[i].arguments;
-                if (!sink.emit(std::move(tc))) ok = false;
-            }
-        } else if (!r.parsed.content.empty()) {
-            if (!sink.emit(arcaine::inference::TextDeltaEvent{r.parsed.content})) ok = false;
-        }
-    }
-
     arcaine::inference::GenerationResult out;
     out.output_token_ids = std::move(r.generated_ids);
     out.text             = std::move(r.parsed.content);

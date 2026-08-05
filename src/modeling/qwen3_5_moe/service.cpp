@@ -23,11 +23,8 @@ arcaine::inference::ModelDescriptor qwen_moe_descriptor() {
         arcaine::inference::InputCapability::Tools);
     d.output_capabilities = static_cast<std::uint32_t>(
         arcaine::inference::OutputCapability::Text |
-        arcaine::inference::OutputCapability::TextDeltas);
-    // NOTE: ToolCalls intentionally NOT declared. The qwen3_5_moe output_parser is
-    // a pass-through stub (native qwen tool-call syntax not yet implemented); the
-    // model cannot produce structured tool_calls. Add ToolCalls back when a
-    // native qwen tool-call parser lands (D2).
+        arcaine::inference::OutputCapability::TextDeltas |
+        arcaine::inference::OutputCapability::ToolCalls);
     d.supports_streaming = true;
     return d;
 }

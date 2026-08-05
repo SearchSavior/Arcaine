@@ -12,4 +12,8 @@ allow = [
     "grep *",
     "awk *",
     "for *",
+    "sed *",
+    "while *",
+    "sort *",
+    "uniq *",
 ]

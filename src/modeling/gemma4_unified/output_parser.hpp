@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "inference/contracts/generation_result.hpp"
@@ -21,6 +22,37 @@ struct Gemma4AssistantOutput {
 };
 
 Gemma4AssistantOutput parse_assistant_output(const std::string& raw_text);
+
+// Incremental stream parser for the Gemma-native format. Feed per-token
+// decoded text; content is emitted as it becomes safe (a potential partial
+// "<|tool_call>" marker at the tail is held back), and each completed
+// <|tool_call>...<tool_call|> block yields one tool-call output carrying the
+// full arguments JSON. Content deltas use the same channel-stripped
+// prefix-diff semantics as the final parse.
+class Gemma4StreamParser {
+public:
+    struct TextDelta { std::string text; };
+    struct ToolCall {
+        int         index = 0;
+        std::string id;
+        std::string name;
+        std::string arguments;  // JSON object string
+    };
+    using Output = std::variant<TextDelta, ToolCall>;
+
+    std::vector<Output> feed(const std::string& text);
+    // Emit anything still held back (truncated tail). Call once at end of
+    // generation.
+    std::vector<Output> flush();
+
+private:
+    bool        in_tool_call_ = false;
+    std::string pending_;      // held-back content suffix (partial marker)
+    std::string tool_buf_;     // accumulates one tool-call block's body
+    int         tool_index_ = 0;
+    std::string content_raw_;  // all content-region text seen so far
+    std::string emitted_;      // stripped content already emitted
+};
 
 class Gemma4BoundaryParser {
 public:

@@ -15,7 +15,7 @@ using json = nlohmann::ordered_json;
 json chunk(const std::string& id, std::time_t created, const std::string& model,
            json delta, json finish_reason = nullptr, json usage = nullptr,
            json metrics = nullptr) {
-    return {
+    json out = {
         {"id", id},
         {"object", "chat.completion.chunk"},
         {"created", created},
@@ -25,9 +25,10 @@ json chunk(const std::string& id, std::time_t created, const std::string& model,
             {"delta", std::move(delta)},
             {"finish_reason", std::move(finish_reason)},
         }})},
-        {"usage", std::move(usage)},
-        {"metrics", std::move(metrics)},
     };
+    if (!usage.is_null())   out["usage"]   = std::move(usage);
+    if (!metrics.is_null()) out["metrics"] = std::move(metrics);
+    return out;
 }
 
 json usage_chunk(const std::string& id, std::time_t created, const std::string& model,
@@ -114,8 +115,14 @@ bool SseEventSink::emit(const arcaine::inference::GenerationEvent& ev) {
                     {"decode_throuput", metrics_.decode_throuput},
                     {"duration", metrics_.duration}})
             : json(nullptr);
+        // The final finish chunk always carries usage + metrics, independent
+        // of stream_options.include_usage (which only gates the extra
+        // OpenAI-spec standalone usage chunk below).
+        json usage_json = json({{"prompt_tokens", c.prompt_tokens},
+                                {"completion_tokens", c.completion_tokens},
+                                {"total_tokens", c.prompt_tokens + c.completion_tokens}});
         if (!write_sse(chunk(id_, created_, model_, json::object(),
-                             c.finish_reason, nullptr, metrics_json)))
+                             c.finish_reason, usage_json, metrics_json)))
             return false;
         if (include_usage_ && !write_sse(usage_chunk(id_, created_, model_,
                                                      c.prompt_tokens,

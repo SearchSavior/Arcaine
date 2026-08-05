@@ -321,6 +321,42 @@ void strip_gemma_channels(std::string& content) {
     erase_all(content, channel_end);
 }
 
+// Channel/marker stripping for the content region (the tail of
+// parse_assistant_output after tool-call extraction). Reused by the stream
+// parser so incremental content deltas match the final parsed content.
+std::string strip_content(std::string content) {
+    strip_gemma_channels(content);
+    erase_all(content, "<turn|>");
+    erase_all(content, "<|tool_response>");
+    erase_all(content, "<tool_response|>");
+    erase_all(content, "<eos>");
+    erase_all(content, "<bos>");
+    return trim_copy(content);
+}
+
+// Prefix-diff: emit the newly-arrived suffix of `full` relative to `emitted`.
+// If `full` no longer starts with `emitted` (non-monotonic stripping, e.g. a
+// channel label collapsing once its newline lands), re-emit `full`.
+std::string prefix_delta(const std::string& full, std::string& emitted) {
+    std::string delta;
+    if (full.size() >= emitted.size() &&
+        full.compare(0, emitted.size(), emitted) == 0) {
+        delta = full.substr(emitted.size());
+    } else {
+        delta = full;
+    }
+    emitted = full;
+    return delta;
+}
+
+// Longest suffix of `s` that is a proper prefix of `marker`.
+size_t marker_prefix_suffix_len(const std::string& s, const std::string& marker) {
+    size_t max = std::min(s.size(), marker.size() - 1);
+    for (size_t len = max; len > 0; --len)
+        if (s.compare(s.size() - len, len, marker, 0, len) == 0) return len;
+    return 0;
+}
+
 }  // namespace
 
 Gemma4AssistantOutput parse_assistant_output(const std::string& raw_text) {
@@ -355,6 +391,93 @@ Gemma4AssistantOutput parse_assistant_output(const std::string& raw_text) {
     erase_all(content, "<eos>");
     erase_all(content, "<bos>");
     out.content = trim_copy(content);
+    return out;
+}
+
+std::vector<Gemma4StreamParser::Output>
+Gemma4StreamParser::feed(const std::string& text) {
+    std::vector<Output> out;
+    const std::string kOpen  = "<|tool_call>";
+    const std::string kClose = "<tool_call|>";
+    std::string rest = text;
+
+    while (true) {
+        if (!in_tool_call_) {
+            pending_ += rest;
+            rest.clear();
+            size_t open = pending_.find(kOpen);
+            if (open == std::string::npos) {
+                size_t hold = marker_prefix_suffix_len(pending_, kOpen);
+                size_t safe = pending_.size() - hold;
+                if (safe > 0) {
+                    content_raw_ += pending_.substr(0, safe);
+                    std::string stripped = strip_content(content_raw_);
+                    std::string delta = prefix_delta(stripped, emitted_);
+                    if (!delta.empty()) out.push_back(TextDelta{std::move(delta)});
+                }
+                pending_.erase(0, safe);
+                break;
+            }
+            if (open > 0) {
+                content_raw_ += pending_.substr(0, open);
+                std::string stripped = strip_content(content_raw_);
+                std::string delta = prefix_delta(stripped, emitted_);
+                if (!delta.empty()) out.push_back(TextDelta{std::move(delta)});
+            }
+            tool_buf_ += pending_.substr(open + kOpen.size());
+            pending_.clear();
+            in_tool_call_ = true;
+        }
+
+        tool_buf_ += rest;
+        rest.clear();
+        size_t close = tool_buf_.find(kClose);
+        if (close == std::string::npos) break;
+        try {
+            if (auto call = parse_one_tool_call(tool_buf_.substr(0, close),
+                                                static_cast<size_t>(tool_index_))) {
+                out.push_back(ToolCall{tool_index_, std::move(call->id),
+                                       std::move(call->name),
+                                       std::move(call->arguments)});
+                ++tool_index_;
+            }
+        } catch (const std::exception&) {
+            // Malformed block: drop it. Content is unaffected.
+        }
+        rest = tool_buf_.substr(close + kClose.size());
+        tool_buf_.clear();
+        in_tool_call_ = false;
+        if (rest.empty()) break;
+    }
+    return out;
+}
+
+std::vector<Gemma4StreamParser::Output> Gemma4StreamParser::flush() {
+    std::vector<Output> out;
+    if (in_tool_call_) {
+        // Truncated tool call (hit max_tokens mid-block): best-effort parse.
+        try {
+            if (auto call = parse_one_tool_call(tool_buf_,
+                                                static_cast<size_t>(tool_index_))) {
+                out.push_back(ToolCall{tool_index_, std::move(call->id),
+                                       std::move(call->name),
+                                       std::move(call->arguments)});
+            }
+        } catch (const std::exception&) {}
+        tool_buf_.clear();
+        in_tool_call_ = false;
+    }
+    if (!pending_.empty()) {
+        content_raw_ += pending_;
+        pending_.clear();
+    }
+    if (!content_raw_.empty()) {
+        std::string stripped = strip_content(content_raw_);
+        std::string delta = prefix_delta(stripped, emitted_);
+        if (!delta.empty()) out.push_back(TextDelta{std::move(delta)});
+        content_raw_.clear();
+        emitted_.clear();
+    }
     return out;
 }
 

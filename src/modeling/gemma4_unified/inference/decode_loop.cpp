@@ -15,16 +15,26 @@
 namespace arcaine::gemma4_unified {
 
 namespace {
-std::string channel_delta(const std::string& full, std::string& emitted) {
-    std::string delta;
-    if (full.size() >= emitted.size() &&
-        full.compare(0, emitted.size(), emitted) == 0) {
-        delta = full.substr(emitted.size());
-    } else {
-        delta = full;
+bool emit_stream_outputs(
+    inference::GenerationSink& sink,
+    std::vector<Gemma4StreamParser::Output>&& outputs) {
+    for (auto& o : outputs) {
+        if (std::holds_alternative<Gemma4StreamParser::TextDelta>(o)) {
+            auto& d = std::get<Gemma4StreamParser::TextDelta>(o);
+            if (d.text.empty()) continue;
+            if (!sink.emit(inference::TextDeltaEvent{std::move(d.text)}))
+                return false;
+        } else {
+            auto& tc = std::get<Gemma4StreamParser::ToolCall>(o);
+            inference::ToolCallDeltaEvent ev;
+            ev.index           = tc.index;
+            ev.id              = std::move(tc.id);
+            ev.name            = std::move(tc.name);
+            ev.arguments_delta = std::move(tc.arguments);
+            if (!sink.emit(std::move(ev))) return false;
+        }
     }
-    emitted = full;
-    return delta;
+    return true;
 }
 }  // namespace
 
@@ -52,8 +62,7 @@ Gemma4DecodeResult run_decode_loop(Gemma4Model& model,
     auto tgen0 = Clock::now();
 
     std::mt19937 rng(static_cast<unsigned>(inv.seed));
-    std::string accumulated_text;
-    std::string emitted_content;
+    Gemma4StreamParser stream_parser;
     bool saw_first = false;
     bool ok = true;
 
@@ -71,17 +80,15 @@ Gemma4DecodeResult run_decode_loop(Gemma4Model& model,
         }
         r.generated_ids.push_back(next);
 
-        // Stream content deltas per token (unless buffering for tool calls).
-        if (inv.stream && !inv.has_tools) {
+        // Stream content/tool-call deltas per token; the stream parser holds
+        // back only a potential partial "<|tool_call>" marker suffix and
+        // channel-strips content with the same semantics as the final parse.
+        if (inv.stream) {
             std::vector<int> one{next};
-            accumulated_text += tokenizer.decode_raw(one);
-            Gemma4AssistantOutput parsed = parse_assistant_output(accumulated_text);
-            std::string delta = channel_delta(parsed.content, emitted_content);
-            if (!delta.empty()) {
-                if (!sink.emit(inference::TextDeltaEvent{std::move(delta)})) {
-                    ok = false;
-                    break;
-                }
+            if (!emit_stream_outputs(sink,
+                    stream_parser.feed(tokenizer.decode_raw(one)))) {
+                ok = false;
+                break;
             }
         }
 
@@ -90,15 +97,14 @@ Gemma4DecodeResult run_decode_loop(Gemma4Model& model,
         ++past;
     }
 
+    if (inv.stream && ok)
+        ok = emit_stream_outputs(sink, stream_parser.flush());
+
     r.duration_s = std::chrono::duration<double>(Clock::now() - start).count();
     r.decode_s   = std::chrono::duration<double>(Clock::now() - tgen0).count();
     if (!saw_first && !r.generated_ids.empty()) r.ttft_s = r.duration_s;
 
-    std::string final_raw;
-    if (inv.has_tools)      final_raw = tokenizer.decode_raw(r.generated_ids);
-    else if (inv.stream)    final_raw = accumulated_text;
-    else                    final_raw = tokenizer.decode_raw(r.generated_ids);
-    r.parsed = parse_assistant_output(final_raw);
+    r.parsed = parse_assistant_output(tokenizer.decode_raw(r.generated_ids));
     r.boundary_counts = boundaries.count(r.generated_ids);
     r.prefill_s = prefill_s;
     return r;

@@ -50,27 +50,7 @@ inference::GenerationResult Gemma4Session::generate(
     Gemma4DecodeResult r = run_decode_loop(service_.model(), inv,
                                            service_.tokenizer(),
                                            service_.boundary_parser(),
-                                           sink, cancel_);
-
-    // Streaming with tools: the loop buffered the whole output (no per-token
-    // content deltas). Emit the parsed tool calls (or content fallback) as a
-    // final delta now that the full output is in hand, matching the prior
-    // transport's buffered tool-call streaming contract.
-    bool ok = true;
-    if (inv.stream && inv.has_tools) {
-        if (!r.parsed.tool_calls.empty()) {
-            for (size_t i = 0; i < r.parsed.tool_calls.size() && ok; ++i) {
-                inference::ToolCallDeltaEvent tc;
-                tc.index           = static_cast<int>(i);
-                tc.id              = r.parsed.tool_calls[i].id;
-                tc.name            = r.parsed.tool_calls[i].name;
-                tc.arguments_delta = r.parsed.tool_calls[i].arguments;
-                if (!sink.emit(std::move(tc))) ok = false;
-            }
-        } else if (!r.parsed.content.empty()) {
-            if (!sink.emit(inference::TextDeltaEvent{r.parsed.content})) ok = false;
-        }
-    }
+                                            sink, cancel_);
 
     inference::GenerationResult out;
     out.output_token_ids = std::move(r.generated_ids);
