@@ -5,15 +5,20 @@
 
 #include "../../runtime/gpu/buffer.hpp"
 #include "../../runtime/quantization/fp8.hpp"
+#include "../../runtime/quantization/int4.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"
+
+// Dense projection weight: FP8 (NVFP4 checkpoint attention/GDN) or
+// pack-quantized INT4 W4A16 (AWQ checkpoint).
+using Qwen35Proj = std::variant<Fp8Linear, Int4Linear>;
 
 struct Qwen35FullAttentionWeights {
     bool fused_projections = false;
-    Fp8Linear qkv_proj;
-    Fp8Linear q_proj;
-    Fp8Linear k_proj;
-    Fp8Linear v_proj;
-    Fp8Linear o_proj;
+    Qwen35Proj qkv_proj;
+    Qwen35Proj q_proj;
+    Qwen35Proj k_proj;
+    Qwen35Proj v_proj;
+    Qwen35Proj o_proj;
     GpuBuffer<bf16> q_norm;
     GpuBuffer<bf16> k_norm;
     GpuBuffer<bf16> k_cache_scale;
@@ -22,10 +27,10 @@ struct Qwen35FullAttentionWeights {
 
 struct Qwen35LinearAttentionWeights {
     bool fused_projections = false;
-    Fp8Linear in_proj_qkvz;
-    Fp8Linear in_proj_qkv;
-    Fp8Linear in_proj_z;
-    Fp8Linear out_proj;
+    Qwen35Proj in_proj_qkvz;
+    Qwen35Proj in_proj_qkv;
+    Qwen35Proj in_proj_z;
+    Qwen35Proj out_proj;
     GpuBuffer<bf16> in_proj_a;
     GpuBuffer<bf16> in_proj_b;
     GpuBuffer<bf16> in_proj_ba;
@@ -38,9 +43,8 @@ struct Qwen35LinearAttentionWeights {
 };
 
 struct Qwen35MlpWeights {
-    bool nvfp4 = false;
-    std::variant<Nvfp4Linear, Fp8Linear> gate_up;
-    std::variant<Nvfp4Linear, Fp8Linear> down;
+    std::variant<Nvfp4Linear, Fp8Linear, Int4Linear> gate_up;
+    std::variant<Nvfp4Linear, Fp8Linear, Int4Linear> down;
 };
 
 struct Qwen35LayerWeights {
@@ -102,7 +106,8 @@ struct Qwen35MtpWeights {
 struct Qwen35Weights {
     GpuBuffer<bf16> embed_tokens;
     GpuBuffer<bf16> final_norm;
-    Fp8Linear lm_head;
+    // FP8 (NVFP4 checkpoint) or plain BF16 (AWQ checkpoint, unquantized F16).
+    std::variant<Fp8Linear, GpuBuffer<bf16>> lm_head;
     std::vector<Qwen35LayerWeights> layers;
     Qwen35VisionWeights vision;
     Qwen35MtpWeights mtp;

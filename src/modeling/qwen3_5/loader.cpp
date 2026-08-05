@@ -37,10 +37,15 @@ private:
     mutable std::unordered_set<std::string> consumed_;
 };
 
-void expect_tensor(const TensorSource& source, const std::string& name,
-                   const char* dtype, std::vector<int64_t> shape) {
+
+GpuBuffer<bf16> load_bf16(const TensorSource& source, const std::string& name,
+                           std::vector<int64_t> shape, sycl::queue& queue,
+                           bool add_one = false) {
+    // upload()/upload_plus_one() stage BF16/F16/F32 to BF16 (converting as
+    // needed): the NVFP4 checkpoint stores BF16, the AWQ checkpoint F16.
     const TensorView& view = source.get(name);
-    if (view.dtype != dtype || view.shape != shape) {
+    if (view.shape != shape ||
+        (view.dtype != "BF16" && view.dtype != "F16" && view.dtype != "F32")) {
         std::ostringstream message;
         message << "Unexpected tensor metadata for " << name << ": dtype="
                 << view.dtype << " shape=(";
@@ -51,14 +56,203 @@ void expect_tensor(const TensorSource& source, const std::string& name,
         message << ')';
         throw std::runtime_error(message.str());
     }
+    return add_one ? upload_plus_one(view, queue, name.c_str())
+                   : upload(view, queue, name.c_str());
 }
 
-GpuBuffer<bf16> load_bf16(const TensorSource& source, const std::string& name,
-                          std::vector<int64_t> shape, sycl::queue& queue,
-                          bool add_one = false) {
-    expect_tensor(source, name, "BF16", std::move(shape));
-    return add_one ? upload_plus_one(source.get(name), queue, name.c_str())
-                   : upload(source.get(name), queue, name.c_str());
+// --- compressed-tensors pack-quantized INT4 (AWQ) W4A16 loading -------------
+// Checkpoint tensors per projection:
+//   weight_packed     I32 [N, K/8]  — 8 nibbles/int32 along K, LSB-first,
+//                                     unsigned offset-8
+//   weight_scale      F16 [N, G]    — G = K / group_size (group_size=32)
+//   weight_zero_point I32 [N/8, G]  — 8 nibbles/int32 along N, LSB-first
+// Dequant: w[n,k] = scale[n,g] * (q_u[n,k] - zp_u[n,g]).  Follows the
+// gemma4_unified pattern: rebase nibbles to s4 (XOR 0x88) for oneDNN,
+// transpose scales to (G, N) BF16, precompute zp_offset = scale*(zp_u-8).
+
+float f16_bits_to_float_local(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 127 - 15 + 1;
+            while ((mant & 0x400) == 0) { mant <<= 1; --exp; }
+            mant &= 0x3FF;
+            bits = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000 | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(float));
+    return out;
+}
+
+struct StagedInt4 {
+    int in_features = 0;
+    int out_features = 0;
+    int group_size = 0;
+    int groups = 0;
+    std::vector<uint8_t> packed;   // raw checkpoint bytes, (N, K/2)
+    std::vector<bf16> scale_t;     // (G, N)
+    std::vector<bf16> corr_t;      // (G, N); empty when no zero_point tensor
+};
+
+StagedInt4 stage_int4_linear(const TensorSource& source, const std::string& prefix) {
+    const TensorView& packed = source.get(prefix + ".weight_packed");
+    if (packed.dtype != "I32" || packed.shape.size() != 2)
+        throw std::runtime_error("Expected I32 2D packed weight: " + prefix);
+    StagedInt4 staged;
+    staged.out_features = (int)packed.shape[0];
+    staged.in_features = (int)packed.shape[1] * 8;
+
+    const TensorView& scale = source.get(prefix + ".weight_scale");
+    if (scale.shape.size() != 2 || (int)scale.shape[0] != staged.out_features)
+        throw std::runtime_error("Unexpected int4 scale shape: " + prefix);
+    staged.groups = (int)scale.shape[1];
+    if (staged.groups == 0 || staged.in_features % staged.groups != 0)
+        throw std::runtime_error("int4 in_features not divisible by groups: " + prefix);
+    staged.group_size = staged.in_features / staged.groups;
+
+    auto scale_at = [&](int64_t i) -> float {
+        if (scale.dtype == "F32")
+            return static_cast<const float*>(scale.data)[i];
+        if (scale.dtype == "F16")
+            return f16_bits_to_float_local(
+                static_cast<const uint16_t*>(scale.data)[i]);
+        if (scale.dtype == "BF16")
+            return bf16_to_float(static_cast<const uint16_t*>(scale.data)[i]);
+        throw std::runtime_error("Unexpected int4 scale dtype for " + prefix +
+                                 ": " + scale.dtype);
+    };
+
+    const int32_t* zp = nullptr;
+    if (source.has(prefix + ".weight_zero_point")) {
+        const TensorView& zpv = source.get(prefix + ".weight_zero_point");
+        if (zpv.dtype != "I32" || zpv.shape.size() != 2 ||
+            (int)zpv.shape[0] != staged.out_features / 8 ||
+            (int)zpv.shape[1] != staged.groups)
+            throw std::runtime_error("Unexpected zero_point shape: " + prefix);
+        zp = static_cast<const int32_t*>(zpv.data);
+    }
+
+    // Cross-check the logical shape metadata (also consumes the tensor).
+    const TensorView& shape_meta = source.get(prefix + ".weight_shape");
+    if (shape_meta.shape.size() != 1 || shape_meta.shape[0] != 2 ||
+        shape_meta.dtype != "I64")
+        throw std::runtime_error("Unexpected weight_shape metadata: " + prefix);
+    const int64_t* dims = static_cast<const int64_t*>(shape_meta.data);
+    if (dims[0] != staged.out_features || dims[1] != staged.in_features)
+        throw std::runtime_error("weight_shape disagrees with packed dims: " + prefix);
+
+    staged.packed.resize(packed.nbytes);
+    std::memcpy(staged.packed.data(), packed.data, packed.nbytes);
+
+    int N = staged.out_features, G = staged.groups;
+    staged.scale_t.resize((size_t)G * N);
+    if (zp) staged.corr_t.resize((size_t)G * N);
+    for (int n = 0; n < N; ++n) {
+        int zp_row = n >> 3;
+        int zp_shift = (n & 7) * 4;
+        for (int g = 0; g < G; ++g) {
+            float s = scale_at((size_t)n * G + g);
+            staged.scale_t[(size_t)g * N + n] = float_to_bf16(s);
+            if (zp) {
+                int zp_signed = ((zp[(size_t)zp_row * G + g] >> zp_shift) & 0xF) - 8;
+                staged.corr_t[(size_t)g * N + n] =
+                    float_to_bf16(s * (float)zp_signed);
+            }
+        }
+    }
+    return staged;
+}
+
+Int4Linear upload_int4_staged(const std::vector<StagedInt4>& parts,
+                              sycl::queue& queue) {
+    Int4Linear lin;
+    lin.in_features = parts.front().in_features;
+    lin.group_size = parts.front().group_size;
+    int G = parts.front().groups;
+    bool has_zp = !parts.front().corr_t.empty();
+    size_t packed_bytes = 0;
+    for (const StagedInt4& part : parts) {
+        if (part.in_features != lin.in_features || part.groups != G ||
+            part.group_size != lin.group_size ||
+            !part.corr_t.empty() != has_zp)
+            throw std::runtime_error("Incompatible int4 projections in concat");
+        packed_bytes += part.packed.size();
+        lin.out_features += part.out_features;
+    }
+    int total_n = lin.out_features;
+
+    static std::vector<uint8_t> staging;
+    staging.clear();
+    staging.reserve(packed_bytes);
+    for (const StagedInt4& part : parts)
+        staging.insert(staging.end(), part.packed.begin(), part.packed.end());
+    lin.weight_packed = GpuBuffer<uint8_t>(packed_bytes, queue);
+    sycl::event copy_done =
+        queue.memcpy(lin.weight_packed.data(), staging.data(), packed_bytes);
+    uint8_t* dst = lin.weight_packed.data();
+    queue.submit([&](sycl::handler& h) {
+        h.depends_on(copy_done);
+        h.parallel_for(sycl::range<1>(packed_bytes), [=](sycl::id<1> id) {
+            dst[id[0]] ^= 0x88;
+        });
+    }).wait();
+
+    std::vector<bf16> scale_t((size_t)G * total_n);
+    std::vector<bf16> corr_t(has_zp ? (size_t)G * total_n : 0);
+    size_t offset = 0;
+    for (const StagedInt4& part : parts) {
+        for (int g = 0; g < G; ++g) {
+            std::memcpy(&scale_t[(size_t)g * total_n + offset],
+                        &part.scale_t[(size_t)g * part.out_features],
+                        (size_t)part.out_features * sizeof(bf16));
+            if (has_zp)
+                std::memcpy(&corr_t[(size_t)g * total_n + offset],
+                            &part.corr_t[(size_t)g * part.out_features],
+                            (size_t)part.out_features * sizeof(bf16));
+        }
+        offset += part.out_features;
+    }
+    lin.weight_scale = GpuBuffer<bf16>(scale_t.size(), queue);
+    lin.weight_scale.upload(scale_t.data(), scale_t.size());
+    if (has_zp) {
+        lin.zp_offset = GpuBuffer<bf16>(corr_t.size(), queue);
+        lin.zp_offset.upload(corr_t.data(), corr_t.size());
+    }
+    return lin;
+}
+
+Int4Linear upload_int4_linear_awq(const TensorSource& source,
+                                  const std::string& prefix,
+                                  sycl::queue& queue) {
+    return upload_int4_staged({stage_int4_linear(source, prefix)}, queue);
+}
+
+Int4Linear upload_int4_linear_concat_awq(
+    const TensorSource& source,
+    std::initializer_list<std::string> prefixes,
+    sycl::queue& queue) {
+    std::vector<StagedInt4> parts;
+    parts.reserve(prefixes.size());
+    for (const std::string& prefix : prefixes)
+        parts.push_back(stage_int4_linear(source, prefix));
+    return upload_int4_staged(parts, queue);
+}
+
+void expect_proj(const Qwen35Proj& proj, int in, int out, const std::string& name) {
+    int actual_in = std::visit([](const auto& w) { return w.in_features; }, proj);
+    int actual_out = std::visit([](const auto& w) { return w.out_features; }, proj);
+    if (actual_in != in || actual_out != out)
+        throw std::runtime_error("Unexpected projection shape: " + name);
 }
 
 void expect_fp8(const Fp8Linear& linear, int in, int out, const std::string& name) {
@@ -169,14 +363,22 @@ Qwen35Weights load_qwen35_weights(
     if (split_layer < 0 || split_layer > total_layers) split_layer = total_layers;
 
     auto& queue0 = GpuEngine::get(0).queue;
+    const bool awq_int4 = config.quant_format == "pack-quantized";
     Qwen35Weights weights;
     weights.embed_tokens = load_bf16(
         source, "model.language_model.embed_tokens.weight",
         {c.vocab_size, c.hidden_size}, queue0);
     weights.final_norm = load_bf16(
         source, "model.language_model.norm.weight", {c.hidden_size}, queue0, true);
-    weights.lm_head = upload_fp8_linear(source, "lm_head", queue0);
-    expect_fp8(weights.lm_head, c.hidden_size, c.vocab_size, "lm_head");
+    if (awq_int4) {
+        // lm_head is in the AWQ ignore list: unquantized F16 -> BF16.
+        weights.lm_head = load_bf16(source, "lm_head.weight",
+                                    {c.vocab_size, c.hidden_size}, queue0);
+    } else {
+        weights.lm_head = upload_fp8_linear(source, "lm_head", queue0);
+        expect_fp8(std::get<Fp8Linear>(weights.lm_head), c.hidden_size,
+                   c.vocab_size, "lm_head");
+    }
 
     weights.layers.reserve(max_layers);
     for (int i = 0; i < max_layers; ++i) {
@@ -196,32 +398,59 @@ Qwen35Weights load_qwen35_weights(
             std::string prefix = layer_prefix + "self_attn.";
             Qwen35FullAttentionWeights attention;
             attention.fused_projections = fused_fp8_projections_enabled();
-            if (attention.fused_projections)
-                attention.qkv_proj = upload_fp8_linear_concat(
-                    source, {prefix + "q_proj", prefix + "k_proj",
-                             prefix + "v_proj"}, queue);
-            else {
-                attention.q_proj = upload_fp8_linear(source, prefix + "q_proj", queue);
-                attention.k_proj = upload_fp8_linear(source, prefix + "k_proj", queue);
-                attention.v_proj = upload_fp8_linear(source, prefix + "v_proj", queue);
+            if (awq_int4) {
+                if (attention.fused_projections)
+                    attention.qkv_proj = upload_int4_linear_concat_awq(
+                        source, {prefix + "q_proj", prefix + "k_proj",
+                                 prefix + "v_proj"}, queue);
+                else {
+                    attention.q_proj = upload_int4_linear_awq(source, prefix + "q_proj", queue);
+                    attention.k_proj = upload_int4_linear_awq(source, prefix + "k_proj", queue);
+                    attention.v_proj = upload_int4_linear_awq(source, prefix + "v_proj", queue);
+                }
+                attention.o_proj = upload_int4_linear_awq(source, prefix + "o_proj", queue);
+            } else {
+                if (attention.fused_projections)
+                    attention.qkv_proj = upload_fp8_linear_concat(
+                        source, {prefix + "q_proj", prefix + "k_proj",
+                                 prefix + "v_proj"}, queue);
+                else {
+                    attention.q_proj = upload_fp8_linear(source, prefix + "q_proj", queue);
+                    attention.k_proj = upload_fp8_linear(source, prefix + "k_proj", queue);
+                    attention.v_proj = upload_fp8_linear(source, prefix + "v_proj", queue);
+                }
+                attention.o_proj = upload_fp8_linear(source, prefix + "o_proj", queue);
             }
-            attention.o_proj = upload_fp8_linear(source, prefix + "o_proj", queue);
             int q_out = c.num_attention_heads * c.head_dim * 2;
             int kv_out = c.num_key_value_heads * c.head_dim;
             int attn_out = c.num_attention_heads * c.head_dim;
             if (attention.fused_projections)
-                expect_fp8(attention.qkv_proj, c.hidden_size, q_out + 2 * kv_out,
+                expect_proj(attention.qkv_proj, c.hidden_size, q_out + 2 * kv_out,
                             prefix + "qkv_proj");
             else {
-                expect_fp8(attention.q_proj, c.hidden_size, q_out, prefix + "q_proj");
-                expect_fp8(attention.k_proj, c.hidden_size, kv_out, prefix + "k_proj");
-                expect_fp8(attention.v_proj, c.hidden_size, kv_out, prefix + "v_proj");
+                expect_proj(attention.q_proj, c.hidden_size, q_out, prefix + "q_proj");
+                expect_proj(attention.k_proj, c.hidden_size, kv_out, prefix + "k_proj");
+                expect_proj(attention.v_proj, c.hidden_size, kv_out, prefix + "v_proj");
             }
-            expect_fp8(attention.o_proj, attn_out, c.hidden_size, prefix + "o_proj");
+            expect_proj(attention.o_proj, attn_out, c.hidden_size, prefix + "o_proj");
             attention.q_norm = load_bf16(source, prefix + "q_norm.weight", {c.head_dim}, queue, true);
             attention.k_norm = load_bf16(source, prefix + "k_norm.weight", {c.head_dim}, queue, true);
-            attention.k_cache_scale = load_bf16(source, prefix + "k_scale", {1}, queue);
-            attention.v_cache_scale = load_bf16(source, prefix + "v_scale", {1}, queue);
+            // FP8 KV-cache scales only exist in the NVFP4 checkpoint.
+            if (source.has(prefix + "k_scale")) {
+                attention.k_cache_scale = load_bf16(source, prefix + "k_scale", {1}, queue);
+                attention.v_cache_scale = load_bf16(source, prefix + "v_scale", {1}, queue);
+            } else {
+                attention.k_cache_scale = GpuBuffer<bf16>(1, queue);
+                attention.v_cache_scale = GpuBuffer<bf16>(1, queue);
+                bf16* k_scale = attention.k_cache_scale.data();
+                bf16* v_scale = attention.v_cache_scale.data();
+                queue.submit([&](sycl::handler& h) {
+                    h.single_task([=]() {
+                        k_scale[0] = float_to_bf16(1.0f);
+                        v_scale[0] = float_to_bf16(1.0f);
+                    });
+                });
+            }
             layer.mixer = std::move(attention);
         } else {
             std::string prefix = layer_prefix + "linear_attn.";
@@ -230,26 +459,40 @@ Qwen35Weights load_qwen35_weights(
             int value_dim = c.linear_num_value_heads * c.linear_value_head_dim;
             int conv_dim = 2 * key_dim + value_dim;
             attention.fused_projections = fused_fp8_projections_enabled();
-            if (attention.fused_projections)
-                attention.in_proj_qkvz = upload_fp8_linear_concat(
-                    source, {prefix + "in_proj_qkv", prefix + "in_proj_z"}, queue);
-            else {
-                attention.in_proj_qkv = upload_fp8_linear(
-                    source, prefix + "in_proj_qkv", queue);
-                attention.in_proj_z = upload_fp8_linear(
-                    source, prefix + "in_proj_z", queue);
+            if (awq_int4) {
+                if (attention.fused_projections)
+                    attention.in_proj_qkvz = upload_int4_linear_concat_awq(
+                        source, {prefix + "in_proj_qkv", prefix + "in_proj_z"}, queue);
+                else {
+                    attention.in_proj_qkv = upload_int4_linear_awq(
+                        source, prefix + "in_proj_qkv", queue);
+                    attention.in_proj_z = upload_int4_linear_awq(
+                        source, prefix + "in_proj_z", queue);
+                }
+                attention.out_proj = upload_int4_linear_awq(
+                    source, prefix + "out_proj", queue);
+            } else {
+                if (attention.fused_projections)
+                    attention.in_proj_qkvz = upload_fp8_linear_concat(
+                        source, {prefix + "in_proj_qkv", prefix + "in_proj_z"}, queue);
+                else {
+                    attention.in_proj_qkv = upload_fp8_linear(
+                        source, prefix + "in_proj_qkv", queue);
+                    attention.in_proj_z = upload_fp8_linear(
+                        source, prefix + "in_proj_z", queue);
+                }
+                attention.out_proj = upload_fp8_linear(source, prefix + "out_proj", queue);
             }
-            attention.out_proj = upload_fp8_linear(source, prefix + "out_proj", queue);
             if (attention.fused_projections)
-                expect_fp8(attention.in_proj_qkvz, c.hidden_size,
+                expect_proj(attention.in_proj_qkvz, c.hidden_size,
                             conv_dim + value_dim, prefix + "in_proj_qkvz");
             else {
-                expect_fp8(attention.in_proj_qkv, c.hidden_size, conv_dim,
+                expect_proj(attention.in_proj_qkv, c.hidden_size, conv_dim,
                             prefix + "in_proj_qkv");
-                expect_fp8(attention.in_proj_z, c.hidden_size, value_dim,
+                expect_proj(attention.in_proj_z, c.hidden_size, value_dim,
                             prefix + "in_proj_z");
             }
-            expect_fp8(attention.out_proj, value_dim, c.hidden_size, prefix + "out_proj");
+            expect_proj(attention.out_proj, value_dim, c.hidden_size, prefix + "out_proj");
             attention.in_proj_a = load_bf16(source, prefix + "in_proj_a.weight",
                                              {c.linear_num_value_heads, c.hidden_size}, queue);
             attention.in_proj_b = load_bf16(source, prefix + "in_proj_b.weight",
@@ -293,8 +536,19 @@ Qwen35Weights load_qwen35_weights(
         }
 
         std::string mlp = layer_prefix + "mlp.";
-        if (source.has(mlp + "gate_proj.weight_packed")) {
-            layer.mlp.nvfp4 = true;
+        if (awq_int4) {
+            Int4Linear gate_up = upload_int4_linear_concat_awq(
+                source, {mlp + "gate_proj", mlp + "up_proj"}, queue);
+            Int4Linear down = upload_int4_linear_awq(source, mlp + "down_proj", queue);
+            if (gate_up.in_features != c.hidden_size ||
+                gate_up.out_features != 2 * c.intermediate_size ||
+                down.in_features != c.intermediate_size ||
+                down.out_features != c.hidden_size)
+                throw std::runtime_error("Unexpected int4 MLP shape in layer " +
+                                         std::to_string(i));
+            layer.mlp.gate_up = std::move(gate_up);
+            layer.mlp.down = std::move(down);
+        } else if (source.has(mlp + "gate_proj.weight_packed")) {
             Nvfp4Linear gate_up = upload_nvfp4_linear_pair(
                 source, mlp + "gate_proj", mlp + "up_proj", queue);
             Nvfp4Linear down = upload_nvfp4_linear(source, mlp + "down_proj", queue);
@@ -303,7 +557,6 @@ Qwen35Weights load_qwen35_weights(
             layer.mlp.gate_up = std::move(gate_up);
             layer.mlp.down = std::move(down);
         } else {
-            layer.mlp.nvfp4 = false;
             Fp8Linear gate_up = upload_fp8_linear_pair(
                 source, mlp + "gate_proj", mlp + "up_proj", queue);
             Fp8Linear down = upload_fp8_linear(source, mlp + "down_proj", queue);
@@ -317,12 +570,17 @@ Qwen35Weights load_qwen35_weights(
     }
 
     weights.vision = load_vision(source, config, queue0);
-    weights.mtp = load_mtp(source, config, queue0);
+    // The AWQ checkpoint quantizes the MTP head; it is unused at inference
+    // time, so skip it there and exempt its tensors from the consumed check.
+    bool mtp_loaded = !awq_int4;
+    if (mtp_loaded) weights.mtp = load_mtp(source, config, queue0);
 
     if (max_layers == total_layers) {
         std::vector<std::string> missing;
         for (const std::string& name : checkpoint.names())
-            if (!source.consumed(name)) missing.push_back(name);
+            if (!source.consumed(name) &&
+                (mtp_loaded || name.rfind("mtp.", 0) != 0))
+                missing.push_back(name);
         if (!missing.empty()) {
             std::sort(missing.begin(), missing.end());
             std::ostringstream message;

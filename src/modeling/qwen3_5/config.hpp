@@ -86,6 +86,7 @@ struct Qwen35Config {
     std::string quant_method;
     std::string quant_format;
     int nvfp4_group_size = 0;
+    int int4_group_size = 0;  // compressed-tensors pack-quantized W4A16 (AWQ)
 
     int bos_token_id = -1;
     int pad_token_id = -1;
@@ -128,7 +129,10 @@ struct Qwen35Config {
         cfg.architecture = architectures.at(0).get<std::string>();
         if (cfg.architecture != "Qwen3_5ForConditionalGeneration")
             throw std::runtime_error("Unsupported Qwen3.5 architecture: " + cfg.architecture);
-        cfg.dtype = root.at("dtype").get<std::string>();
+        // The NVFP4 (unsloth) checkpoint keeps dtype at the root; the AWQ
+        // (cyankiwi) checkpoint only has text_config.dtype.
+        if (root.contains("dtype"))
+            cfg.dtype = root.at("dtype").get<std::string>();
         cfg.language_model_only = root.at("language_model_only").get<bool>();
         if (cfg.language_model_only)
             throw std::runtime_error("This loader expects the multimodal Qwen3.5 checkpoint");
@@ -136,8 +140,10 @@ struct Qwen35Config {
         cfg.video_token_id = root.at("video_token_id").get<int>();
         cfg.vision_start_token_id = root.at("vision_start_token_id").get<int>();
         cfg.vision_end_token_id = root.at("vision_end_token_id").get<int>();
-        cfg.mtp_num_hidden_layers = root.at("mtp_num_hidden_layers").get<int>();
-        cfg.unsloth_fixed_mtp = root.at("unsloth_fixed_mtp").get<bool>();
+        if (root.contains("mtp_num_hidden_layers"))
+            cfg.mtp_num_hidden_layers = root.at("mtp_num_hidden_layers").get<int>();
+        if (root.contains("unsloth_fixed_mtp"))
+            cfg.unsloth_fixed_mtp = root.at("unsloth_fixed_mtp").get<bool>();
 
         const json& text = root.at("text_config");
         if (text.at("model_type").get<std::string>() != "qwen3_5_text")
@@ -171,6 +177,9 @@ struct Qwen35Config {
         cfg.text.attention_bias = text.at("attention_bias").get<bool>();
         cfg.text.attention_output_gate = text.at("attn_output_gate").get<bool>();
         cfg.text.tie_word_embeddings = text.at("tie_word_embeddings").get<bool>();
+        if (cfg.dtype.empty()) cfg.dtype = text.at("dtype").get<std::string>();
+        if (cfg.mtp_num_hidden_layers == 0 && text.contains("mtp_num_hidden_layers"))
+            cfg.mtp_num_hidden_layers = text.at("mtp_num_hidden_layers").get<int>();
         const json& rope = text.at("rope_parameters");
         cfg.text.rope.type = rope.at("rope_type").get<std::string>();
         cfg.text.rope.theta = rope.at("rope_theta").get<float>();
@@ -179,8 +188,9 @@ struct Qwen35Config {
         cfg.text.rope.mrope_section = read_ints(rope.at("mrope_section"));
 
         const json& vision = root.at("vision_config");
-        if (vision.at("model_type").get<std::string>() != "qwen3_5_vision")
-            throw std::runtime_error("Expected vision_config.model_type=qwen3_5_vision");
+        const std::string vision_type = vision.at("model_type").get<std::string>();
+        if (vision_type != "qwen3_5_vision" && vision_type != "qwen3_5")
+            throw std::runtime_error("Unexpected vision_config.model_type: " + vision_type);
         cfg.vision.depth = vision.at("depth").get<int>();
         cfg.vision.hidden_size = vision.at("hidden_size").get<int>();
         cfg.vision.intermediate_size = vision.at("intermediate_size").get<int>();
@@ -196,17 +206,35 @@ struct Qwen35Config {
         const json& quant = root.at("quantization_config");
         cfg.quant_method = quant.at("quant_method").get<std::string>();
         cfg.quant_format = quant.at("format").get<std::string>();
-        cfg.nvfp4_group_size = quant.at("config_groups").at("group_1")
-            .at("weights").at("group_size").get<int>();
-        if (cfg.quant_method != "compressed-tensors" ||
-            cfg.quant_format != "mixed-precision" || cfg.nvfp4_group_size != 16)
+        if (cfg.quant_method != "compressed-tensors")
             throw std::runtime_error("Unsupported Qwen3.5 quantization configuration");
+        if (cfg.quant_format == "mixed-precision") {
+            cfg.nvfp4_group_size = quant.at("config_groups").at("group_1")
+                .at("weights").at("group_size").get<int>();
+            if (cfg.nvfp4_group_size != 16)
+                throw std::runtime_error("Unsupported Qwen3.5 quantization configuration");
+        } else if (cfg.quant_format == "pack-quantized") {
+            const json& w = quant.at("config_groups").at("group_0").at("weights");
+            if (w.at("num_bits").get<int>() != 4 ||
+                w.at("type").get<std::string>() != "int")
+                throw std::runtime_error("Unsupported Qwen3.5 pack-quantized weights");
+            cfg.int4_group_size = w.at("group_size").get<int>();
+        } else {
+            throw std::runtime_error("Unsupported Qwen3.5 quantization configuration");
+        }
 
-        json processor = read_json(dir + "/processor_config.json");
-        const json& image = processor.at("image_processor");
-        cfg.vision.do_rescale = image.at("do_rescale").get<bool>();
-        cfg.vision.do_normalize = image.at("do_normalize").get<bool>();
-        cfg.vision.rescale_factor = image.at("rescale_factor").get<float>();
+        // NVFP4 checkpoint: processor_config.json with an "image_processor"
+        // sub-object. AWQ checkpoint: flat preprocessor_config.json whose
+        // do_* keys may be absent (Qwen2VLImageProcessorFast defaults).
+        json image;
+        {
+            std::ifstream wrapped(dir + "/processor_config.json");
+            if (wrapped) image = json::parse(wrapped).at("image_processor");
+            else image = read_json(dir + "/preprocessor_config.json");
+        }
+        cfg.vision.do_rescale = image.value("do_rescale", true);
+        cfg.vision.do_normalize = image.value("do_normalize", true);
+        cfg.vision.rescale_factor = image.value("rescale_factor", 1.0f / 255.0f);
         cfg.vision.image_mean = read_floats(image.at("image_mean"));
         cfg.vision.image_std = read_floats(image.at("image_std"));
         cfg.vision.min_pixels = image.at("size").at("shortest_edge").get<int>();
@@ -218,7 +246,9 @@ struct Qwen35Config {
 
         json generation = read_json(dir + "/generation_config.json");
         cfg.bos_token_id = generation.at("bos_token_id").get<int>();
-        cfg.pad_token_id = generation.at("pad_token_id").get<int>();
+        cfg.pad_token_id = (generation.contains("pad_token_id") &&
+                            !generation.at("pad_token_id").is_null())
+            ? generation.at("pad_token_id").get<int>() : -1;
         cfg.eos_token_ids = read_ints(generation.at("eos_token_id"));
         cfg.temperature = generation.at("temperature").get<float>();
         cfg.top_k = generation.at("top_k").get<int>();

@@ -76,6 +76,14 @@ inline bool qwen35_fused_esimd_delta_decode_enabled() {
     return enabled;
 }
 
+inline void matmul_proj(const bf16* A, int M, int K, const Qwen35Proj& W,
+                        bf16* C, GpuEngine& context) {
+    if (const auto* w = std::get_if<Fp8Linear>(&W))
+        matmul_fp8(A, M, K, *w, C, context);
+    else
+        matmul_int4(A, M, K, std::get<Int4Linear>(W), C, context);
+}
+
 inline bool qwen35_fused_ba_projection_enabled() {
     static bool enabled = [] {
         const char* value =
@@ -108,22 +116,22 @@ inline void qwen35_full_attention_forward(
         throw std::runtime_error("Qwen3.5 KV cache overflow");
 
     if (weights.fused_projections) {
-        matmul_fp8(hidden, seq, c.hidden_size, weights.qkv_proj,
-                   workspace.tmp0.data(), context);
+        matmul_proj(hidden, seq, c.hidden_size, weights.qkv_proj,
+                    workspace.tmp0.data(), context);
         qwen35_split_q_gate_kv(
             queue, workspace.tmp0.data(), workspace.tmp2.data(),
             workspace.tmp3.data(), workspace.tmp1.data(), workspace.tmp4.data(),
             seq, c.num_attention_heads, c.num_key_value_heads, c.head_dim);
     } else {
-        matmul_fp8(hidden, seq, c.hidden_size, weights.q_proj,
-                   workspace.tmp0.data(), context);
+        matmul_proj(hidden, seq, c.hidden_size, weights.q_proj,
+                    workspace.tmp0.data(), context);
         qwen35_split_q_gate(queue, workspace.tmp0.data(), workspace.tmp2.data(),
                             workspace.tmp3.data(), seq, c.num_attention_heads,
                             c.head_dim);
-        matmul_fp8(hidden, seq, c.hidden_size, weights.k_proj,
-                   workspace.tmp1.data(), context);
-        matmul_fp8(hidden, seq, c.hidden_size, weights.v_proj,
-                   workspace.tmp4.data(), context);
+        matmul_proj(hidden, seq, c.hidden_size, weights.k_proj,
+                    workspace.tmp1.data(), context);
+        matmul_proj(hidden, seq, c.hidden_size, weights.v_proj,
+                    workspace.tmp4.data(), context);
     }
     rms_norm(queue, workspace.tmp2.data(), weights.q_norm.data(), workspace.tmp2.data(),
              seq * c.num_attention_heads, c.head_dim, c.rms_norm_eps);
@@ -159,7 +167,7 @@ inline void qwen35_full_attention_forward(
     }
     mul_sigmoid_inplace(queue, workspace.tmp2.data(), workspace.tmp3.data(),
                         (size_t)seq * query_dim);
-    matmul_fp8(workspace.tmp2.data(), seq, query_dim, weights.o_proj, output, context);
+    matmul_proj(workspace.tmp2.data(), seq, query_dim, weights.o_proj, output, context);
 }
 
 inline void qwen35_linear_attention_forward(
@@ -182,11 +190,11 @@ inline void qwen35_linear_attention_forward(
     int projected_stride = conv_dim;
     if (weights.fused_projections) {
         projected_stride = conv_dim + value_dim;
-        matmul_fp8(hidden, seq, c.hidden_size, weights.in_proj_qkvz,
-                   workspace.tmp0.data(), context);
+        matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkvz,
+                    workspace.tmp0.data(), context);
     } else {
-        matmul_fp8(hidden, seq, c.hidden_size, weights.in_proj_qkv,
-                   workspace.tmp0.data(), context);
+        matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkv,
+                    workspace.tmp0.data(), context);
     }
     if (seq == 1 && weights.fused_projections &&
         qwen35_fused_esimd_delta_decode_enabled()) {
@@ -215,8 +223,8 @@ inline void qwen35_linear_attention_forward(
             queue, workspace.tmp4.data(), workspace.tmp2.data(),
             weights.norm.data(), workspace.tmp4.data(), heads,
             c.linear_value_head_dim, c.rms_norm_eps);
-        matmul_fp8(workspace.tmp4.data(), 1, value_dim, weights.out_proj,
-                   output, context);
+        matmul_proj(workspace.tmp4.data(), 1, value_dim, weights.out_proj,
+                    output, context);
         return;
     }
     qwen35_conv_causal(queue, workspace.tmp0.data(), weights.conv1d.data(),
@@ -241,8 +249,8 @@ inline void qwen35_linear_attention_forward(
     // The unfused path reuses tmp0 for z. The fused path keeps z at the tail
     // of each projected row until the recurrent core has consumed q/k/v.
     if (!weights.fused_projections)
-        matmul_fp8(hidden, seq, c.hidden_size, weights.in_proj_z,
-                   workspace.tmp0.data(), context);
+        matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_z,
+                    workspace.tmp0.data(), context);
     bf16* beta = workspace.tmp1.data();
     bf16* g = workspace.tmp1.data() + head_values;
     if (qwen35_fused_ba_projection_enabled())
@@ -280,8 +288,8 @@ inline void qwen35_linear_attention_forward(
     gated_rmsnorm(queue, workspace.tmp4.data(), z,
                   weights.norm.data(), workspace.tmp4.data(), seq * heads,
                   c.linear_value_head_dim, c.rms_norm_eps);
-    matmul_fp8(workspace.tmp4.data(), seq, value_dim, weights.out_proj,
-               output, context);
+    matmul_proj(workspace.tmp4.data(), seq, value_dim, weights.out_proj,
+                output, context);
 }
 
 inline void qwen35_mlp_forward(
@@ -295,7 +303,13 @@ inline void qwen35_mlp_forward(
     int H = config.text.hidden_size;
     int I = config.text.intermediate_size;
     auto& queue = context.queue;
-    if (weights.nvfp4) {
+    if (std::holds_alternative<Int4Linear>(weights.gate_up)) {
+        const auto& gate_up = std::get<Int4Linear>(weights.gate_up);
+        const auto& down = std::get<Int4Linear>(weights.down);
+        matmul_int4(hidden, seq, H, gate_up, workspace.tmp0.data(), context);
+        swiglu_strided(queue, workspace.tmp0.data(), workspace.tmp1.data(), seq, I);
+        matmul_int4(workspace.tmp1.data(), seq, I, down, output, context);
+    } else if (std::holds_alternative<Nvfp4Linear>(weights.gate_up)) {
         const auto& gate_up = std::get<Nvfp4Linear>(weights.gate_up);
         const auto& down = std::get<Nvfp4Linear>(weights.down);
         if (qwen35_nvfp4_dpas_enabled()) {
