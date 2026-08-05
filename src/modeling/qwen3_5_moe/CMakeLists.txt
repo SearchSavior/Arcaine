@@ -33,4 +33,5 @@ arcaine_add_model(NAME qwen3_5_moe
     KERNEL_BENCH_SOURCES
         benchmarks/nvfp4_mlp_bench.cpp
         benchmarks/int4_moe_bench.cpp
-        benchmarks/gdn_bench.cpp)
+        benchmarks/gdn_bench.cpp
+        benchmarks/attention_bench.cpp)

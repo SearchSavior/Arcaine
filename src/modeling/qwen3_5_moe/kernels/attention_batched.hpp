@@ -10,6 +10,7 @@
 #include "runtime/gpu/ops.hpp"
 #include "attention_mask.hpp"
 #include "attention_layout.hpp"
+#include "attention_decode_fused.hpp"
 
 // Model-local namespace: these kernels are per-model COPIES (see
 // AGENTS.md model isolation). Global-scope inline functions with
@@ -98,6 +99,9 @@ struct Scratch {
     GpuBuffer<bf16>  p_tile;      // [nq*seq*tile] scores/P
     GpuBuffer<float> o_acc;       // [nq*seq*q_hd] f32 running output
     GpuBuffer<float> ml;          // [4, nq*seq]: m_run | l_run | m_t | l_t
+    // Decode-fused (flash-decoding) path only:
+    GpuBuffer<float> o_part;      // [nkv*MAXSPLIT*8*hd] split partials
+    GpuBuffer<float> ml_part;     // [nkv*MAXSPLIT*8*2]: m | l per partial
     size_t mask_cap = 0;
     size_t q_cap = 0;             // covers q_hm / ctx_hm / ctx_tm (nq*seq*q_hd)
     size_t kv_cap = 0;            // covers k_exp / v_exp (nq*kv*kv_hd)
@@ -105,6 +109,7 @@ struct Scratch {
     size_t tile_kv_cap = 0;       // covers kt_exp / vt_exp
     size_t p_cap = 0;             // covers p_tile
     size_t acc_cap = 0;           // covers o_acc (rows*q_hd) and ml (rows*4)
+    size_t part_cap = 0;          // covers o_part / ml_part (decode fused)
 };
 inline Scratch& scratch()
 {
@@ -140,12 +145,15 @@ inline int qwen_attn_tile_override()
 // Worst-case device bytes batched_attention will ensure in grow-only scratch
 // for one call with (seq, kv). Mirrors the dispatch rule and alloc blocks
 // below exactly; used by QwenModel's max_seq preflight. Keep in sync.
-inline size_t qwen_attn_scratch_bytes(int seq, int kv, int nq, int q_hd, int kv_hd)
+inline size_t qwen_attn_scratch_bytes(int seq, int kv, int nq, int nkv,
+                                      int q_hd, int kv_hd)
 {
     const size_t rows      = (size_t)nq * seq;
     const size_t q_sz      = rows * q_hd;
     const size_t scores_sz = rows * kv;
     size_t total = 3 * q_sz * sizeof(bf16);               // q_hm / ctx_hm / ctx_tm
+    if (qwen_attn_decode_fused_enabled())
+        total += qwen_attn_decode_fused_scratch_elems(nkv) * sizeof(float);
     if (scores_sz * 6 <= qwen_attn_scores_budget_bytes()) {
         // single-shot
         total += 2 * (size_t)nq * kv * kv_hd * sizeof(bf16); // k_exp / v_exp
@@ -375,19 +383,65 @@ inline bf16* batched_attention_tiled(
     return sc.ctx_tm.data();
 }
 
+// Fused decode attention (seq==1): flash-decoding + DPAS with GQA reuse,
+// one KV pass, 2 launches. Returns the same scratch-owned ctx_tm pointer as
+// batched_attention ([nq*hd] flat == (1, nq, hd) time-major). The caller
+// holds qwen_attn_batched_detail::scratch_mutex().
+inline bf16* qwen_attn_decode_fused(
+    GpuEngine& ctx,
+    const bf16* Q_dev, int nq_heads,
+    const bf16* K_dev, const bf16* V_dev, int kv_len, int nkv_heads,
+    float scale
+) {
+    auto& q  = ctx.queue;
+    auto& sc = qwen_attn_batched_detail::scratch();
+    constexpr int HD = kQwenAttnDecodeHd;
+    const int ratio  = nq_heads / nkv_heads;
+    const int nsplit = qwen_attn_decode_nsplit(kv_len);
+    const int chunk  = (((kv_len + nsplit - 1) / nsplit) + 15) & ~15;
+
+    const size_t q_sz = (size_t)nq_heads * HD;
+    if (sc.q_cap < q_sz) {
+        sc.q_hm   = GpuBuffer<bf16>(q_sz, q);
+        sc.ctx_hm = GpuBuffer<bf16>(q_sz, q);
+        sc.ctx_tm = GpuBuffer<bf16>(q_sz, q);
+        sc.q_cap  = q_sz;
+    }
+    const size_t o_elems = (size_t)nkv_heads * kQwenAttnDecodeMaxSplit *
+                           kQwenAttnDecodeRows * HD;
+    if (sc.part_cap < o_elems) {
+        sc.o_part   = GpuBuffer<float>(o_elems, q);
+        sc.ml_part  = GpuBuffer<float>(
+            (size_t)nkv_heads * kQwenAttnDecodeMaxSplit * kQwenAttnDecodeRows * 2, q);
+        sc.part_cap = o_elems;
+    }
+
+    qwen_attn_decode_fused_partial(q, Q_dev, K_dev, V_dev,
+                                   sc.o_part.data(), sc.ml_part.data(),
+                                   kv_len, nkv_heads, nsplit, chunk, ratio, scale);
+    qwen_attn_decode_fused_combine(q, sc.o_part.data(), sc.ml_part.data(),
+                                   sc.ctx_tm.data(),
+                                   nq_heads, nkv_heads, nsplit, ratio);
+    return sc.ctx_tm.data();
+}
+
 // Full GQA batched attention: scores = scale * QK^T, mask, softmax, then @ V.
 // Returns a pointer to the context in (seq, nq, q_head_dim) time-major layout,
 // ready for o_proj. The pointer is into grow-only scratch; the caller must
 // hold qwen_attn_batched_detail::scratch_mutex() until all kernels consuming
 // it have been enqueued.
-inline bf16* batched_attention(
+// Baseline batched attention (single-shot / KV-tiled chain). Exposed for
+// A/B benchmarks that must run the split decode path regardless of the
+// QWEN35_ATTN_DECODE_FUSED env toggle; production callers use
+// batched_attention.
+inline bf16* batched_attention_baseline(
     GpuEngine& ctx,
     const bf16* Q_dev, int seq_len, int nq_heads, int q_head_dim,
     const bf16* K_dev, const bf16* V_dev, int kv_len, int nkv_heads, int kv_head_dim,
     int past_offset,
     int sliding_window,
     float scale = 1.0f,
-    bool skip_mask = false,  // true when mask is provably all-zeros (decode after KV truncation)
+    bool skip_mask = false,
     const int32_t* block_ids = nullptr
 ) {
     auto& q = ctx.queue;
@@ -477,6 +531,37 @@ inline bf16* batched_attention(
     scatter_ctx(q, sc.ctx_hm.data(), sc.ctx_tm.data(), nq_heads, seq_len, q_head_dim);
 
     return sc.ctx_tm.data();
+}
+
+// Full GQA batched attention dispatcher: routes decode (seq==1) to the fused
+// flash-decoding DPAS path when enabled and shape-compatible; otherwise the
+// baseline single-shot / KV-tiled chain.
+inline bf16* batched_attention(
+    GpuEngine& ctx,
+    const bf16* Q_dev, int seq_len, int nq_heads, int q_head_dim,
+    const bf16* K_dev, const bf16* V_dev, int kv_len, int nkv_heads, int kv_head_dim,
+    int past_offset,
+    int sliding_window,
+    float scale = 1.0f,
+    bool skip_mask = false,  // true when mask is provably all-zeros (decode after KV truncation)
+    const int32_t* block_ids = nullptr
+) {
+    // Decode (seq==1) fused path: flash-decoding + DPAS, one KV pass. The
+    // mask is provably all-zero (skip_mask) and this model uses no sliding
+    // window, so all cached tokens attend. Below kv=2048 the fixed split
+    // overhead outweighs the traffic win (see attention_bench decode mode).
+    if (seq_len == 1 && skip_mask && !block_ids && kv_len >= 2048 &&
+        qwen_attn_decode_fused_enabled() &&
+        q_head_dim == kQwenAttnDecodeHd && kv_head_dim == kQwenAttnDecodeHd &&
+        nq_heads % nkv_heads == 0 &&
+        nq_heads / nkv_heads <= kQwenAttnDecodeRows) {
+        return qwen_attn_decode_fused(ctx, Q_dev, nq_heads,
+                                      K_dev, V_dev, kv_len, nkv_heads, scale);
+    }
+    return batched_attention_baseline(ctx,
+        Q_dev, seq_len, nq_heads, q_head_dim,
+        K_dev, V_dev, kv_len, nkv_heads, kv_head_dim,
+        past_offset, sliding_window, scale, skip_mask, block_ids);
 }
 
 } // namespace qwen35moe_kernels

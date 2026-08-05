@@ -74,7 +74,7 @@ QwenModel::QwenModel(const std::string& model_dir, int max_seq_len) {
             const size_t gdn_state  = (size_t)n_linear *
                 ((size_t)cdim * (cfg_.linear_conv_kernel_dim - 1) * sizeof(bf16) +
                  (size_t)n_v * d_k * d_v * sizeof(float));
-            const size_t attn_scr   = qwen_attn_scratch_bytes(Sa, Sa, nq, hd, hd);
+            const size_t attn_scr   = qwen_attn_scratch_bytes(Sa, Sa, nq, nkv, hd, hd);
             const size_t gdn_scr    = qwen_gdn_detail::qwen_gdn_scratch_bytes(
                                           Sa, cdim, n_v, d_k, d_v, vdim);
             const size_t fwd_scr    = 3 * (size_t)Sa * cfg_.hidden_size * sizeof(bf16);

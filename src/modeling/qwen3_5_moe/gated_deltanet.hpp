@@ -55,6 +55,7 @@
 #include "kernels/gated_delta_chunk.hpp"     // qwen_gdn_device_chunk, qwen_gdn_impl
 #include "kernels/gated_delta_chunk_xmx.hpp" // qwen_gdn_device_chunk_xmx
 #include "kernels/gated_delta_chunk_hybrid.hpp" // qwen_gdn_device_chunk_hybrid
+#include "kernels/gated_delta_decode_fused.hpp" // qwen_gdn_decode_fused (QWEN35_GDN_DECODE_FUSED)
 
 using namespace qwen35moe_kernels;
 
@@ -515,11 +516,18 @@ inline void qwen_linear_attn_forward(
     // 1. in_proj_qkv: [S, H] -> [S, conv_dim].
     matmul_bf16(hidden, S, H, w.in_proj_qkv.data(), conv_dim, sc.mixed.data(), ctx);
 
+    const bool decode_cached = (S == 1 && cache.has_state);
+    // Fused decode: one kernel for extract+l2norm+scale+beta/g+recurrent+
+    // gated rmsnorm (QWEN35_GDN_DECODE_FUSED=1). Reads conv_out / raw b,a
+    // directly, so steps 3-4 and the sigmoid/compute_g launches are skipped.
+    const bool decode_fused = decode_cached && d_k == 128 && d_v == 128 &&
+                              n_v == 2 * n_k && qwen_gdn_decode_fused_enabled();
+
     // 2. conv1d (depthwise causal k=4 + silu). Decode uses conv_state; prefill
     //    reads the leading k-1 positions from conv_state (zeroed when fresh,
     //    so the first call is a zero left-pad) and saves the last k-1 pre-conv
     //    inputs.
-    if (S == 1 && cache.has_state) {
+    if (decode_cached) {
         conv1d_causal_decode(q, sc.mixed.data(), w.conv1d.data(),
                              cache.conv_state.data(), sc.conv_out.data(), conv_dim, kk);
     } else {
@@ -530,13 +538,15 @@ inline void qwen_linear_attn_forward(
     }
 
     // 3. split + repeat q,k (->32 heads); v already 32 heads. -> [S, n_v, d].
-    extract_qkv_repeat(q, sc.conv_out.data(), sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
-                       S, n_k, d_k, d_v, key_dim, conv_dim);
-
     // 4. l2norm q,k (per head over d); scale q by 1/sqrt(d).
-    l2norm(q, sc.qbuf.data(), sc.qbuf.data(), S * n_v, d_k, cfg.rms_norm_eps);
-    l2norm(q, sc.kbuf.data(), sc.kbuf.data(), S * n_v, d_k, cfg.rms_norm_eps);
-    scale_inplace(q, sc.qbuf.data(), S * n_v * d_k, scale);
+    //    (both folded into the fused decode kernel when decode_fused)
+    if (!decode_fused) {
+        extract_qkv_repeat(q, sc.conv_out.data(), sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                           S, n_k, d_k, d_v, key_dim, conv_dim);
+        l2norm(q, sc.qbuf.data(), sc.qbuf.data(), S * n_v, d_k, cfg.rms_norm_eps);
+        l2norm(q, sc.kbuf.data(), sc.kbuf.data(), S * n_v, d_k, cfg.rms_norm_eps);
+        scale_inplace(q, sc.qbuf.data(), S * n_v * d_k, scale);
+    }
 
     // 5. z = in_proj_z(hidden) -> [S, value_dim] (gate for the output norm).
     matmul_bf16(hidden, S, H, w.in_proj_z.data(), value_dim, sc.zbuf.data(), ctx);
@@ -544,41 +554,52 @@ inline void qwen_linear_attn_forward(
     // 6. b,a -> beta=sigmoid(b); g=-exp(A_log)*softplus(a+dt_bias).
     matmul_bf16(hidden, S, H, w.in_proj_b.data(), n_v, bbuf, ctx);
     matmul_bf16(hidden, S, H, w.in_proj_a.data(), n_v, abuf, ctx);
-    sigmoid_inplace(q, bbuf, S * n_v);
-    compute_g(q, abuf, w.A_log.data(), w.dt_bias.data(), sc.gbuf.data(), S, n_v);
+    if (!decode_fused) {
+        sigmoid_inplace(q, bbuf, S * n_v);
+        compute_g(q, abuf, w.A_log.data(), w.dt_bias.data(), sc.gbuf.data(), S, n_v);
+    }
 
-    // 7. core gated delta rule.
-    if (S == 1 && cache.has_state) {
-        recurrent_gated_delta_decode(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
-                                     bbuf, sc.gbuf.data(),
-                                     cache.ssm_state.data(), sc.core.data(),
-                                     n_v, d_k, d_v);
-    } else if (qwen_gdn_impl() == 3 && d_k == 128 && d_v == 128) {
-        qwen_gdn_device_chunk_hybrid(ctx, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
-                                     bbuf, sc.gbuf.data(),
-                                     cache.ssm_state.data(), sc.core.data(),
-                                     S, n_v, d_k, d_v, 64);
-    } else if (qwen_gdn_impl() == 2 && d_k == 128 && d_v == 128) {
-        qwen_gdn_device_chunk_xmx(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+    // 7. core gated delta rule (+ 8. gated rmsnorm, folded into the fused
+    //    decode kernel when decode_fused).
+    if (decode_fused) {
+        qwen_gdn_decode_fused(q, sc.conv_out.data(), bbuf, abuf,
+                              w.A_log.data(), w.dt_bias.data(),
+                              sc.zbuf.data(), w.norm.data(),
+                              cache.ssm_state.data(), sc.core.data(),
+                              n_v, key_dim, scale, cfg.rms_norm_eps);
+    } else {
+        if (decode_cached) {
+            recurrent_gated_delta_decode(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                                         bbuf, sc.gbuf.data(),
+                                         cache.ssm_state.data(), sc.core.data(),
+                                         n_v, d_k, d_v);
+        } else if (qwen_gdn_impl() == 3 && d_k == 128 && d_v == 128) {
+            qwen_gdn_device_chunk_hybrid(ctx, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                                         bbuf, sc.gbuf.data(),
+                                         cache.ssm_state.data(), sc.core.data(),
+                                         S, n_v, d_k, d_v, 64);
+        } else if (qwen_gdn_impl() == 2 && d_k == 128 && d_v == 128) {
+            qwen_gdn_device_chunk_xmx(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                                      bbuf, sc.gbuf.data(),
+                                      cache.ssm_state.data(), sc.core.data(),
+                                      S, n_v, d_k, d_v, 64);
+        } else if (qwen_gdn_impl() == 1 && d_k == 128 && d_v == 128) {
+            qwen_gdn_device_chunk(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
                                   bbuf, sc.gbuf.data(),
                                   cache.ssm_state.data(), sc.core.data(),
                                   S, n_v, d_k, d_v, 64);
-    } else if (qwen_gdn_impl() == 1 && d_k == 128 && d_v == 128) {
-        qwen_gdn_device_chunk(q, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
-                              bbuf, sc.gbuf.data(),
-                              cache.ssm_state.data(), sc.core.data(),
-                              S, n_v, d_k, d_v, 64);
-    } else {
-        host_chunk_gated_delta_rule(ctx, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
-                                    bbuf, sc.gbuf.data(),
-                                    cache.ssm_state.data(), sc.core.data(),
-                                    S, n_v, d_k, d_v, 64);
+        } else {
+            host_chunk_gated_delta_rule(ctx, sc.qbuf.data(), sc.kbuf.data(), sc.vbuf.data(),
+                                        bbuf, sc.gbuf.data(),
+                                        cache.ssm_state.data(), sc.core.data(),
+                                        S, n_v, d_k, d_v, 64);
+        }
+
+        // 8. gated rmsnorm: (norm * rmsnorm_D(core)) * silu(z), over d_v.
+        gated_rmsnorm(q, sc.core.data(), sc.zbuf.data(), w.norm.data(), sc.core.data(),
+                      S * n_v, d_v, cfg.rms_norm_eps);
     }
     cache.has_state = true;
-
-    // 8. gated rmsnorm: (norm * rmsnorm_D(core)) * silu(z), over d_v.
-    gated_rmsnorm(q, sc.core.data(), sc.zbuf.data(), w.norm.data(), sc.core.data(),
-                  S * n_v, d_v, cfg.rms_norm_eps);
 
     // 9. out_proj: [S, value_dim] -> [S, H].
     qwen_matmul_proj(sc.core.data(), S, value_dim, w.out_proj, out, ctx);
