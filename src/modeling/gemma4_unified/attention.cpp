@@ -157,13 +157,13 @@ void sliding_attention_forward(
     int win  = cfg.sliding_window;      // 1024
 
     GpuBuffer<bf16> Q((size_t)seq_len * nq * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.q_proj.data(), nq * hd, Q.data(), ctx);
+    proj_matmul(w.q_proj, hidden, seq_len, H, nq * hd, Q.data(), ctx);
 
     GpuBuffer<bf16> K_raw((size_t)seq_len * nkv * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.k_proj.data(), nkv * hd, K_raw.data(), ctx);
+    proj_matmul(w.k_proj, hidden, seq_len, H, nkv * hd, K_raw.data(), ctx);
 
     GpuBuffer<bf16> V_raw((size_t)seq_len * nkv * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.v_proj.data(), nkv * hd, V_raw.data(), ctx);
+    proj_matmul(w.v_proj, hidden, seq_len, H, nkv * hd, V_raw.data(), ctx);
 
     rms_norm(q, Q.data(),     w.q_norm.data(), Q.data(),     seq_len * nq,  hd, cfg.rms_norm_eps);
     rms_norm(q, K_raw.data(), w.k_norm.data(), K_raw.data(), seq_len * nkv, hd, cfg.rms_norm_eps);
@@ -202,7 +202,7 @@ void sliding_attention_forward(
         auto attn_ctx = sliding_decode_attention(ctx,
             Q.data(), kv.k_decode.data(), kv.v_decode.data(),
             eff_kv_len, eff_kv_start, kv.max_seq, nq, nkv, hd);
-        matmul_bf16(attn_ctx.data(), seq_len, nq * hd, w.o_proj.data(), H, tmp, ctx);
+        proj_matmul(w.o_proj, attn_ctx.data(), seq_len, nq * hd, H, tmp, ctx);
         return;
     }
 
@@ -214,7 +214,7 @@ void sliding_attention_forward(
         /*skip_mask=*/false,
         block_ids);
 
-    matmul_bf16(attn_ctx.data(), seq_len, nq * hd, w.o_proj.data(), H, tmp, ctx);
+    proj_matmul(w.o_proj, attn_ctx.data(), seq_len, nq * hd, H, tmp, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -237,10 +237,10 @@ void full_attention_forward(
     int hd   = cfg.global_head_dim;      // 512
 
     GpuBuffer<bf16> Q((size_t)seq_len * nq * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.q_proj.data(), nq * hd, Q.data(), ctx);
+    proj_matmul(w.q_proj, hidden, seq_len, H, nq * hd, Q.data(), ctx);
 
     GpuBuffer<bf16> K_raw((size_t)seq_len * nkv * hd, q);
-    matmul_bf16(hidden, seq_len, H, w.k_proj.data(), nkv * hd, K_raw.data(), ctx);
+    proj_matmul(w.k_proj, hidden, seq_len, H, nkv * hd, K_raw.data(), ctx);
 
     rms_norm(q, Q.data(), w.q_norm.data(), Q.data(), seq_len * nq, hd, cfg.rms_norm_eps);
 
@@ -283,7 +283,7 @@ void full_attention_forward(
 
         // attn_out(nq, hd) = scores(nq, kv_len) @ V(kv_len, hd). Reuse Q (same size).
         matmul_bf16_nn(scores_bf16.data(), nq, kv_len, kv.v.data(), hd, Q.data(), ctx);
-        matmul_bf16(Q.data(), 1, nq * hd, w.o_proj.data(), H, tmp, ctx);
+        proj_matmul(w.o_proj, Q.data(), 1, nq * hd, H, tmp, ctx);
         return;
     }
 
@@ -296,5 +296,5 @@ void full_attention_forward(
         /*skip_mask=*/(seq_len == 1),
         block_ids);
 
-    matmul_bf16(attn_ctx.data(), seq_len, nq * hd, w.o_proj.data(), H, tmp, ctx);
+    proj_matmul(w.o_proj, attn_ctx.data(), seq_len, nq * hd, H, tmp, ctx);
 }

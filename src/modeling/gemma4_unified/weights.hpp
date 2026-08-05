@@ -2,28 +2,45 @@
 #include <variant>
 #include <vector>
 #include "../../runtime/gpu/buffer.hpp"
+#include "../../runtime/gpu/ops.hpp"
+#include "../../runtime/quantization/int4.hpp"
+
+// A projection weight is either a dense BF16 matrix (BF16 checkpoints, and the
+// non-quantized projections of INT4 checkpoints) or a packed INT4 W4A16 linear
+// (compressed-tensors AWQ).  Both compute C(M,N) = A(M,K) @ W^T with W logical
+// (N,K); the dispatch below picks the matching kernel.
+using ProjWeight = std::variant<GpuBuffer<bf16>, Int4Linear>;
+
+inline void proj_matmul(const ProjWeight& w, const bf16* A, int M, int K,
+                        int N, bf16* C, GpuEngine& ctx) {
+    if (std::holds_alternative<GpuBuffer<bf16>>(w)) {
+        matmul_bf16(A, M, K, std::get<GpuBuffer<bf16>>(w).data(), N, C, ctx);
+    } else {
+        matmul_int4(A, M, K, std::get<Int4Linear>(w), C, ctx);
+    }
+}
 
 struct SlidingAttnWeights {
-    GpuBuffer<bf16> q_proj;  // (4096, 3840)
-    GpuBuffer<bf16> k_proj;  // (2048, 3840)
-    GpuBuffer<bf16> v_proj;  // (2048, 3840)
-    GpuBuffer<bf16> o_proj;  // (3840, 4096)
+    ProjWeight q_proj;  // (4096, 3840)
+    ProjWeight k_proj;  // (2048, 3840)
+    ProjWeight v_proj;  // (2048, 3840)
+    ProjWeight o_proj;  // (3840, 4096)
     GpuBuffer<bf16> q_norm;  // (256,)
     GpuBuffer<bf16> k_norm;  // (256,)
 };
 
 struct FullAttnWeights {
-    GpuBuffer<bf16> q_proj;  // (8192, 3840)
-    GpuBuffer<bf16> k_proj;  // (512,  3840) — K=V, no v_proj
-    GpuBuffer<bf16> o_proj;  // (3840, 8192)
+    ProjWeight q_proj;  // (8192, 3840)
+    ProjWeight k_proj;  // (512,  3840) — K=V, no v_proj
+    ProjWeight o_proj;  // (3840, 8192)
     GpuBuffer<bf16> q_norm;  // (512,)
     GpuBuffer<bf16> k_norm;  // (512,)
 };
 
 struct FfnWeights {
-    GpuBuffer<bf16> gate_proj;  // (15360, 3840)
-    GpuBuffer<bf16> up_proj;    // (15360, 3840)
-    GpuBuffer<bf16> down_proj;  // (3840, 15360)
+    ProjWeight gate_proj;  // (15360, 3840)
+    ProjWeight up_proj;    // (15360, 3840)
+    ProjWeight down_proj;  // (3840, 15360)
 };
 
 struct LayerWeights {

@@ -205,7 +205,8 @@ struct ModelConfig {
         cfg.vision.num_soft_tokens     = vc.at("num_soft_tokens").get<int>();
         cfg.vision.mm_posemb_size      = vc.at("mm_posemb_size").get<int>();
         cfg.vision.mm_embed_dim        = vc.at("mm_embed_dim").get<int>();
-        cfg.vision.model_patch_size    = vc.at("model_patch_size").get<int>();
+        cfg.vision.model_patch_size    = vc.value("model_patch_size",
+            cfg.vision.patch_size * cfg.vision.pooling_kernel_size);
         cfg.vision.output_proj_dims    = vc.at("output_proj_dims").get<int>();
         cfg.vision.rms_norm_eps        = vc.at("rms_norm_eps").get<float>();
         if (cfg.vision.model_patch_size != cfg.vision.patch_size * cfg.vision.pooling_kernel_size)
@@ -216,7 +217,8 @@ struct ModelConfig {
         if (cfg.audio.model_type != "gemma4_unified_audio")
             throw std::runtime_error("Expected audio_config.model_type=gemma4_unified_audio");
         cfg.audio.audio_embed_dim         = ac.at("audio_embed_dim").get<int>();
-        cfg.audio.audio_samples_per_token = ac.at("audio_samples_per_token").get<int>();
+        cfg.audio.audio_samples_per_token = ac.value("audio_samples_per_token",
+            cfg.audio.audio_embed_dim);
         cfg.audio.rms_norm_eps            = ac.at("rms_norm_eps").get<float>();
 
         cfg.bos_token_id = cfg.text.bos_token_id;

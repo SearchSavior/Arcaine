@@ -18,11 +18,11 @@ void ffn_forward(
     GpuBuffer<bf16> up  ((size_t)seq_len * intermediate_size, q);
 
     // Both matmuls read x — submit to queue back-to-back (both async).
-    matmul_bf16(x, seq_len, hidden_size, w.gate_proj.data(), intermediate_size, gate.data(), ctx);
-    matmul_bf16(x, seq_len, hidden_size, w.up_proj.data(),   intermediate_size, up.data(),   ctx);
+    proj_matmul(w.gate_proj, x, seq_len, hidden_size, intermediate_size, gate.data(), ctx);
+    proj_matmul(w.up_proj, x, seq_len, hidden_size, intermediate_size, up.data(), ctx);
 
     // Fused GeGLU: gate[i] = gelu(gate[i]) * up[i]
     geglu_inplace(q, gate.data(), up.data(), seq_len * intermediate_size);
 
-    matmul_bf16(gate.data(), seq_len, intermediate_size, w.down_proj.data(), hidden_size, out, ctx);
+    proj_matmul(w.down_proj, gate.data(), seq_len, intermediate_size, hidden_size, out, ctx);
 }
