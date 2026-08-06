@@ -8,8 +8,8 @@
 #include <mutex>
 
 #include "runtime/gpu/ops.hpp"
-#include "attention_mask.hpp"
-#include "attention_layout.hpp"
+#include "runtime/kernels/attention_mask.hpp"
+#include "runtime/kernels/attention_layout.hpp"
 #include "attention_decode_fused.hpp"
 
 // Model-local namespace: these kernels are per-model COPIES (see

@@ -8,7 +8,7 @@
 #include "kernels.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/gpu/ops.hpp"
-#include "kernels/elementwise.hpp"
+#include "runtime/kernels/elementwise.hpp"
 
 namespace {
 

@@ -1,21 +1,19 @@
 #pragma once
 //
-// qwen3_5 — model-local copies of the Qwen-family shared kernels consumed by
-// this module's operators. Duplicated per the model-isolation rule so this
-// module does not include any other model's headers.
+// qwen3_5 — model-local Qwen-family kernels (activations, gated RMSNorm, L2
+// norm) consumed by this module's operators. Wrapped in a model-local namespace
+// so global-scope inline functions with identical names in other models do not
+// ODR-merge at link time; divergent bodies would then crash at runtime (see
+// AGENTS.md model isolation).
 // Math is transcribed from the HF transformers Qwen3.5-MoE reference implementation.
-//
-//   sigmoid_inplace        : 1 / (1 + exp(-x))
-//   swiglu_strided         : silu(gate) * up  (stacked seq,2*inter layout)
-//   mul_sigmoid_inplace    : a *= sigmoid(gate)              (attn output gate)
-//   gated_rmsnorm          : (w * rmsnorm(x)) * silu(z)
-//   l2norm                 : x * rsqrt(sum(x^2)+eps)
 //
 
 #include <sycl/sycl.hpp>
 #include "runtime/gpu/buffer.hpp"
 #include <algorithm>
 #include <cmath>
+
+namespace qwen35_kernels {
 
 // x[i] = sigmoid(x[i]) = 1 / (1 + exp(-x)).
 inline void sigmoid_inplace(sycl::queue& q, bf16* x, int n) {
@@ -124,3 +122,5 @@ inline void l2norm(sycl::queue& q, const bf16* x, bf16* out, int N, int D, float
             });
     });
 }
+
+} // namespace qwen35_kernels

@@ -45,7 +45,7 @@
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
 #include "../../runtime/gpu/ops.hpp"                // matmul_bf16
-#include "kernels/elementwise.hpp"    // add_inplace
+#include "runtime/kernels/elementwise.hpp"    // add_inplace
 #include "kernels/int4_grouped_moe.hpp"   // grouped DPAS INT4 routed path (tiny-M fallback)
 #include "kernels/int4_grouped_onednn.hpp" // oneDNN grouped W4A16 routed path (primary)
 #include "kernels/router_topk.hpp"    // device softmax+top-k router, active-expert compaction

@@ -1,4 +1,5 @@
 #pragma once
+// Shared tensor primitive — single definition (see AGENTS.md model isolation).
 #include <sycl/sycl.hpp>
 #include "runtime/gpu/buffer.hpp"
 

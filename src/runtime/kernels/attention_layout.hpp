@@ -1,16 +1,10 @@
 #pragma once
+// Shared tensor primitive — single definition (see AGENTS.md model isolation).
+// Attention tensor layout helpers shared by multiple model families.
+// These stay narrowly focused on reshaping and scattering buffers.
 
 #include "runtime/gpu/buffer.hpp"
 #include "runtime/gpu/engine.hpp"
-
-// Model-local namespace: these kernels are per-model COPIES (see
-// AGENTS.md model isolation). Global-scope inline functions with
-// identical names in other models would ODR-merge at link time;
-// divergent bodies (e.g. tiled attention) then crash at runtime.
-namespace qwen35moe_kernels {
-
-// Attention tensor layout helpers shared by multiple model families.
-// These stay narrowly focused on reshaping and scattering buffers.
 
 // Transpose Q from (seq, nq, hd) time-major to (nq, seq, hd) head-major, into a
 // caller-provided buffer (lets callers reuse arena/planned scratch instead of
@@ -81,5 +75,3 @@ inline void scatter_ctx(
         });
     });
 }
-
-} // namespace qwen35moe_kernels

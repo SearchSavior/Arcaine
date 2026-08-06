@@ -19,9 +19,10 @@
 #include "runtime/gpu/buffer.hpp"
 #include "runtime/gpu/device_select.hpp"
 #include "runtime/gpu/engine.hpp"
-#include "modeling/qwen3_5/kernels/elementwise.hpp"
+#include "runtime/kernels/elementwise.hpp"
 #include "modeling/qwen3_5/kernels.hpp"
 
+using namespace qwen35_kernels;
 using arcaine::bench::aggregate;
 using arcaine::bench::Stat;
 

@@ -31,7 +31,7 @@
 #include "../../runtime/gpu/buffer.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/quantization/nvfp4.hpp"               // matmul_nvfp4, Nvfp4Linear
-#include "kernels/rms_norm.hpp"       // rms_norm (plain w*x; +1 baked)
+#include "runtime/kernels/rms_norm.hpp"       // rms_norm (plain w*x; +1 baked)
 #include "kernels/attention_batched.hpp" // batched_attention (GQA)
 
 #include "config.hpp"

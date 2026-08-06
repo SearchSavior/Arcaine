@@ -12,10 +12,10 @@
 #include "vision.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/quantization/fp8.hpp"
-#include "kernels/elementwise.hpp"
-#include "kernels/embedding.hpp"
-#include "kernels/rms_norm.hpp"
-#include "kernels/scatter.hpp"
+#include "runtime/kernels/elementwise.hpp"
+#include "runtime/kernels/embedding.hpp"
+#include "runtime/kernels/rms_norm.hpp"
+#include "runtime/kernels/scatter.hpp"
 #include "../../preprocessing/chat_template.hpp"
 
 namespace {

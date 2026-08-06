@@ -7,9 +7,9 @@
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/gpu/ops.hpp"
 #include "../../runtime/quantization/quant_loader.hpp"
-#include "kernels/embedding.hpp"
-#include "kernels/rms_norm.hpp"
-#include "kernels/elementwise.hpp"
+#include "runtime/kernels/embedding.hpp"
+#include "runtime/kernels/rms_norm.hpp"
+#include "runtime/kernels/elementwise.hpp"
 
 using namespace qwen35moe_kernels;
 #include "../../preprocessing/chat_template.hpp"
