@@ -1,7 +1,7 @@
 #include "ffn.hpp"
 #include "../../runtime/gpu/ops.hpp"
 #include "../../runtime/gpu/engine.hpp"
-#include "kernels/elementwise.hpp"
+#include "runtime/kernels/elementwise.hpp"
 
 void ffn_forward(
     GpuEngine& ctx,

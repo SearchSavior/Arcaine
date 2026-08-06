@@ -5,10 +5,10 @@
 #include "../../preprocessing/chat_template.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/gpu/ops.hpp"
-#include "kernels/embedding.hpp"
-#include "kernels/rms_norm.hpp"
-#include "kernels/elementwise.hpp"
-#include "kernels/scatter.hpp"
+#include "runtime/kernels/embedding.hpp"
+#include "runtime/kernels/rms_norm.hpp"
+#include "runtime/kernels/elementwise.hpp"
+#include "runtime/kernels/scatter.hpp"
 #include <cmath>
 #include <vector>
 #include <optional>

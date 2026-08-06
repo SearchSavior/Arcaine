@@ -1,10 +1,12 @@
 #include "attention.hpp"
-#include "kernels/rms_norm.hpp"
-#include "kernels/rope.hpp"
-#include "kernels/elementwise.hpp"
+#include "runtime/kernels/rms_norm.hpp"
+#include "runtime/kernels/rope.hpp"
+#include "runtime/kernels/elementwise.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/gpu/ops.hpp"
 #include "kernels/attention_batched.hpp"   // batched_attention, scores conversions, ...
+
+using namespace gemma4_unified_kernels;
 #include <cmath>
 #include <climits>
 #include <optional>

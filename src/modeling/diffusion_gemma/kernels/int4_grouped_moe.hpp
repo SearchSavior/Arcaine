@@ -14,6 +14,14 @@
 #include "runtime/quantization/int4.hpp"
 #include "runtime/quantization/q8_0.hpp" // DPAS builtin declaration / vector operand types.
 
+// Model-local namespace: this kernel is a per-model survivor (see AGENTS.md
+// model isolation). Global-scope inline functions with identical names in
+// other models would ODR-merge at link time; divergent bodies would then crash
+// at runtime. DiffusionGemma's grouped INT4 MoE GEMM differs from the
+// Qwen3.5-MoE variant (GeGLU vs SwiGLU epilogue, different zero-point math),
+// so it stays per-model and namespaced.
+namespace diffusion_gemma_kernels {
+
 static constexpr int kInt4GroupedDpasBF16 = 0x3000;
 
 // Make a compact expert-major route list entirely on device.  offsets has
@@ -209,3 +217,5 @@ inline void matmul_int4_grouped_dpas_down(
             });
     });
 }
+
+} // namespace diffusion_gemma_kernels

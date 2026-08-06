@@ -17,8 +17,8 @@
 #include "runtime/gpu/buffer.hpp"
 #include "runtime/gpu/engine.hpp"
 #include "runtime/gpu/ops.hpp"
-#include "modeling/diffusion_gemma/kernels/elementwise.hpp"
-#include "modeling/diffusion_gemma/kernels/rms_norm.hpp"
+#include "runtime/kernels/elementwise.hpp"
+#include "runtime/kernels/rms_norm.hpp"
 #include "modeling/diffusion_gemma/fusions/int4_awq.hpp"
 #include "modeling/diffusion_gemma/fusions/postnorm.hpp"
 #include <algorithm>

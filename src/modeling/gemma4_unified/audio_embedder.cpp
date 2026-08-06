@@ -1,7 +1,7 @@
 #include "audio_embedder.hpp"
 #include "../../runtime/gpu/engine.hpp"
 #include "../../runtime/gpu/ops.hpp"
-#include "kernels/rms_norm.hpp"
+#include "runtime/kernels/rms_norm.hpp"
 #include <stdexcept>
 
 GpuBuffer<bf16> audio_embedder_forward(

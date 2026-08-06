@@ -5,8 +5,15 @@
 #include <optional>
 
 #include "runtime/gpu/ops.hpp"
-#include "attention_mask.hpp"
-#include "attention_layout.hpp"
+#include "runtime/kernels/attention_mask.hpp"
+#include "runtime/kernels/attention_layout.hpp"
+
+// Model-local namespace: this kernel is a per-model survivor (see AGENTS.md
+// model isolation). Global-scope inline functions with identical names in other
+// models would ODR-merge at link time; divergent bodies would then crash at
+// runtime. Gemma4's batched attention differs from the Qwen3.5-MoE variant
+// (smaller, no fused decode path), so it stays per-model and namespaced.
+namespace gemma4_unified_kernels {
 
 // ---------------------------------------------------------------------------
 // Reusable GQA-aware batched dot-product attention building blocks.
@@ -134,3 +141,5 @@ inline GpuBuffer<bf16> batched_attention(
 
     return ctx_tm;
 }
+
+} // namespace gemma4_unified_kernels
