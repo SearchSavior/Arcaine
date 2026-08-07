@@ -78,6 +78,19 @@ inline bool qwen35_fused_esimd_delta_decode_enabled() {
     return enabled;
 }
 
+// Largest batch the per-token fused decode core is used for. Above this the
+// chunked path wins, and prefill is far above it. Speculative verify windows
+// are a handful of tokens, so the default covers them.
+inline int qwen35_fused_decode_max_seq() {
+    static int limit = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_FUSED_DECODE_MAX_SEQ");
+        if (!value) return 8;
+        int parsed = std::atoi(value);
+        return parsed > 0 ? parsed : 8;
+    }();
+    return limit;
+}
+
 inline void matmul_proj(const bf16* A, int M, int K, const Qwen35Proj& W,
                         bf16* C, GpuEngine& context) {
     if (const auto* w = std::get_if<Fp8Linear>(&W))
@@ -198,34 +211,58 @@ inline void qwen35_linear_attention_forward(
         matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkv,
                     workspace.tmp0.data(), context);
     }
-    if (seq == 1 && weights.fused_projections &&
-        qwen35_fused_esimd_delta_decode_enabled()) {
-        if (qwen35_fused_ba_projection_enabled())
-            matmul_bf16(hidden, 1, c.hidden_size, weights.in_proj_ba.data(),
-                        2 * heads, workspace.tmp1.data(), context);
-        else {
-            matmul_bf16(hidden, 1, c.hidden_size, weights.in_proj_b.data(), heads,
-                        workspace.tmp1.data(), context);
-            matmul_bf16(hidden, 1, c.hidden_size, weights.in_proj_a.data(), heads,
-                        workspace.tmp1.data() + heads, context);
+    // The fused decode core handles one token, so a short batch runs it once
+    // per token rather than falling through to the chunked path below. Batch
+    // size then stops selecting between two implementations that do not agree
+    // numerically: before this, a two-token forward and two one-token forwards
+    // over the same tokens produced different logits, which is visible as soon
+    // as anything verifies a batch against sequential decoding.
+    //
+    // Only the recurrent core loops. The projection above is already batched
+    // over the whole window, so this re-reads the recurrent state and the small
+    // conv/gate tensors, not the weights.
+    if (seq >= 1 && seq <= qwen35_fused_decode_max_seq() &&
+        weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled()) {
+        for (int token = 0; token < seq; ++token) {
+            const bf16* token_hidden = hidden + (size_t)token * c.hidden_size;
+            const bf16* projected =
+                workspace.tmp0.data() + (size_t)token * projected_stride;
+            bf16* ba = workspace.tmp1.data() + (size_t)token * 2 * heads;
+            bf16* core = workspace.tmp4.data() + (size_t)token * value_dim;
+            bf16* gate = workspace.tmp2.data() + (size_t)token * value_dim;
+
+            // Kept at M=1 so a token sees the same projection arithmetic it
+            // would have seen decoding alone. These weights are a few hundred
+            // KB against the tens of GB a decode step already moves.
+            if (qwen35_fused_ba_projection_enabled())
+                matmul_bf16(token_hidden, 1, c.hidden_size,
+                            weights.in_proj_ba.data(), 2 * heads, ba, context);
+            else {
+                matmul_bf16(token_hidden, 1, c.hidden_size,
+                            weights.in_proj_b.data(), heads, ba, context);
+                matmul_bf16(token_hidden, 1, c.hidden_size,
+                            weights.in_proj_a.data(), heads, ba + heads, context);
+            }
+            qwen35_delta_decode_fused_esimd(
+                queue, projected, projected_stride,
+                weights.conv1d_time_major.data(), cache.conv_state.data(),
+                weights.A_log.data(), weights.dt_bias.data(), ba,
+                cache.recurrent_state.data(), core, gate,
+                c.linear_num_key_heads, heads, c.linear_key_head_dim,
+                c.linear_value_head_dim, conv_dim, c.linear_conv_kernel_dim,
+                c.rms_norm_eps);
+            // Shifts this token into the history before the next reads it. The
+            // in-order queue keeps the core and the update interleaved.
+            qwen35_update_conv_state_time_major(queue, projected,
+                                                projected_stride,
+                                                cache.conv_state.data(), conv_dim);
         }
-        qwen35_delta_decode_fused_esimd(
-            queue, workspace.tmp0.data(), projected_stride,
-            weights.conv1d_time_major.data(), cache.conv_state.data(),
-            weights.A_log.data(), weights.dt_bias.data(), workspace.tmp1.data(),
-            cache.recurrent_state.data(), workspace.tmp4.data(),
-            workspace.tmp2.data(), c.linear_num_key_heads, heads,
-            c.linear_key_head_dim, c.linear_value_head_dim, conv_dim,
-            c.linear_conv_kernel_dim, c.rms_norm_eps);
-        qwen35_update_conv_state_time_major(
-            queue, workspace.tmp0.data(), projected_stride,
-            cache.conv_state.data(), conv_dim);
         cache.has_state = true;
         gated_rmsnorm(
             queue, workspace.tmp4.data(), workspace.tmp2.data(),
-            weights.norm.data(), workspace.tmp4.data(), heads,
+            weights.norm.data(), workspace.tmp4.data(), seq * heads,
             c.linear_value_head_dim, c.rms_norm_eps);
-        matmul_proj(workspace.tmp4.data(), 1, value_dim, weights.out_proj,
+        matmul_proj(workspace.tmp4.data(), seq, value_dim, weights.out_proj,
                     output, context);
         return;
     }
