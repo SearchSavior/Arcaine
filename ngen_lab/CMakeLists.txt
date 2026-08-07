@@ -15,6 +15,23 @@ include_directories(${NGEN_DIR})
 add_executable(ngen_lab ngen_dpas_8x8_matmul_bf16_16x16x32.cpp ${NGEN_DIR}/ngen_register_allocator.cpp)
 target_link_libraries(ngen_lab PRIVATE ze_loader ${CMAKE_DL_LIBS})
 
+# One target per fixed-shape kernel file. The kernel name encodes its operand
+# types and shape (e.g. s4 = s8 x s4 int4 weights); each file represents exactly
+# one shape. Target name = file stem (ngen_dpas_8x8_matmul_s4_16x16x32 -> ...).
+# Only kernels that pass correctness on Xe2 are kept; the types that the
+# hardware does not support are documented in docs/findings.md (never built).
+set(NGEN_LAB_WORKING_KERNELS
+        ngen_dpas_8x8_matmul_s8_16x16x32
+        ngen_dpas_8x8_matmul_s4_16x16x32
+        ngen_dpas_8x8_matmul_w8a2_16x16x32
+        ngen_dpas_8x8_matmul_w4a8_16x16x32)
+
+foreach(kernel_stem IN LISTS NGEN_LAB_WORKING_KERNELS)
+    add_executable(${kernel_stem} ${kernel_stem}.cpp
+            ${NGEN_DIR}/ngen_register_allocator.cpp)
+    target_link_libraries(${kernel_stem} PRIVATE ze_loader ${CMAKE_DL_LIBS})
+endforeach()
+
 add_executable(ngen_lab_asmdump ngen_lab_asm.cpp)
 target_compile_definitions(ngen_lab_asmdump PRIVATE NGEN_ASM)
 

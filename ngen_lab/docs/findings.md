@@ -133,10 +133,22 @@ follows this.
 
 ## 5. Files
 
-- `ngen_dpas_8x8_matmul_bf16_16x16x32.cpp` — L0 harness: device/queue selection, correctness
-  vs CPU ref, perf reporting, env knobs.
-- `ngen_dpas_8x8_matmul_bf16_16x16x32.hpp` — shared kernel bodies (compiled by both generators).
-- `ngen_lab_asm.cpp` — textual asm dump binary (`ngen_lab_asmdump`).
+- `ngen_dpas_8x8_matmul_bf16_16x16x32.cpp` + `.hpp` — bf16 x bf16 (L0 harness,
+  correctness vs CPU ref, perf).
+- `ngen_dpas_8x8_matmul_s8_16x16x32.cpp` + `.hpp` — s8 x s8 -> s32 (PASS,
+  ~363 TFLOPS). Header namespace `ngen_lab::s8`.
+- `ngen_dpas_8x8_matmul_s4_16x16x32.cpp` + `.hpp` — s8 x s4 -> s32, int4 weights
+  (PASS). Header namespace `ngen_lab::s4`.
+- `ngen_dpas_8x8_matmul_w8a2_16x16x32.cpp` + `.hpp` — s8 x s2 -> s32, int2
+  weights (PASS). Header namespace `ngen_lab::w8a2`.
+- `ngen_dpas_8x8_matmul_w4a8_16x16x32.cpp` + `.hpp` — s4 x s8 -> s32, int4
+  activations (PASS). Header namespace `ngen_lab::w4a8`.
+- Each `.hpp` holds the kernel-body authors templated on the generator, so the
+  same body compiles against both the binary generator (harness) and the text
+  generator (asm dump). Distinct nested namespaces avoid cross-kernel symbol
+  collisions when a TU includes multiple headers.
+- `ngen_lab_asm.cpp` — textual asm dump binary (`ngen_lab_asmdump`); dumps all
+  five kernels (bf16 dpas+scalar, s8, s4, w8a2, w4a8).
 - `l0_min.cpp` — compile-time stage ladder (0-7) for bisection; stage 6/7 run
   the real DPAS/scalar bodies.
 - `iga_dis.cpp` — raw Gen-ISA disassembler (optional; wired into CMake if IGA
@@ -147,7 +159,37 @@ follows this.
 ```sh
 cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx
 cmake --build build -j$(nproc)
-NGEN_LAB_DEVIDX=1 NGEN_LAB_KERNELS=both ./build/ngen_lab      # correctness + perf
-./build/ngen_lab_asmdump dpas.asm scalar.asm                  # textual assembly
+# One build target per kernel file (name = operand types + shape):
+NGEN_LAB_DEVIDX=1 NGEN_LAB_KERNELS=both ./build/ngen_lab  # bf16 x bf16
+NGEN_LAB_DEVIDX=1 ./build/ngen_dpas_8x8_matmul_s8_16x16x32     # s8 x s8 (PASS)
+NGEN_LAB_DEVIDX=1 ./build/ngen_dpas_8x8_matmul_s4_16x16x32     # s8 x s4, int4 weights (PASS)
+NGEN_LAB_DEVIDX=1 ./build/ngen_dpas_8x8_matmul_w8a2_16x16x32   # s8 x s2, int2 weights (PASS)
+NGEN_LAB_DEVIDX=1 ./build/ngen_dpas_8x8_matmul_w4a8_16x16x32   # s4 x s8, int4 activations (PASS)
+./build/ngen_lab_asmdump                                   # asm dumps for all 5 kernels
 L0_MIN_DEVIDX=1 ./build/l0_min_s3                             # hardware health probe
 ```
+
+## 7. What does NOT work on Xe2 (documented, no code kept)
+
+The following operand-type combinations were implemented and tested on BMG; they
+fail and are intentionally not kept as buildable kernels. Evidence and exact
+layouts were recorded in project memory (`ngen_lab_int2.md`, `ngen_lab_int4.md`,
+`ngen_lab_fp.md`).
+
+| Combo | Failure mode |
+|---|---|
+| s4 x s4 (w4a4) | ngen encodes; hardware computes garbage (deterministic wrong values) |
+| s2 x s2 | ngen encodes; hardware computes garbage |
+| s2 x s8 (w2a8) | ngen encodes; hardware computes garbage |
+| fp8 x fp8 | ngen encodes; hardware returns `inf` (misreads fp8 operands) |
+| fp4 x fp4 (e2m1) | ngen rejects at encode (`invalid_type_exception`; fp4 is Xe3/`bdpas` only) |
+| f16 x s4 (w4a16) | ngen rejects at encode (ternary operand type-family mismatch) |
+| dpas sdepth < 8 | ngen encodes and reads correct registers, but computes wrong results for every B layout tried; oneDNN always uses sdepth 8 |
+
+General rules that follow (all verified empirically):
+- Sub-byte precision (s4, s2) works on **one** dpas operand only, and only on the
+  src2 (weights) side; not in src1 (activations), not both.
+- 16-bit float (bf16/f16) and 8-bit int (s8) are the only native dpas types;
+  everything else requires upconversion or Xe3's `bdpas`.
+- True fp4/fp8/int2-both-sides matmul needs Xe3 (`bdpas`, fused scale operands
+  src3/src4).
