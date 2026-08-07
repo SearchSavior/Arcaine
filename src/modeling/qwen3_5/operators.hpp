@@ -99,6 +99,10 @@ inline void matmul_proj(const bf16* A, int M, int K, const Qwen35Proj& W,
         matmul_int4(A, M, K, std::get<Int4Linear>(W), C, context);
 }
 
+// Gates the fused [b|a] projection on the M=1 decode path only. The
+// multi-token prefill path cannot use it - the fused output interleaves b and
+// a per token, which is not the layout its consumers read - and no longer
+// consults this flag.
 inline bool qwen35_fused_ba_projection_enabled() {
     static bool enabled = [] {
         const char* value =
@@ -292,15 +296,31 @@ inline void qwen35_linear_attention_forward(
                     workspace.tmp0.data(), context);
     bf16* beta = workspace.tmp1.data();
     bf16* g = workspace.tmp1.data() + head_values;
-    if (qwen35_fused_ba_projection_enabled())
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_ba.data(),
-                    2 * heads, beta, context);
-    else {
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_b.data(), heads,
-                    beta, context);
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
-                    g, context);
-    }
+    // Two matmuls, deliberately, even though a fused [b|a] weight exists.
+    //
+    // matmul_bf16 writes C(M,N) row-major, and in_proj_ba stacks b's rows then
+    // a's, so C(seq, 2*heads) comes back with each token's b and a adjacent:
+    // token t occupies [t*2*heads, (t+1)*2*heads). The two consumers below read
+    // separate contiguous blocks instead - beta at tmp1 and g at
+    // tmp1 + seq*heads, both indexed [token * heads + head] - which describes
+    // the same bytes only when seq == 1.
+    //
+    // Using the fused matmul here therefore fed the DeltaNet recurrence some
+    // other token's gate values for every token after the first, on the
+    // default configuration, for any prompt longer than the fused-decode
+    // guard's 8 tokens. Measured against a corrected engine over 1000 records:
+    // top-1 agreement 0.87 and perplexity 191.99 against 186.16.
+    //
+    // It survived because the decode path above builds ba per token at M=1,
+    // where the two layouts coincide, and because scrambled gates perturb the
+    // output rather than obviously breaking it.
+    //
+    // These are hidden_size x heads GEMMs, launch-bound at any sequence
+    // length: pp512 measures 664.45 -> 664.20 t/s, inside run-to-run noise.
+    matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_b.data(), heads,
+                beta, context);
+    matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
+                g, context);
     sigmoid_inplace(queue, beta, head_values);
     qwen35_compute_g(queue, g, weights.A_log.data(), weights.dt_bias.data(),
                      g, seq, heads);
