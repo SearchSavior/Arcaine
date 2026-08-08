@@ -225,8 +225,38 @@ inline void qwen35_linear_attention_forward(
     // Only the recurrent core loops. The projection above is already batched
     // over the whole window, so this re-reads the recurrent state and the small
     // conv/gate tensors, not the weights.
+    // qwen35_esimd_delta_enabled() belongs here even though this arm never
+    // calls qwen35_recurrent_delta_esimd.
+    //
+    // Both arms advance the same cache.recurrent_state, and the three
+    // recurrent implementations do not agree on its layout:
+    //
+    //   qwen35_recurrent_delta        state[head*K*V + k*V + v]  [head][key][value]
+    //   qwen35_recurrent_delta_esimd  state[head*V*K + v*K + k]  [head][value][key]
+    //   qwen35_delta_decode_fused_esimd (below)                  [head][value][key]
+    //
+    // K and V are both 128 here, so a mismatch is exactly size-compatible:
+    // nothing faults, the state is silently transposed between the prefill
+    // that wrote it and the decode that reads it.
+    //
+    // Without this term, ARCAINE_QWEN35_ESIMD_DELTA=0 selects the scalar
+    // kernel for prefill while leaving the fused ESIMD core on for decode, and
+    // the two corrupt each other across every generation. Measured over 400
+    // teacher-forced records, that arm agreed with the default configuration on
+    // 33.75% of tokens, against 92% or better for every other kernel flag.
+    // An fp64 host reference puts both recurrent kernels within 0.67 bf16 ULP
+    // of the true recurrence, so neither was ever at fault - only the pairing.
+    // With this term the same arm reports 92.75%, in line with the rest.
+    //
+    // kernels.hpp already noted that a cache must not switch layouts
+    // mid-stream; nothing enforced it. The flag now switches the whole
+    // DeltaNet path coherently, which is what a baseline A/B switch should do.
+    // The deeper fix is to give the scalar kernel the same [head][value][key]
+    // layout so no combination can mix them; this makes the unsafe one
+    // unreachable meanwhile.
     if (seq >= 1 && seq <= qwen35_fused_decode_max_seq() &&
-        weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled()) {
+        weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled() &&
+        qwen35_esimd_delta_enabled()) {
         for (int token = 0; token < seq; ++token) {
             const bf16* token_hidden = hidden + (size_t)token * c.hidden_size;
             const bf16* projected =
