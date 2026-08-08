@@ -37,6 +37,20 @@ if(TARGET arcaine_model_qwen3_5)
     add_test(NAME modeling/qwen3_5/output_parser
              COMMAND arcaine_test_qwen3_5_output_parser)
 
+    # Conv-state layout contract between the chunked and fused decode paths.
+    # Needs a GPU but no model dir, so it runs under ctest.
+    add_executable(arcaine_test_qwen3_5_conv_state_layout
+        ${CMAKE_CURRENT_SOURCE_DIR}/modeling/qwen3_5/test_conv_state_layout.cpp)
+    target_link_libraries(arcaine_test_qwen3_5_conv_state_layout PRIVATE
+        arcaine_model_qwen3_5 DNNL::dnnl)
+    target_compile_options(arcaine_test_qwen3_5_conv_state_layout PRIVATE
+        -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+    target_link_options(arcaine_test_qwen3_5_conv_state_layout PRIVATE
+        -fsycl ${ARCAINE_SYCL_TARGET_FLAG}
+        -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+    add_test(NAME modeling/qwen3_5/conv_state_layout
+             COMMAND arcaine_test_qwen3_5_conv_state_layout)
+
     add_executable(arcaine_smoke_qwen35
         ${CMAKE_CURRENT_SOURCE_DIR}/modeling/qwen3_5/smoke_service.cpp)
     target_link_libraries(arcaine_smoke_qwen35 PRIVATE arcaine_model_qwen3_5 DNNL::dnnl)
