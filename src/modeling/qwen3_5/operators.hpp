@@ -54,6 +54,55 @@ inline bool qwen35_xmx_attention_enabled() {
     return enabled;
 }
 
+inline bool qwen35_splitkv_decode_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_DECODE_XMX_SPLITKV");
+        // Flash-style split-KV decode: partition the KV range across S WGs,
+        // each keeping flash-softmax partials (m_p, l_p, O_p), combined in a
+        // second kernel. The long-KV decode is latency-bound (serial 16-key
+        // blocks + 2 barriers each in the general kernel), so S-way scan
+        // parallelism hides the latency. Opt-in for A/B.
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
+inline int qwen35_splitkv_decode_slices() {
+    static int slices = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_DECODE_SPLITKV_SLICES");
+        // 16 slices measured optimal on B70 (32 saturates; 8 leaves ~15% on
+        // the table at d8192). d8192 decode: 6.75 -> 20.59 t/s vs baseline.
+        if (!value) return 16;
+        int parsed = std::atoi(value);
+        return parsed > 0 ? parsed : 16;
+    }();
+    return slices;
+}
+
+inline bool qwen35_xmx_decode_gqa_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_DECODE_XMX_GQA");
+        // Decode-optimized GQA-reuse XMX kernel: one WG per (KV head,
+        // partition) loads K/V once and reuses it across the GQA group, vs
+        // the general per-(query, output)-tile kernel which re-reads the same
+        // KV head's cache for each query head (up to 6x redundant loads at
+        // GQA 6:1).
+        //
+        // A/B (2026-08-08): this swap is essentially throughput-neutral on the
+        // measured sweep (tg128 @ d0 24.93 vs 25.02, @ d8192 6.21 vs 6.76) —
+        // the long-KV decode is bounded by the online-softmax KV-scan
+        // *latency* (per-block barriers over 24 WGs), not by KV DRAM traffic,
+        // which the GQA reuse does not reduce. Default OFF keeps the
+        // general-kernel behavior; keep this opt-in for A/B only.
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
 inline bool qwen35_esimd_delta_enabled() {
     static bool enabled = [] {
         const char* value = std::getenv("ARCAINE_QWEN35_ESIMD_DELTA");
@@ -163,11 +212,53 @@ inline void qwen35_full_attention_forward(
     cache.filled = past + seq;
 
     if (qwen35_xmx_attention_enabled()) {
-        qwen35_xmx_attention(
-            queue, workspace.tmp2.data(), cache.key.data(), cache.value.data(),
-            workspace.tmp2.data(), seq, past, c.num_attention_heads,
-            c.num_key_value_heads, c.head_dim,
-            1.0f / std::sqrt((float)c.head_dim));
+        if (seq == 1 && qwen35_splitkv_decode_enabled() &&
+            c.num_attention_heads % c.num_key_value_heads == 0 &&
+            c.num_attention_heads / c.num_key_value_heads <= 8) {
+            // M=1 decode, split-KV: partition the KV scan across S WGs
+            // (flash-attention partial softmax states, combined in a second
+            // kernel). Reads query across the whole head group while WGs write
+            // disjoint partials to scratch and the combine writes output —
+            // query and output MUST be separate buffers: write to tmp4 (free
+            // after the KV cache store) then copy back to tmp2.
+            int slices = qwen35_splitkv_decode_slices();
+            if (slices > Qwen35Workspace::decode_max_kv_slices)
+                slices = Qwen35Workspace::decode_max_kv_slices;
+            qwen35_xmx_attention_decode_gqa_splitkv(
+                queue, workspace.tmp2.data(), cache.key.data(),
+                cache.value.data(), workspace.tmp4.data(), past,
+                c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                1.0f / std::sqrt((float)c.head_dim),
+                workspace.decode_part_out.data(),
+                workspace.decode_part_state.data(), slices);
+            const size_t qdim = (size_t)seq * query_dim;
+            queue.memcpy(workspace.tmp2.data(), workspace.tmp4.data(),
+                         qdim * sizeof(bf16));
+        } else if (seq == 1 && qwen35_xmx_decode_gqa_enabled() &&
+            c.num_attention_heads % c.num_key_value_heads == 0 &&
+            c.num_attention_heads / c.num_key_value_heads <= 8) {
+            // M=1 decode: the GQA-reuse kernel computes a KV head's query
+            // group together, loading K/V once per KV head instead of once per
+            // query head (6x redundant KV traffic at GQA 6:1). It reads query
+            // across the whole head group while partitions write disjoint
+            // output dims, so query and output MUST be separate buffers —
+            // write to tmp4 (free after the KV cache store) then copy back to
+            // tmp2 to keep the downstream in-place flow.
+            qwen35_xmx_attention_decode_gqa(
+                queue, workspace.tmp2.data(), cache.key.data(),
+                cache.value.data(), workspace.tmp4.data(), past,
+                c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                1.0f / std::sqrt((float)c.head_dim));
+            const size_t qdim = (size_t)seq * query_dim;
+            queue.memcpy(workspace.tmp2.data(), workspace.tmp4.data(),
+                         qdim * sizeof(bf16));
+        } else {
+            qwen35_xmx_attention(
+                queue, workspace.tmp2.data(), cache.key.data(),
+                cache.value.data(), workspace.tmp2.data(), seq, past,
+                c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                1.0f / std::sqrt((float)c.head_dim));
+        }
     } else if (qwen35_subgroup_attention_enabled()) {
         qwen35_online_attention_subgroup(
             queue, workspace.tmp2.data(), cache.key.data(), cache.value.data(),

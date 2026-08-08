@@ -1058,3 +1058,214 @@ inline void qwen35_xmx_attention_decode_gqa(
             });
     });
 }
+
+// Flash-style split-KV GQA decode attention. The long-KV decode scan in
+// qwen35_xmx_attention_decode_gqa is latency-bound: one WG per (key_head,
+// partition) serially scans the whole KV cache in 16-key blocks with two
+// full-WG barriers per block, so at past=8192 it runs ~512 serial iterations
+// and the small grid cannot hide the barrier/DPAS latency (measured effective
+// bandwidth ~4 GB/s/layer vs 792 GB/s peak — not bandwidth-bound). This
+// variant divides the KV range into kv_slices slices; each slice is scanned by
+// its own WG (grid = key_heads * slices * partitions), keeping the
+// flash-attention partial softmax state (m_p, l_p, O_p) in global scratch. A
+// tiny second kernel combines the partials with the global max, exactly like
+// flash-attention split-KV. S-way scan parallelism hides the latency.
+inline void qwen35_xmx_attention_decode_gqa_splitkv(
+    sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
+    bf16* output, int past, int query_heads, int key_heads, int head_dim,
+    float scale, float* part_out, float* part_state, int kv_slices) {
+    if (head_dim != 256 || query_heads % key_heads != 0 ||
+        query_heads / key_heads > 8 || kv_slices < 1)
+        throw std::runtime_error("Qwen3.5 split-KV decode kernel shape mismatch");
+    constexpr int subgroup_size = 16;
+    constexpr int rows = 8;
+    constexpr int output_tiles = 16;
+    constexpr int partitions = 4;
+    constexpr int output_tiles_per_partition = output_tiles / partitions;
+    constexpr int work_group = subgroup_size * output_tiles_per_partition;
+    // part_out layout: [key_head][slice][partition][row][64]
+    constexpr int slice_out_stride = partitions * rows * 64;
+    constexpr int part_out_stride = rows * 64;
+    // part_state layout: [key_head][slice][row][2] (m_p, l_p)
+    constexpr int slice_state_stride = rows * 2;
+    const int queries_per_key = query_heads / key_heads;
+    const int visible_tokens = past + 1;
+    const int slice_len = (visible_tokens + kv_slices - 1) / kv_slices;
+
+    // Kernel 1: per-(key_head, slice, partition) WG scans only its KV slice.
+    queue.submit([&](sycl::handler& handler) {
+        sycl::local_accessor<float, 1> shared(
+            rows * subgroup_size + 2 * rows, handler);
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                (size_t)key_heads * kv_slices * partitions * work_group,
+                work_group),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                int group = static_cast<int>(item.get_group(0));
+                int key_head = group / (kv_slices * partitions);
+                int slice = (group / partitions) % kv_slices;
+                int partition = group % partitions;
+                auto subgroup = item.get_sub_group();
+                int local_output_tile =
+                    static_cast<int>(subgroup.get_group_linear_id());
+                int output_tile = partition * output_tiles_per_partition +
+                    local_output_tile;
+                int lane = static_cast<int>(subgroup.get_local_linear_id());
+                int query_head0 = key_head * queries_per_key;
+                diff_dpas_v8f output_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                float running_max[rows];
+                float running_sum[rows];
+                for (int row = 0; row < rows; ++row) {
+                    running_max[row] = -INFINITY;
+                    running_sum[row] = 0.0f;
+                }
+
+                int slice_start = slice * slice_len;
+                int slice_end = slice_start + slice_len;
+                if (slice_end > visible_tokens) slice_end = visible_tokens;
+                for (int key0 = slice_start; key0 < slice_end;
+                     key0 += subgroup_size) {
+                    if (local_output_tile == 0) {
+                        diff_dpas_v8f scores = {0, 0, 0, 0, 0, 0, 0, 0};
+                        for (int kt = 0; kt < head_dim / subgroup_size; ++kt) {
+                            int dimension = kt * subgroup_size + lane;
+                            diff_dpas_v8s query_fragment;
+                            for (int row = 0; row < rows; ++row) {
+                                query_fragment[row] = row < queries_per_key
+                                    ? static_cast<short>(query[
+                                        (size_t)(query_head0 + row) * head_dim +
+                                        dimension])
+                                    : 0;
+                            }
+                            diff_dpas_v8i key_fragment;
+                            int key_position = key0 + lane;
+                            for (int pair = 0; pair < 8; ++pair) {
+                                uint32_t packed = 0;
+                                if (key_position < visible_tokens) {
+                                    const bf16* key_row = key +
+                                        ((size_t)key_position * key_heads +
+                                         key_head) * head_dim;
+                                    packed = static_cast<uint32_t>(
+                                        key_row[kt * 16 + pair * 2]) |
+                                        (static_cast<uint32_t>(
+                                            key_row[kt * 16 + pair * 2 + 1]) << 16);
+                                }
+                                key_fragment[pair] = static_cast<int>(packed);
+                            }
+                            scores =
+                                __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                                    16, query_fragment, key_fragment, scores,
+                                    kNvfp4DpasBF16);
+                        }
+
+                        for (int row = 0; row < rows; ++row) {
+                            int key_position = key0 + lane;
+                            bool visible = row < queries_per_key &&
+                                           key_position < visible_tokens;
+                            float score = visible ? scores[row] * scale : -INFINITY;
+                            float block_max = sycl::reduce_over_group(
+                                subgroup, score, sycl::maximum<float>());
+                            float next_max = sycl::fmax(running_max[row], block_max);
+                            float alpha = sycl::exp(running_max[row] - next_max);
+                            float probability = visible
+                                ? sycl::exp(score - next_max) : 0.0f;
+                            float block_sum = sycl::reduce_over_group(
+                                subgroup, probability, sycl::plus<float>());
+                            running_sum[row] =
+                                running_sum[row] * alpha + block_sum;
+                            running_max[row] = next_max;
+                            shared[row * subgroup_size + lane] = probability;
+                            if (lane == 0)
+                                shared[rows * subgroup_size + row] = alpha;
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int row = 0; row < rows; ++row)
+                        output_acc[row] *= shared[rows * subgroup_size + row];
+                    diff_dpas_v8s probability_fragment;
+                    for (int row = 0; row < rows; ++row)
+                        probability_fragment[row] = static_cast<short>(
+                            float_to_bf16(shared[row * subgroup_size + lane]));
+                    diff_dpas_v8i value_fragment;
+                    int output_dimension = output_tile * subgroup_size + lane;
+                    for (int pair = 0; pair < 8; ++pair) {
+                        int key_position0 = key0 + pair * 2;
+                        uint32_t packed = 0;
+                        if (key_position0 < visible_tokens) {
+                            bf16 low = value[
+                                ((size_t)key_position0 * key_heads + key_head) *
+                                    head_dim + output_dimension];
+                            bf16 high = 0;
+                            if (key_position0 + 1 < visible_tokens)
+                                high = value[
+                                    ((size_t)(key_position0 + 1) * key_heads +
+                                     key_head) * head_dim + output_dimension];
+                            packed = static_cast<uint32_t>(low) |
+                                     (static_cast<uint32_t>(high) << 16);
+                        }
+                        value_fragment[pair] = static_cast<int>(packed);
+                    }
+                    output_acc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                        16, probability_fragment, value_fragment, output_acc,
+                        kNvfp4DpasBF16);
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                // Store flash partials: SG0 lane 0 owns running_max/sum for
+                // all rows; every lane stores its output tile's accumulator.
+                if (local_output_tile == 0 && lane == 0) {
+                    size_t state_base =
+                        ((size_t)key_head * kv_slices + slice) *
+                        slice_state_stride;
+                    for (int row = 0; row < rows; ++row) {
+                        part_state[state_base + row * 2 + 0] = running_max[row];
+                        part_state[state_base + row * 2 + 1] = running_sum[row];
+                    }
+                }
+                size_t out_base =
+                    ((size_t)key_head * kv_slices + slice) * slice_out_stride +
+                    partition * part_out_stride;
+                for (int row = 0; row < queries_per_key; ++row)
+                    part_out[out_base + row * 64 +
+                             local_output_tile * subgroup_size + lane] =
+                        output_acc[row];
+            });
+    });
+
+    // Kernel 2: combine partials across slices (global-max softmax merge).
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::range<1>((size_t)key_heads * queries_per_key * head_dim),
+            [=](sycl::id<1> id) {
+                int dim = id[0] % head_dim;
+                int row = (id[0] / head_dim) % queries_per_key;
+                int key_head = id[0] / (head_dim * queries_per_key);
+                int partition = dim / 64;
+                int d64 = dim % 64;
+                size_t state_base = (size_t)key_head * kv_slices *
+                                    slice_state_stride;
+                size_t out_base =
+                    (size_t)key_head * kv_slices * slice_out_stride +
+                    partition * part_out_stride + row * 64 + d64;
+                float m = -INFINITY;
+                for (int s = 0; s < kv_slices; ++s)
+                    m = sycl::fmax(
+                        m, part_state[state_base + s * slice_state_stride +
+                                      row * 2 + 0]);
+                float o = 0.0f, l = 0.0f;
+                for (int s = 0; s < kv_slices; ++s) {
+                    float ms = part_state[state_base + s * slice_state_stride +
+                                          row * 2 + 0];
+                    float ls = part_state[state_base + s * slice_state_stride +
+                                          row * 2 + 1];
+                    float e = sycl::exp(ms - m);
+                    o += part_out[out_base + s * slice_out_stride] * e;
+                    l += ls * e;
+                }
+                float result = (l > 0.0f) ? (o / l) : 0.0f;
+                output[((size_t)key_head * queries_per_key + row) * head_dim +
+                       dim] = float_to_bf16(result);
+            });
+    });
+}

@@ -18,6 +18,16 @@ struct Qwen35Workspace {
     GpuBuffer<uint8_t> input_scale;
     GpuBuffer<uint8_t> activation_packed;
     GpuBuffer<uint8_t> activation_scale;
+    // Decode split-KV attention partials. Sized for head_dim=256, 8 rows,
+    // 4 partitions, 64 output dims/partition, and max_kv_slices (default 16).
+    // part_out: [key_heads * slices * 4 * 8 * 64] floats; part_state:
+    // [key_heads * slices * 8 * 2] floats (m_p, l_p per row).
+    static constexpr int decode_max_kv_slices = 16;
+    static constexpr int decode_rows = 8;
+    static constexpr int decode_partitions = 4;
+    static constexpr int decode_part_dims = 64;
+    GpuBuffer<float> decode_part_out;
+    GpuBuffer<float> decode_part_state;
 
     void init(const Qwen35Config& config, int max_seq, sycl::queue& queue) {
         max_seq_len = max_seq;
@@ -36,5 +46,11 @@ struct Qwen35Workspace {
         input_scale = GpuBuffer<uint8_t>(s * c.hidden_size / 16, queue);
         activation_packed = GpuBuffer<uint8_t>(s * c.intermediate_size / 2, queue);
         activation_scale = GpuBuffer<uint8_t>(s * c.intermediate_size / 16, queue);
+        size_t out_elems = (size_t)c.num_key_value_heads * decode_max_kv_slices *
+                           decode_partitions * decode_rows * decode_part_dims;
+        size_t state_elems = (size_t)c.num_key_value_heads * decode_max_kv_slices *
+                             decode_rows * 2;
+        decode_part_out = GpuBuffer<float>(out_elems, queue);
+        decode_part_state = GpuBuffer<float>(state_elems, queue);
     }
 };
