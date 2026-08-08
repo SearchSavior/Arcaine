@@ -24,7 +24,8 @@ set(NGEN_LAB_WORKING_KERNELS
         ngen_dpas_8x8_matmul_s8_16x16x32
         ngen_dpas_8x8_matmul_s4_16x16x32
         ngen_dpas_8x8_matmul_w8a2_16x16x32
-        ngen_dpas_8x8_matmul_w4a8_16x16x32)
+        ngen_dpas_8x8_matmul_w4a8_16x16x32
+        ngen_dpas_w4a8_gemm)
 
 foreach(kernel_stem IN LISTS NGEN_LAB_WORKING_KERNELS)
     add_executable(${kernel_stem} ${kernel_stem}.cpp

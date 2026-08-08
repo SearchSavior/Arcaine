@@ -51,8 +51,6 @@ build CMakeFiles/ngen_lab.dir/ngen_dpas_8x8_matmul_bf16_16x16x32.cpp.o: CXX_COMP
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_lab.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_lab.dir
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_lab.dir/
-  TARGET_PDB = ngen_lab.pdb
 
 build CMakeFiles/ngen_lab.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__ngen_lab_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_ngen_lab
   DEFINES = -DNGEN_SAFE
@@ -61,8 +59,6 @@ build CMakeFiles/ngen_lab.dir/workspace/reference/oneDNN/third_party/ngen/ngen_r
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_lab.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_lab.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_lab.dir/
-  TARGET_PDB = ngen_lab.pdb
 
 
 # =============================================================================
@@ -77,9 +73,8 @@ build ngen_lab: CXX_EXECUTABLE_LINKER__ngen_lab_ CMakeFiles/ngen_lab.dir/ngen_dp
   OBJECT_DIR = CMakeFiles/ngen_lab.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_lab.dir/
   TARGET_FILE = ngen_lab
-  TARGET_PDB = ngen_lab.pdb
+  TARGET_PDB = ngen_lab.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target ngen_dpas_8x8_matmul_s8_16x16x32
@@ -97,8 +92,6 @@ build CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir/ngen_dpas_8x8_matmul_s8_16
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir/
-  TARGET_PDB = ngen_dpas_8x8_matmul_s8_16x16x32.pdb
 
 build CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__ngen_dpas_8x8_matmul_s8_16x16x32_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_ngen_dpas_8x8_matmul_s8_16x16x32
   DEFINES = -DNGEN_SAFE
@@ -107,8 +100,6 @@ build CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir/workspace/reference/oneDNN
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir/
-  TARGET_PDB = ngen_dpas_8x8_matmul_s8_16x16x32.pdb
 
 
 # =============================================================================
@@ -123,9 +114,8 @@ build ngen_dpas_8x8_matmul_s8_16x16x32: CXX_EXECUTABLE_LINKER__ngen_dpas_8x8_mat
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_s8_16x16x32.dir/
   TARGET_FILE = ngen_dpas_8x8_matmul_s8_16x16x32
-  TARGET_PDB = ngen_dpas_8x8_matmul_s8_16x16x32.pdb
+  TARGET_PDB = ngen_dpas_8x8_matmul_s8_16x16x32.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target ngen_dpas_8x8_matmul_s4_16x16x32
@@ -143,8 +133,6 @@ build CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir/ngen_dpas_8x8_matmul_s4_16
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir/
-  TARGET_PDB = ngen_dpas_8x8_matmul_s4_16x16x32.pdb
 
 build CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__ngen_dpas_8x8_matmul_s4_16x16x32_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_ngen_dpas_8x8_matmul_s4_16x16x32
   DEFINES = -DNGEN_SAFE
@@ -153,8 +141,6 @@ build CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir/workspace/reference/oneDNN
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir/
-  TARGET_PDB = ngen_dpas_8x8_matmul_s4_16x16x32.pdb
 
 
 # =============================================================================
@@ -169,9 +155,8 @@ build ngen_dpas_8x8_matmul_s4_16x16x32: CXX_EXECUTABLE_LINKER__ngen_dpas_8x8_mat
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_s4_16x16x32.dir/
   TARGET_FILE = ngen_dpas_8x8_matmul_s4_16x16x32
-  TARGET_PDB = ngen_dpas_8x8_matmul_s4_16x16x32.pdb
+  TARGET_PDB = ngen_dpas_8x8_matmul_s4_16x16x32.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target ngen_dpas_8x8_matmul_w8a2_16x16x32
@@ -189,8 +174,6 @@ build CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir/ngen_dpas_8x8_matmul_w8a
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir/
-  TARGET_PDB = ngen_dpas_8x8_matmul_w8a2_16x16x32.pdb
 
 build CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__ngen_dpas_8x8_matmul_w8a2_16x16x32_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_ngen_dpas_8x8_matmul_w8a2_16x16x32
   DEFINES = -DNGEN_SAFE
@@ -199,8 +182,6 @@ build CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir/workspace/reference/oneD
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir/
-  TARGET_PDB = ngen_dpas_8x8_matmul_w8a2_16x16x32.pdb
 
 
 # =============================================================================
@@ -215,9 +196,8 @@ build ngen_dpas_8x8_matmul_w8a2_16x16x32: CXX_EXECUTABLE_LINKER__ngen_dpas_8x8_m
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir/
   TARGET_FILE = ngen_dpas_8x8_matmul_w8a2_16x16x32
-  TARGET_PDB = ngen_dpas_8x8_matmul_w8a2_16x16x32.pdb
+  TARGET_PDB = ngen_dpas_8x8_matmul_w8a2_16x16x32.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target ngen_dpas_8x8_matmul_w4a8_16x16x32
@@ -235,8 +215,6 @@ build CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir/ngen_dpas_8x8_matmul_w4a
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir/
-  TARGET_PDB = ngen_dpas_8x8_matmul_w4a8_16x16x32.pdb
 
 build CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__ngen_dpas_8x8_matmul_w4a8_16x16x32_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_ngen_dpas_8x8_matmul_w4a8_16x16x32
   DEFINES = -DNGEN_SAFE
@@ -245,8 +223,6 @@ build CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir/workspace/reference/oneD
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir/
-  TARGET_PDB = ngen_dpas_8x8_matmul_w4a8_16x16x32.pdb
 
 
 # =============================================================================
@@ -261,9 +237,49 @@ build ngen_dpas_8x8_matmul_w4a8_16x16x32: CXX_EXECUTABLE_LINKER__ngen_dpas_8x8_m
   OBJECT_DIR = CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir/
   TARGET_FILE = ngen_dpas_8x8_matmul_w4a8_16x16x32
-  TARGET_PDB = ngen_dpas_8x8_matmul_w4a8_16x16x32.pdb
+  TARGET_PDB = ngen_dpas_8x8_matmul_w4a8_16x16x32.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ngen_dpas_w4a8_gemm
+
+
+#############################################
+# Order-only phony target for ngen_dpas_w4a8_gemm
+
+build cmake_object_order_depends_target_ngen_dpas_w4a8_gemm: phony || CMakeFiles/ngen_dpas_w4a8_gemm.dir
+
+build CMakeFiles/ngen_dpas_w4a8_gemm.dir/ngen_dpas_w4a8_gemm.cpp.o: CXX_COMPILER__ngen_dpas_w4a8_gemm_unscanned_ /workspace/ngen_lab/ngen_dpas_w4a8_gemm.cpp || cmake_object_order_depends_target_ngen_dpas_w4a8_gemm
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ngen_dpas_w4a8_gemm.dir/ngen_dpas_w4a8_gemm.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ngen_dpas_w4a8_gemm.dir
+  OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_w4a8_gemm.dir
+
+build CMakeFiles/ngen_dpas_w4a8_gemm.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__ngen_dpas_w4a8_gemm_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_ngen_dpas_w4a8_gemm
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ngen_dpas_w4a8_gemm.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ngen_dpas_w4a8_gemm.dir
+  OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_w4a8_gemm.dir/workspace/reference/oneDNN/third_party/ngen
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ngen_dpas_w4a8_gemm
+
+
+#############################################
+# Link the executable ngen_dpas_w4a8_gemm
+
+build ngen_dpas_w4a8_gemm: CXX_EXECUTABLE_LINKER__ngen_dpas_w4a8_gemm_ CMakeFiles/ngen_dpas_w4a8_gemm.dir/ngen_dpas_w4a8_gemm.cpp.o CMakeFiles/ngen_dpas_w4a8_gemm.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ngen_dpas_w4a8_gemm.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ngen_dpas_w4a8_gemm
+  TARGET_PDB = ngen_dpas_w4a8_gemm.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target ngen_lab_asmdump
@@ -281,8 +297,6 @@ build CMakeFiles/ngen_lab_asmdump.dir/ngen_lab_asm.cpp.o: CXX_COMPILER__ngen_lab
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/ngen_lab_asmdump.dir
   OBJECT_FILE_DIR = CMakeFiles/ngen_lab_asmdump.dir
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_lab_asmdump.dir/
-  TARGET_PDB = ngen_lab_asmdump.pdb
 
 
 # =============================================================================
@@ -296,9 +310,8 @@ build ngen_lab_asmdump: CXX_EXECUTABLE_LINKER__ngen_lab_asmdump_ CMakeFiles/ngen
   OBJECT_DIR = CMakeFiles/ngen_lab_asmdump.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/ngen_lab_asmdump.dir/
   TARGET_FILE = ngen_lab_asmdump
-  TARGET_PDB = ngen_lab_asmdump.pdb
+  TARGET_PDB = ngen_lab_asmdump.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target iga_dis
@@ -316,8 +329,6 @@ build CMakeFiles/iga_dis.dir/iga_dis.cpp.o: CXX_COMPILER__iga_dis_unscanned_ /wo
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen -I/opt/intel/oneapi/debugger/latest/opt/debugger/include
   OBJECT_DIR = CMakeFiles/iga_dis.dir
   OBJECT_FILE_DIR = CMakeFiles/iga_dis.dir
-  TARGET_COMPILE_PDB = CMakeFiles/iga_dis.dir/
-  TARGET_PDB = iga_dis.pdb
 
 
 # =============================================================================
@@ -332,9 +343,8 @@ build iga_dis: CXX_EXECUTABLE_LINKER__iga_dis_ CMakeFiles/iga_dis.dir/iga_dis.cp
   OBJECT_DIR = CMakeFiles/iga_dis.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/iga_dis.dir/
   TARGET_FILE = iga_dis
-  TARGET_PDB = iga_dis.pdb
+  TARGET_PDB = iga_dis.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target l0_min_s0
@@ -352,8 +362,6 @@ build CMakeFiles/l0_min_s0.dir/l0_min.cpp.o: CXX_COMPILER__l0_min_s0_unscanned_ 
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s0.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s0.dir
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s0.dir/
-  TARGET_PDB = l0_min_s0.pdb
 
 build CMakeFiles/l0_min_s0.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__l0_min_s0_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_l0_min_s0
   DEFINES = -DNGEN_SAFE -DTEST_STAGE=0
@@ -362,8 +370,6 @@ build CMakeFiles/l0_min_s0.dir/workspace/reference/oneDNN/third_party/ngen/ngen_
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s0.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s0.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s0.dir/
-  TARGET_PDB = l0_min_s0.pdb
 
 
 # =============================================================================
@@ -378,9 +384,8 @@ build l0_min_s0: CXX_EXECUTABLE_LINKER__l0_min_s0_ CMakeFiles/l0_min_s0.dir/l0_m
   OBJECT_DIR = CMakeFiles/l0_min_s0.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s0.dir/
   TARGET_FILE = l0_min_s0
-  TARGET_PDB = l0_min_s0.pdb
+  TARGET_PDB = l0_min_s0.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target l0_min_s1
@@ -398,8 +403,6 @@ build CMakeFiles/l0_min_s1.dir/l0_min.cpp.o: CXX_COMPILER__l0_min_s1_unscanned_ 
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s1.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s1.dir
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s1.dir/
-  TARGET_PDB = l0_min_s1.pdb
 
 build CMakeFiles/l0_min_s1.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__l0_min_s1_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_l0_min_s1
   DEFINES = -DNGEN_SAFE -DTEST_STAGE=1
@@ -408,8 +411,6 @@ build CMakeFiles/l0_min_s1.dir/workspace/reference/oneDNN/third_party/ngen/ngen_
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s1.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s1.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s1.dir/
-  TARGET_PDB = l0_min_s1.pdb
 
 
 # =============================================================================
@@ -424,9 +425,8 @@ build l0_min_s1: CXX_EXECUTABLE_LINKER__l0_min_s1_ CMakeFiles/l0_min_s1.dir/l0_m
   OBJECT_DIR = CMakeFiles/l0_min_s1.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s1.dir/
   TARGET_FILE = l0_min_s1
-  TARGET_PDB = l0_min_s1.pdb
+  TARGET_PDB = l0_min_s1.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target l0_min_s2
@@ -444,8 +444,6 @@ build CMakeFiles/l0_min_s2.dir/l0_min.cpp.o: CXX_COMPILER__l0_min_s2_unscanned_ 
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s2.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s2.dir
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s2.dir/
-  TARGET_PDB = l0_min_s2.pdb
 
 build CMakeFiles/l0_min_s2.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__l0_min_s2_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_l0_min_s2
   DEFINES = -DNGEN_SAFE -DTEST_STAGE=2
@@ -454,8 +452,6 @@ build CMakeFiles/l0_min_s2.dir/workspace/reference/oneDNN/third_party/ngen/ngen_
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s2.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s2.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s2.dir/
-  TARGET_PDB = l0_min_s2.pdb
 
 
 # =============================================================================
@@ -470,9 +466,8 @@ build l0_min_s2: CXX_EXECUTABLE_LINKER__l0_min_s2_ CMakeFiles/l0_min_s2.dir/l0_m
   OBJECT_DIR = CMakeFiles/l0_min_s2.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s2.dir/
   TARGET_FILE = l0_min_s2
-  TARGET_PDB = l0_min_s2.pdb
+  TARGET_PDB = l0_min_s2.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target l0_min_s3
@@ -490,8 +485,6 @@ build CMakeFiles/l0_min_s3.dir/l0_min.cpp.o: CXX_COMPILER__l0_min_s3_unscanned_ 
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s3.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s3.dir
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s3.dir/
-  TARGET_PDB = l0_min_s3.pdb
 
 build CMakeFiles/l0_min_s3.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__l0_min_s3_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_l0_min_s3
   DEFINES = -DNGEN_SAFE -DTEST_STAGE=3
@@ -500,8 +493,6 @@ build CMakeFiles/l0_min_s3.dir/workspace/reference/oneDNN/third_party/ngen/ngen_
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s3.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s3.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s3.dir/
-  TARGET_PDB = l0_min_s3.pdb
 
 
 # =============================================================================
@@ -516,9 +507,8 @@ build l0_min_s3: CXX_EXECUTABLE_LINKER__l0_min_s3_ CMakeFiles/l0_min_s3.dir/l0_m
   OBJECT_DIR = CMakeFiles/l0_min_s3.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s3.dir/
   TARGET_FILE = l0_min_s3
-  TARGET_PDB = l0_min_s3.pdb
+  TARGET_PDB = l0_min_s3.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target l0_min_s4
@@ -536,8 +526,6 @@ build CMakeFiles/l0_min_s4.dir/l0_min.cpp.o: CXX_COMPILER__l0_min_s4_unscanned_ 
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s4.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s4.dir
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s4.dir/
-  TARGET_PDB = l0_min_s4.pdb
 
 build CMakeFiles/l0_min_s4.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__l0_min_s4_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_l0_min_s4
   DEFINES = -DNGEN_SAFE -DTEST_STAGE=4
@@ -546,8 +534,6 @@ build CMakeFiles/l0_min_s4.dir/workspace/reference/oneDNN/third_party/ngen/ngen_
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s4.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s4.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s4.dir/
-  TARGET_PDB = l0_min_s4.pdb
 
 
 # =============================================================================
@@ -562,9 +548,8 @@ build l0_min_s4: CXX_EXECUTABLE_LINKER__l0_min_s4_ CMakeFiles/l0_min_s4.dir/l0_m
   OBJECT_DIR = CMakeFiles/l0_min_s4.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s4.dir/
   TARGET_FILE = l0_min_s4
-  TARGET_PDB = l0_min_s4.pdb
+  TARGET_PDB = l0_min_s4.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target l0_min_s5
@@ -582,8 +567,6 @@ build CMakeFiles/l0_min_s5.dir/l0_min.cpp.o: CXX_COMPILER__l0_min_s5_unscanned_ 
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s5.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s5.dir
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s5.dir/
-  TARGET_PDB = l0_min_s5.pdb
 
 build CMakeFiles/l0_min_s5.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__l0_min_s5_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_l0_min_s5
   DEFINES = -DNGEN_SAFE -DTEST_STAGE=5
@@ -592,8 +575,6 @@ build CMakeFiles/l0_min_s5.dir/workspace/reference/oneDNN/third_party/ngen/ngen_
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s5.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s5.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s5.dir/
-  TARGET_PDB = l0_min_s5.pdb
 
 
 # =============================================================================
@@ -608,9 +589,8 @@ build l0_min_s5: CXX_EXECUTABLE_LINKER__l0_min_s5_ CMakeFiles/l0_min_s5.dir/l0_m
   OBJECT_DIR = CMakeFiles/l0_min_s5.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s5.dir/
   TARGET_FILE = l0_min_s5
-  TARGET_PDB = l0_min_s5.pdb
+  TARGET_PDB = l0_min_s5.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target l0_min_s6
@@ -628,8 +608,6 @@ build CMakeFiles/l0_min_s6.dir/l0_min.cpp.o: CXX_COMPILER__l0_min_s6_unscanned_ 
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s6.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s6.dir
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s6.dir/
-  TARGET_PDB = l0_min_s6.pdb
 
 build CMakeFiles/l0_min_s6.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__l0_min_s6_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_l0_min_s6
   DEFINES = -DNGEN_SAFE -DTEST_STAGE=6
@@ -638,8 +616,6 @@ build CMakeFiles/l0_min_s6.dir/workspace/reference/oneDNN/third_party/ngen/ngen_
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s6.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s6.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s6.dir/
-  TARGET_PDB = l0_min_s6.pdb
 
 
 # =============================================================================
@@ -654,9 +630,8 @@ build l0_min_s6: CXX_EXECUTABLE_LINKER__l0_min_s6_ CMakeFiles/l0_min_s6.dir/l0_m
   OBJECT_DIR = CMakeFiles/l0_min_s6.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s6.dir/
   TARGET_FILE = l0_min_s6
-  TARGET_PDB = l0_min_s6.pdb
+  TARGET_PDB = l0_min_s6.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target l0_min_s7
@@ -674,8 +649,6 @@ build CMakeFiles/l0_min_s7.dir/l0_min.cpp.o: CXX_COMPILER__l0_min_s7_unscanned_ 
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s7.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s7.dir
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s7.dir/
-  TARGET_PDB = l0_min_s7.pdb
 
 build CMakeFiles/l0_min_s7.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__l0_min_s7_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_l0_min_s7
   DEFINES = -DNGEN_SAFE -DTEST_STAGE=7
@@ -684,8 +657,6 @@ build CMakeFiles/l0_min_s7.dir/workspace/reference/oneDNN/third_party/ngen/ngen_
   INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
   OBJECT_DIR = CMakeFiles/l0_min_s7.dir
   OBJECT_FILE_DIR = CMakeFiles/l0_min_s7.dir/workspace/reference/oneDNN/third_party/ngen
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s7.dir/
-  TARGET_PDB = l0_min_s7.pdb
 
 
 # =============================================================================
@@ -700,9 +671,8 @@ build l0_min_s7: CXX_EXECUTABLE_LINKER__l0_min_s7_ CMakeFiles/l0_min_s7.dir/l0_m
   OBJECT_DIR = CMakeFiles/l0_min_s7.dir
   POST_BUILD = :
   PRE_LINK = :
-  TARGET_COMPILE_PDB = CMakeFiles/l0_min_s7.dir/
   TARGET_FILE = l0_min_s7
-  TARGET_PDB = l0_min_s7.pdb
+  TARGET_PDB = l0_min_s7.dbg
 
 
 #############################################
@@ -738,7 +708,7 @@ build rebuild_cache: phony CMakeFiles/rebuild_cache.util
 #############################################
 # Folder: /workspace/ngen_lab/build
 
-build all: phony ngen_lab ngen_dpas_8x8_matmul_s8_16x16x32 ngen_dpas_8x8_matmul_s4_16x16x32 ngen_dpas_8x8_matmul_w8a2_16x16x32 ngen_dpas_8x8_matmul_w4a8_16x16x32 ngen_lab_asmdump iga_dis l0_min_s0 l0_min_s1 l0_min_s2 l0_min_s3 l0_min_s4 l0_min_s5 l0_min_s6 l0_min_s7
+build all: phony ngen_lab ngen_dpas_8x8_matmul_s8_16x16x32 ngen_dpas_8x8_matmul_s4_16x16x32 ngen_dpas_8x8_matmul_w8a2_16x16x32 ngen_dpas_8x8_matmul_w4a8_16x16x32 ngen_dpas_w4a8_gemm ngen_lab_asmdump iga_dis l0_min_s0 l0_min_s1 l0_min_s2 l0_min_s3 l0_min_s4 l0_min_s5 l0_min_s6 l0_min_s7
 
 # =============================================================================
 # Built-in targets
@@ -747,14 +717,14 @@ build all: phony ngen_lab ngen_dpas_8x8_matmul_s8_16x16x32 ngen_dpas_8x8_matmul_
 #############################################
 # Re-run CMake if any of its inputs changed.
 
-build build.ninja: RERUN_CMAKE | /usr/share/cmake-3.28/Modules/CMakeCXXCompiler.cmake.in /usr/share/cmake-3.28/Modules/CMakeCXXCompilerABI.cpp /usr/share/cmake-3.28/Modules/CMakeCXXInformation.cmake /usr/share/cmake-3.28/Modules/CMakeCommonLanguageInclude.cmake /usr/share/cmake-3.28/Modules/CMakeCompilerIdDetection.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCXXCompiler.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCompileFeatures.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCompiler.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCompilerABI.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCompilerId.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineSystem.cmake /usr/share/cmake-3.28/Modules/CMakeFindBinUtils.cmake /usr/share/cmake-3.28/Modules/CMakeGenericSystem.cmake /usr/share/cmake-3.28/Modules/CMakeInitializeConfigs.cmake /usr/share/cmake-3.28/Modules/CMakeLanguageInformation.cmake /usr/share/cmake-3.28/Modules/CMakeNinjaFindMake.cmake /usr/share/cmake-3.28/Modules/CMakeParseImplicitIncludeInfo.cmake /usr/share/cmake-3.28/Modules/CMakeParseImplicitLinkInfo.cmake /usr/share/cmake-3.28/Modules/CMakeParseLibraryArchitecture.cmake /usr/share/cmake-3.28/Modules/CMakeSystem.cmake.in /usr/share/cmake-3.28/Modules/CMakeSystemSpecificInformation.cmake /usr/share/cmake-3.28/Modules/CMakeSystemSpecificInitialize.cmake /usr/share/cmake-3.28/Modules/CMakeTestCXXCompiler.cmake /usr/share/cmake-3.28/Modules/CMakeTestCompilerCommon.cmake /usr/share/cmake-3.28/Modules/Compiler/ADSP-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/ARMCC-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/ARMClang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/AppleClang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Borland-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/CMakeCommonCompilerMacros.cmake /usr/share/cmake-3.28/Modules/Compiler/Clang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Clang-DetermineCompilerInternal.cmake /usr/share/cmake-3.28/Modules/Compiler/Comeau-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Compaq-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Cray-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/CrayClang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Embarcadero-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Fujitsu-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/FujitsuClang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/GHS-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU-CXX.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU-FindBinUtils.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU.cmake /usr/share/cmake-3.28/Modules/Compiler/HP-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/IAR-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/IBMCPP-CXX-DetermineVersionInternal.cmake /usr/share/cmake-3.28/Modules/Compiler/IBMClang-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Intel-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/IntelLLVM-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/LCC-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/MSVC-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/NVHPC-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/NVIDIA-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/OpenWatcom-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/OrangeC-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/PGI-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/PathScale-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/SCO-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/SunPro-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/TI-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Tasking-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/VisualAge-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Watcom-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/XL-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/XLClang-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/zOS-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Internal/FeatureTesting.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-Determine-CXX.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-GNU-CXX.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-GNU.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-Initialize.cmake /usr/share/cmake-3.28/Modules/Platform/Linux.cmake /usr/share/cmake-3.28/Modules/Platform/UnixPaths.cmake /workspace/ngen_lab/CMakeLists.txt CMakeCache.txt CMakeFiles/3.28.3/CMakeCXXCompiler.cmake CMakeFiles/3.28.3/CMakeSystem.cmake
+build build.ninja: RERUN_CMAKE | /usr/share/cmake-3.28/Modules/CMakeCXXInformation.cmake /usr/share/cmake-3.28/Modules/CMakeCommonLanguageInclude.cmake /usr/share/cmake-3.28/Modules/CMakeGenericSystem.cmake /usr/share/cmake-3.28/Modules/CMakeInitializeConfigs.cmake /usr/share/cmake-3.28/Modules/CMakeLanguageInformation.cmake /usr/share/cmake-3.28/Modules/CMakeSystemSpecificInformation.cmake /usr/share/cmake-3.28/Modules/CMakeSystemSpecificInitialize.cmake /usr/share/cmake-3.28/Modules/Compiler/CMakeCommonCompilerMacros.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU-CXX.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-GNU-CXX.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-GNU.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-Initialize.cmake /usr/share/cmake-3.28/Modules/Platform/Linux.cmake /usr/share/cmake-3.28/Modules/Platform/UnixPaths.cmake /workspace/ngen_lab/CMakeLists.txt CMakeCache.txt CMakeFiles/3.28.3/CMakeCXXCompiler.cmake CMakeFiles/3.28.3/CMakeSystem.cmake
   pool = console
 
 
 #############################################
 # A missing CMake input file is not an error.
 
-build /usr/share/cmake-3.28/Modules/CMakeCXXCompiler.cmake.in /usr/share/cmake-3.28/Modules/CMakeCXXCompilerABI.cpp /usr/share/cmake-3.28/Modules/CMakeCXXInformation.cmake /usr/share/cmake-3.28/Modules/CMakeCommonLanguageInclude.cmake /usr/share/cmake-3.28/Modules/CMakeCompilerIdDetection.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCXXCompiler.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCompileFeatures.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCompiler.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCompilerABI.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineCompilerId.cmake /usr/share/cmake-3.28/Modules/CMakeDetermineSystem.cmake /usr/share/cmake-3.28/Modules/CMakeFindBinUtils.cmake /usr/share/cmake-3.28/Modules/CMakeGenericSystem.cmake /usr/share/cmake-3.28/Modules/CMakeInitializeConfigs.cmake /usr/share/cmake-3.28/Modules/CMakeLanguageInformation.cmake /usr/share/cmake-3.28/Modules/CMakeNinjaFindMake.cmake /usr/share/cmake-3.28/Modules/CMakeParseImplicitIncludeInfo.cmake /usr/share/cmake-3.28/Modules/CMakeParseImplicitLinkInfo.cmake /usr/share/cmake-3.28/Modules/CMakeParseLibraryArchitecture.cmake /usr/share/cmake-3.28/Modules/CMakeSystem.cmake.in /usr/share/cmake-3.28/Modules/CMakeSystemSpecificInformation.cmake /usr/share/cmake-3.28/Modules/CMakeSystemSpecificInitialize.cmake /usr/share/cmake-3.28/Modules/CMakeTestCXXCompiler.cmake /usr/share/cmake-3.28/Modules/CMakeTestCompilerCommon.cmake /usr/share/cmake-3.28/Modules/Compiler/ADSP-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/ARMCC-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/ARMClang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/AppleClang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Borland-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/CMakeCommonCompilerMacros.cmake /usr/share/cmake-3.28/Modules/Compiler/Clang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Clang-DetermineCompilerInternal.cmake /usr/share/cmake-3.28/Modules/Compiler/Comeau-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Compaq-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Cray-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/CrayClang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Embarcadero-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Fujitsu-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/FujitsuClang-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/GHS-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU-CXX.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU-FindBinUtils.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU.cmake /usr/share/cmake-3.28/Modules/Compiler/HP-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/IAR-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/IBMCPP-CXX-DetermineVersionInternal.cmake /usr/share/cmake-3.28/Modules/Compiler/IBMClang-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Intel-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/IntelLLVM-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/LCC-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/MSVC-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/NVHPC-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/NVIDIA-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/OpenWatcom-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/OrangeC-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/PGI-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/PathScale-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/SCO-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/SunPro-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/TI-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Tasking-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/VisualAge-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/Watcom-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/XL-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/XLClang-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Compiler/zOS-CXX-DetermineCompiler.cmake /usr/share/cmake-3.28/Modules/Internal/FeatureTesting.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-Determine-CXX.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-GNU-CXX.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-GNU.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-Initialize.cmake /usr/share/cmake-3.28/Modules/Platform/Linux.cmake /usr/share/cmake-3.28/Modules/Platform/UnixPaths.cmake /workspace/ngen_lab/CMakeLists.txt CMakeCache.txt CMakeFiles/3.28.3/CMakeCXXCompiler.cmake CMakeFiles/3.28.3/CMakeSystem.cmake: phony
+build /usr/share/cmake-3.28/Modules/CMakeCXXInformation.cmake /usr/share/cmake-3.28/Modules/CMakeCommonLanguageInclude.cmake /usr/share/cmake-3.28/Modules/CMakeGenericSystem.cmake /usr/share/cmake-3.28/Modules/CMakeInitializeConfigs.cmake /usr/share/cmake-3.28/Modules/CMakeLanguageInformation.cmake /usr/share/cmake-3.28/Modules/CMakeSystemSpecificInformation.cmake /usr/share/cmake-3.28/Modules/CMakeSystemSpecificInitialize.cmake /usr/share/cmake-3.28/Modules/Compiler/CMakeCommonCompilerMacros.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU-CXX.cmake /usr/share/cmake-3.28/Modules/Compiler/GNU.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-GNU-CXX.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-GNU.cmake /usr/share/cmake-3.28/Modules/Platform/Linux-Initialize.cmake /usr/share/cmake-3.28/Modules/Platform/Linux.cmake /usr/share/cmake-3.28/Modules/Platform/UnixPaths.cmake /workspace/ngen_lab/CMakeLists.txt CMakeCache.txt CMakeFiles/3.28.3/CMakeCXXCompiler.cmake CMakeFiles/3.28.3/CMakeSystem.cmake: phony
 
 
 #############################################

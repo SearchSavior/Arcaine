@@ -135,6 +135,19 @@ target_link_libraries(diffusion_gemma_dev PRIVATE
 endif()
 
 # ---------------------------------------------------------------------------
+# qwen3_5 W4A8 accuracy probe (go/no-go for the ngen s8x4 matmul_int4 port).
+# Compares baseline int4 logits/greedy decode against the s8-activation
+# simulation (ARCAINE_INT4_ACT_QUANT_S8) on a real AWQ checkpoint.
+#   ./build/qwen35_actquant_probe -m <dir> [--prompt <text>] [--gen <n>] [--stats]
+if(TARGET arcaine_model_qwen3_5)
+add_executable(qwen35_actquant_probe src/apps/qwen35_actquant/main.cpp)
+target_compile_options(qwen35_actquant_probe PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
+target_link_options(qwen35_actquant_probe PRIVATE ${ARCAINE_SYCL_LINK_FLAGS})
+target_link_libraries(qwen35_actquant_probe PRIVATE
+    arcaine_preprocessing arcaine_model_qwen3_5 DNNL::dnnl)
+endif()
+
+# ---------------------------------------------------------------------------
 # OpenAI-compatible HTTP API server. Talks only to ModelService; one execution
 # path for every model (autoregressive or block-diffusion). Requires at least
 # one enabled model (ARCAINE_MODEL_LIBS).
@@ -169,9 +182,10 @@ endif()
 #   ./build/arcaine_kbench --list
 #   ./build/arcaine_kbench <name> [opts]
 get_property(ARCAINE_KERNEL_BENCH_SRCS GLOBAL PROPERTY ARCAINE_KERNEL_BENCH_SRCS)
-# Central (not model-owned) kernel bench.
+# Central (not model-owned) kernel benches.
 list(APPEND ARCAINE_KERNEL_BENCH_SRCS
-    ${CMAKE_SOURCE_DIR}/src/benchmarks/nvfp4_roofline_bench.cpp)
+    ${CMAKE_SOURCE_DIR}/src/benchmarks/nvfp4_roofline_bench.cpp
+    ${CMAKE_SOURCE_DIR}/src/benchmarks/qwen35_matmul_roofline_bench.cpp)
 if(ARCAINE_KERNEL_BENCH_SRCS)
 add_executable(arcaine_kbench src/apps/kernel_bench/main.cpp ${ARCAINE_KERNEL_BENCH_SRCS})
 target_compile_options(arcaine_kbench PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})
