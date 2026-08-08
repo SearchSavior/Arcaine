@@ -96,13 +96,14 @@ set_target_properties(get_device_props PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/.agents/skills/check-available-hardware")
 
 # ---------------------------------------------------------------------------
-# Model inference benchmark (llama-bench style). Each model owns its benchmark
+# Model inference benchmark (llama-bench approach). Each model owns its benchmark
 # under src/modeling/<m>/benchmarks/model_bench.cpp (collected via arcaine_add_model's
 # MODEL_BENCH_SOURCES into ARCAINE_MODEL_BENCH_SRCS). The dispatcher resolves
 # config.json::model_type and forwards argv to the model-owned bench, which drives
-# its concrete engine (forward/reset_cache/generate) directly.
-#   ./build/arcaine_mbench --list
-#   ./build/arcaine_mbench --model <dir> [-p 512,1024,2048,4096 -n 128 -d 0,512,1024,2048 ...]
+# its concrete engine (forward/reset_cache/generate) directly through the shared
+# llama-bench-style harness in benchmarks/model_bench_util.hpp.
+#   ./build/arcaine_mbench -m <dir> [options]
+#   ./build/arcaine_mbench -m <dir> --help   (flag list, llama-bench style)
 get_property(ARCAINE_MODEL_BENCH_SRCS GLOBAL PROPERTY ARCAINE_MODEL_BENCH_SRCS)
 if(ARCAINE_MODEL_LIBS)
 add_executable(arcaine_mbench src/apps/model_bench/main.cpp ${ARCAINE_MODEL_BENCH_SRCS})

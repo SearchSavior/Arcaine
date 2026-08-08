@@ -1,27 +1,16 @@
-// qwen3_5_moe — model-owned inference benchmark (llama-bench style).
-// Drives the module's concrete QwenModel (NVFP4 MoE) engine directly
-// (forward/reset_cache) to measure real GPU prefill (PP) and decode (TG)
-// throughput at various KV-cache depths. Registered with the central
-// arcaine_mbench dispatcher as "qwen3_5_moe_text" (matches config.json::model_type).
+// qwen3_5_moe — model-owned inference benchmark (llama-bench approach).
+// Drives the module's concrete QwenModel (NVFP4 MoE) engine directly through
+// the shared AR driver in benchmarks/model_bench_util.hpp: synthetic BOS+random
+// payloads (random token per decode step — no logit chaining), per-cell warmup
+// at test size, -pchunk batching, depth prefill, and a markdown result table.
+// Registered with the central arcaine_mbench dispatcher as "qwen3_5_moe_text"
+// (matches config.json::model_type).
 //
-//   ./build/arcaine_mbench --model <dir> [options]
-//     -p, --p P,...   prefill prompt sizes (default: 512,1024,2048,4096)
-//     -n, --n N,...   new-token counts      (default: 128)
-//     -d D,...        starting KV depths     (default: 0,512,1024,2048)
-//     -r, --r R       timed repetitions      (default: 3)
-//     -w, --w W       warmup runs            (default: 1)
-//     --max-seq N     KV cache capacity      (default: auto)
-//     --device N      restrict to one Level Zero GPU
+//   ./build/arcaine_mbench -m <dir> [options]
+//   (see arcaine_mbench -m <dir> --help for the flag list)
 
-#include <chrono>
-#include <cmath>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <string>
-#include <vector>
-#include <algorithm>
-#include <memory>
 
 #include "modeling/qwen3_5_moe/model.hpp"
 #include "runtime/gpu/device_select.hpp"
@@ -29,141 +18,42 @@
 #include "benchmarks/model_bench_registry.hpp"
 #include "benchmarks/model_bench_util.hpp"
 
-using Clk = std::chrono::high_resolution_clock;
-using Ms  = std::chrono::duration<double, std::milli>;
-static double now_ms() { return Ms(Clk::now().time_since_epoch()).count(); }
-
-static const char* USAGE =
-    "Usage: arcaine_mbench --model <dir> [options]   (qwen3_5_moe_text)\n"
-    "  -h, --help    show this help text\n"
-    "  -p, --p P,... prefill sizes          (default: 512,1024,2048,4096)\n"
-    "  -n, --n N,... new-token counts       (default: 128)\n"
-    "  -d D,...      KV-cache depths        (default: 0,512,1024,2048)\n"
-    "  -r, --r R     timed repetitions      (default: 3)\n"
-    "  -w, --w W     warmup runs            (default: 1)\n"
-    "  --max-seq N   KvCache capacity       (default: auto)\n"
-    "  --device N    run with one visible Level Zero GPU\n";
-
 static int run(int argc, char* argv[]) {
-    std::string model_dir;
-    std::vector<int> pp_list = {512, 1024, 2048, 4096};
-    std::vector<int> tg_list = {128};
-    std::vector<int> depths  = {0, 512, 1024, 2048};
-    std::string device_index;
-    int reps = 3, warmup = 1, max_seq = -1;
-    bool device_index_set = false;
+    using namespace arcaine::bench;
 
-    for (int i = 1; i < argc; ++i) {
-        if      (!strcmp(argv[i], "--model") && i+1<argc) model_dir = argv[++i];
-        else if ((!strcmp(argv[i], "-p") || !strcmp(argv[i], "--p")) && i+1<argc)
-            pp_list = arcaine::bench::parse_int_csv(argv[++i]);
-        else if ((!strcmp(argv[i], "-n") || !strcmp(argv[i], "--n")) && i+1<argc)
-            tg_list = arcaine::bench::parse_int_csv(argv[++i]);
-        else if (!strcmp(argv[i], "-d") && i+1<argc) depths = arcaine::bench::parse_int_csv(argv[++i]);
-        else if ((!strcmp(argv[i], "-r") || !strcmp(argv[i], "--r") || !strcmp(argv[i], "--reps")) && i+1<argc) reps = atoi(argv[++i]);
-        else if ((!strcmp(argv[i], "-w") || !strcmp(argv[i], "--w") || !strcmp(argv[i], "--warmup")) && i+1<argc) warmup = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--max-seq") && i+1<argc) max_seq = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--device") && i+1<argc) { device_index = argv[++i]; device_index_set = true; }
-        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { std::fputs(USAGE, stderr); return 0; }
-        else if (argv[i][0] != '-' && model_dir.empty()) model_dir = argv[i];
-        else { std::fprintf(stderr, "Unknown argument: %s\n", argv[i]); std::fputs(USAGE, stderr); return 1; }
+    BenchArgs args;
+    int r = parse_bench_args(argc, argv, nullptr, 0, nullptr, args);
+    if (r == 1) return 0;  // help shown
+    if (r != 0) return 1;  // parse error
+
+    if (args.device_set) {
+        try { gpu_device_control::apply_device_index(args.device); }
+        catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
     }
 
-    if (model_dir.empty() || pp_list.empty() || tg_list.empty() || depths.empty() || reps <= 0 || warmup < 0) {
-        std::fputs(USAGE, stderr); return 1;
-    }
-    for (int v : pp_list) if (v <= 0) { std::fputs("--p values must be positive\n", stderr); return 1; }
-    for (int v : tg_list) if (v <= 0) { std::fputs("--n values must be positive\n", stderr); return 1; }
-
-    try { if (device_index_set) gpu_device_control::apply_device_index(device_index); }
-    catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
-
-    if (max_seq < 0) {
-        int max_d = *std::max_element(depths.begin(), depths.end());
-        int max_p = *std::max_element(pp_list.begin(), pp_list.end());
-        int max_n = *std::max_element(tg_list.begin(), tg_list.end());
-        max_seq = std::max(max_d + max_n, max_p);
-    }
-
-    std::printf("loading model from %s ...\n", model_dir.c_str());
+    const int max_seq = compute_max_seq(args);
+    std::printf("loading model from %s ...\n", args.model.c_str());
     double t0 = now_ms();
-    QwenModel model(model_dir, max_seq);
+    QwenModel model(args.model, max_seq);
     double load_s = (now_ms() - t0) * 0.001;
     const ModelInfo& info = model.info();
-    std::printf("model   : %s\n", info.description.c_str());
-    std::printf("backend : SYCL + oneDNN | GPUs: %d | max_seq: %d",
-                GpuEngine::count(), max_seq);
-    if (const char* active_gpus = gpu_device_control::active_gpus_spec())
-        std::printf(" | ZE_AFFINITY_MASK=%s", active_gpus);
-    std::printf("\nload    : %.1f s\n", load_s);
 
-    const int bos_id = info.bos_token_id;
-    arcaine::bench::print_pp_tg_header();
+    std::string backend_line = "SYCL + oneDNN | GPUs: " + std::to_string(GpuEngine::count()) +
+                              " | max_seq: " + std::to_string(max_seq);
+    if (const char* gpus = gpu_device_control::active_gpus_spec())
+        backend_line += std::string(" | ZE_AFFINITY_MASK=") + gpus;
 
-    for (int pp : pp_list) {
-        if (pp > max_seq) {
-            char name[32]; std::snprintf(name, sizeof name, "pp %d", pp);
-            std::printf(" %-18s %9s   [skip: pp=%d > max_seq=%d]\n", name, "—", pp, max_seq);
-            continue;
-        }
-        // Varied-but-deterministic prompt (all-BOS overflows to NaN at long S).
-        // Keep ids well inside vocab regardless of bos_id.
-        std::vector<int> prompt(pp);
-        for (int i = 0; i < pp; ++i) prompt[i] = 1000 + (int)((i * 2654435761u) % 100000);
-        std::vector<double> times;
-        for (int r = 0; r < warmup + reps; ++r) {
-            model.reset_cache();
-            double t = now_ms();
-            model.forward(ForwardInput{prompt, 0});
-            double dt = now_ms() - t;
-            if (r >= warmup) times.push_back(dt);
-        }
-        char name[32]; std::snprintf(name, sizeof name, "pp %d", pp);
-        arcaine::bench::print_pp_tg_row(name, "—", arcaine::bench::compute_pp_tg_stats(times, pp));
-    }
+    ArEngine eng;
+    eng.bos_id   = info.bos_token_id;
+    eng.n_vocab  = info.vocab_size;
+    eng.reset_cache = [&] { model.reset_cache(); };
+    eng.forward = [&](const std::vector<int>& ids, int past_len) {
+        model.forward(ForwardInput{ids, past_len});
+    };
 
-    for (int tg : tg_list) {
-        for (int depth : depths) {
-            char name[32]; std::snprintf(name, sizeof name, "tg %d", tg);
-            char dstr[32]; std::snprintf(dstr, sizeof dstr, "%d", depth);
-            if (depth + tg > max_seq) {
-                arcaine::bench::print_pp_tg_row(name, dstr, {}, /*skipped=*/true);
-                continue;
-            }
-            std::vector<double> times;
-            for (int r = 0; r < warmup + reps; ++r) {
-                model.reset_cache();
-                std::vector<float> logits;
-                if (depth > 0) {
-                    constexpr int CHUNK = 512;
-                    for (int pos = 0; pos < depth; pos += CHUNK) {
-                        int sz = std::min(CHUNK, depth - pos);
-                        std::vector<int> chunk(sz, bos_id);
-                        logits = model.forward(ForwardInput{chunk, pos});
-                    }
-                }
-                // Greedy-chain the model's own (junk) tokens through decode
-                // instead of a constant BOS: realistic per-step inputs and
-                // routing, first token taken from the prefill's logits.
-                int next = bos_id;
-                if (!logits.empty())
-                    next = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
-                double t = now_ms();
-                for (int step = 0; step < tg; ++step) {
-                    std::vector<int> in(1, next);
-                    logits = model.forward(ForwardInput{in, depth + step});
-                    next = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
-                }
-                double dt = now_ms() - t;
-                if (r >= warmup) times.push_back(dt);
-            }
-            arcaine::bench::print_pp_tg_row(name, dstr, arcaine::bench::compute_pp_tg_stats(times, tg));
-        }
-    }
-    std::printf("\n");
-    return 0;
+    return run_ar_bench(args, eng, info.description, backend_line.c_str(), load_s);
 }
 
-REGISTER_MODEL_BENCH("qwen3_5_moe_text", "Qwen3.5-MoE NVFP4 AR (PP/TG KV-depth throughput)", run)
+REGISTER_MODEL_BENCH("qwen3_5_moe_text", "Qwen3.5-MoE NVFP4 AR (llama-bench pp/tg KV-depth throughput)", run)
 static ::arcaine::bench::ModelBenchRegistrar arcaine_model_bench_registrar_wrapped(
-    "qwen3_5_moe", "Qwen3.5-MoE (wrapped VLM config, text-only) AR (PP/TG KV-depth throughput)", run);
+    "qwen3_5_moe", "Qwen3.5-MoE (wrapped VLM config, text-only) AR (llama-bench pp/tg KV-depth throughput)", run);
