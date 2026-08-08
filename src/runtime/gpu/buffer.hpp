@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstring>
@@ -76,20 +77,75 @@ public:
     bool   empty() const { return ptr_ == nullptr; }
 
     void upload(const T* host, size_t n) {
-        q_->memcpy(ptr_, host, n * sizeof(T)).wait();
+        copy_chunked(ptr_, host, n * sizeof(T));
     }
 
     void download(T* host, size_t n) const {
-        q_->memcpy(host, ptr_, n * sizeof(T)).wait();
+        copy_chunked(host, ptr_, n * sizeof(T));
     }
 
     void zero() {
-        q_->memset(ptr_, 0, count_ * sizeof(T)).wait();
+        // memset takes the same path as memcpy in the driver, so it gets the
+        // same treatment; a large KV cache is well over the limit.
+        size_t remaining = count_ * sizeof(T);
+        char* dst = reinterpret_cast<char*>(ptr_);
+        sycl::event last;
+        while (remaining) {
+            size_t step = std::min(remaining, kMaxTransferBytes);
+            last = q_->memset(dst, 0, step);
+            dst += step;
+            remaining -= step;
+        }
+        if (count_) last.wait();
     }
 
     sycl::queue& queue() const { return *q_; }
 
 private:
+    // Large single transfers can stall indefinitely on some kernel/driver
+    // pairings: the copy is enqueued, its event never signals, and the runtime
+    // spins in sched_yield() forever. It is a hang, not a slow path - nothing
+    // times out and no error is reported.
+    //
+    // Observed loading Qwen3.6-27B on an Arc Pro B70 under kernel 7.0: the load
+    // stops with device memory frozen at ~2.5 GB, which is the embedding
+    // table's size, and the backtrace sits in urEventWait under
+    // GpuBuffer::upload. The same binary and card under kernel 6.17 never
+    // stalls, and swapping the GPU userspace across 26.18 / 26.22 / 26.27
+    // changes nothing, so it is below the userspace.
+    //
+    // **The mechanism is not established.** A standalone SYCL reproducer with
+    // no oneDNN and no model stalls only intermittently: a 2 GiB copy hung
+    // once, 1 GiB on an in-order queue hung once, and a size sweep from 256 MiB
+    // to 1 GiB then passed cleanly on the same machine minutes later. So the
+    // trigger is not simply "copies above size N", and this constant is an
+    // empirical mitigation, not a documented boundary. What is consistent is
+    // that this engine reproduces it reliably where the probes do not, and this
+    // engine differs by doing ~1968 allocate-then-copy pairs during load.
+    // llama.cpp on the same host is unaffected and also splits its transfers.
+    //
+    // 256 MiB was the largest size that never stalled in any probe run. If a
+    // load hangs again, lower it and re-test rather than assuming this value is
+    // principled. Splitting costs nothing measurable - the pieces sustain the
+    // same GB/s - and the queue is in-order, so ordering holds and only the
+    // final event needs waiting on.
+    static constexpr size_t kMaxTransferBytes = 256ull * 1024ull * 1024ull;
+
+    void copy_chunked(void* dst, const void* src, size_t bytes) const {
+        char* d = static_cast<char*>(dst);
+        const char* s = static_cast<const char*>(src);
+        sycl::event last;
+        size_t remaining = bytes;
+        while (remaining) {
+            size_t step = std::min(remaining, kMaxTransferBytes);
+            last = q_->memcpy(d, s, step);
+            d += step;
+            s += step;
+            remaining -= step;
+        }
+        if (bytes) last.wait();
+    }
+
     T*           ptr_   = nullptr;
     size_t       count_ = 0;
     sycl::queue* q_     = nullptr;
