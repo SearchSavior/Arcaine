@@ -60,6 +60,14 @@ namespace w4a8gemm {
 static int kN = 0, kK = 0, kKt = 0;   // N, K, K/32
 // Tiles per thread along N, and K-loop unroll in 32-deep tiles.
 static int kTiles = 1, kUnroll = 4;
+static int kPrefetch = 0;
+// P2 kernel variant (kTiles==1, kMode==0, kUnroll%4==0 only): the s32 tile
+// accs are double-buffered so the epilogue of tile u-1 TRAILS dpas(u) --
+// breaking the in-order issue serialization that drains the DPAS pipe --
+// and the act_s multiply is hoisted to the 128-group boundary (as32 is
+// constant across 4 consecutive tiles) via a fp32 Ctmp accumulator, cutting
+// the per-tile epilogue from 5 to 4 fp lane-ops per column pair.
+static bool kP2 = false;
 
 // Codegen experiment modes (perf ceiling analysis; results are numerically
 // WRONG in modes != 0, harness must skip the check):
@@ -68,6 +76,12 @@ static int kTiles = 1, kUnroll = 4;
 //       single (wrong) rescale after the loop
 //   2 = mode 1 + no in-loop loads at all (pure dpas issue rate)
 //   3 = loads only (A/B/ws/as), no dpas, no epilogue (load-path ceiling)
+//   4 = P2-only perf ablation: full P2 body but the epilogue reads the
+//       permanent zero block instead of the dpas output (no dpas->cvt RAW;
+//       numerically wrong, harness skips the check)
+//   5 = P2 with production-style mad epilogue (gemmstone outerProductRepackC):
+//       cvt -> mul ws -> mad(C, C, acc, as) fuses the as-multiply and the
+//       C-accumulate; no Ctmp, no group flush. Numerically exact.
 static int kMode = 0;
 // Cache hint applied to A/B stream loads (codegen experiment).
 static ngen::CacheSettingsLSC kCacheAB = ngen::CacheSettingsLSC::Default;
@@ -88,6 +102,8 @@ inline int bASv() { return 24 + 5 * kTiles; }  // act_s lane vec, duplicated: 2
 inline int bS() { return 24 + 5 * kTiles + 2; }      // s32 acc: 16T GRFs
 inline int bC() { return 24 + 5 * kTiles + 2 + 16 * kTiles; }  // f32 C: 16T
 // T=2: A 16-23, B 24-31, WS 32-33, AS 34-35, S 36-67, C 68-99.
+// P2 map (T=1 only): S0 36-51, S1 52-67, Ctmp 68-83, C 84-99.
+constexpr int kP2S0 = 36, kP2S1 = 52, kP2Ctmp = 68, kP2C = 84;
 constexpr int kZ = 100;                // 8 zeroed s32 GRFs (dpas src0)
 // fixed address/temp region: 108..127 (exactly fills the 128-GRF budget).
 constexpr int kBaseAS = 108, kBaseC = 109;
@@ -192,9 +208,14 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
         g.add(1, rAddrWS.uq(0), rAddrWS.uq(0), rTmp.uq(0));
     }
 
-    // Zero the fp32 C accumulators and the shared dpas-src0 zero block.
+    // Zero the fp32 C accumulators (and P2's Ctmp) plus the shared
+    // dpas-src0 zero block.
+    const int cBase = kP2 ? kP2C : bC();
     for (int i = 0; i < 16 * kTiles; i += 2)
-        g.mov(32, GRF(bC() + i).f(), 0.0f);
+        g.mov(32, GRF(cBase + i).f(), 0.0f);
+    if (kP2)
+        for (int i = 0; i < 16; i += 2)
+            g.mov(32, GRF(kP2Ctmp + i).f(), 0.0f);
     for (int i = 0; i < 8; i += 2)
         g.mov(32, GRF(kZ + i).d(), 0);
 
@@ -228,28 +249,128 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
                 g.load(1, GRF(bB() + 4 * t + 2 * h),
                         block(DataSizeLSC::D32, 32) | kCacheAB, g.A64,
                         rAddrB + bOff + h * 128);
-            if (kMode == 0 || kMode == 3)
-                // w_scale row for this K tile: 16 f32.
+            // w_scale row for this K tile: 16 f32. P2 splits ws loads out
+            // of emitLoads (they must issue AFTER the trailing epilogue's
+            // reads of the same ping-pong buffer).
+            if ((kMode == 0 || kMode == 3) && !kP2)
                 g.load(1, GRF((wb ? kWS2 : bWS()) + t),
                         block(DataSizeLSC::D32, 16), g.A64, rAddrWS + wsOff);
         }
     };
 
+    // Prefetch tile u of the NEXT unroll group into L1 (load with null dst;
+    // oneDNN's prefetch idiom). Fire-and-forget: no scoreboard, so these add
+    // memory-level parallelism without register cost. Over-prefetches past
+    // the end on the final groups; harness pads the allocations.
+    auto emitPrefetch = [&](int u) {
+        const int aOff = (kUnroll + u) * 512, bOff = (kUnroll + u) * 256;
+        if (kPrefetch & 1)
+            for (int j = 0; j < 4; j++)
+                g.load(1, g.null, block(DataSizeLSC::D32, 32) | kCacheAB,
+                        g.A64, rAddrA + aOff + 128 * j);
+        if (kPrefetch & 2)
+            for (int t = 0; t < kTiles; t++) {
+                GRF rAddrB(kAddrB + t);
+                for (int h = 0; h < 2; h++)
+                    g.load(1, g.null, block(DataSizeLSC::D32, 32) | kCacheAB,
+                            g.A64, rAddrB + bOff + h * 128);
+            }
+        // NB: no ws prefetch — 64B null-dst block prefetch hangs (Xe2).
+    };
+
     // Preload activation-scale lane vector for K tile 0 (duplicated into 2
     // GRFs so the SIMD32 epilogue can use it as a full-width operand).
-    if (kMode == 0 || kMode == 3) {
+    if (kMode == 0 || kMode == 3 || kMode == 4 || kMode == 5) {
         g.load(16, GRF(bASv()), scattered(DataSizeLSC::D32, 1), g.A64, rPtrAS);
         g.mov(16, GRF(bASv() + 1).f(), GRF(bASv()).f());
     }
+
+    // P2 per-tile epilogue for tile v: Ctmp += w_s * cvt(S[v&1]); at the
+    // 128-group boundary (v%4==3) C += act_s*Ctmp, Ctmp = 0, and the next
+    // group's act_s lane vector is preloaded (expanded layout, so any tile
+    // of the group reads the same value; the final group's preload reads
+    // the padded tail, unused).
+    auto emitEpilogueP2 = [&](int v) {
+        // Mode 4: source the epilogue from Ctmp (fp-written, never read by
+        // dpas) to remove the dpas->cvt RAW while keeping the instruction
+        // stream identical. NB: kZ is only 8 GRFs -- using it here clobbered
+        // rIt/address registers above it and hung the loop.
+        const int sBase = kMode == 4 ? kP2Ctmp : ((v & 1) ? kP2S1 : kP2S0);
+        GRF rWS = wsBuf(v, 0);
+        if (kMode == 5) {
+            // Direct-C accumulate (no Ctmp, no g128 flush). as is constant
+            // across the g128 group so applying it per tile is exact. NB:
+            // mad(32) with 2-GRF sources hits fixup_ternary_rgn
+            // (hs==1 && vs==width) and produced garbage here; mul+add instead.
+            for (int n = 0; n < 16; n += 2) {
+                GRF rS(sBase + n), rCf(kP2C + n);
+                g.mov(32, rS.f(), rS.d());
+                g.mul(16, rS.f(), rS.f(), rWS.f(n)(0));
+                g.mul(16, GRF(sBase + n + 1).f(), GRF(sBase + n + 1).f(),
+                        rWS.f(n + 1)(0));
+                g.mul(32, rS.f(), rS.f(), GRF(bASv()).f());
+                g.add(32, rCf.f(), rCf.f(), rS.f());
+            }
+        } else {
+        for (int n = 0; n < 16; n += 2) {
+            GRF rS(sBase + n), rCt(kP2Ctmp + n);
+            g.mov(32, rS.f(), rS.d());              // cvt, cols n,n+1
+            g.mul(16, rS.f(), rS.f(), rWS.f(n)(0)); // w_s[n]
+            g.mul(16, GRF(sBase + n + 1).f(), GRF(sBase + n + 1).f(),
+                    rWS.f(n + 1)(0));
+            g.add(32, rCt.f(), rCt.f(), rS.f());
+        }
+        if ((v & 3) == 3 && kMode != 4) {
+            for (int i = 0; i < 16; i += 2) {
+                g.mul(32, GRF(kP2Ctmp + i).f(), GRF(kP2Ctmp + i).f(),
+                        GRF(bASv()).f());
+                g.add(32, GRF(kP2C + i).f(), GRF(kP2C + i).f(),
+                        GRF(kP2Ctmp + i).f());
+                g.mov(32, GRF(kP2Ctmp + i).f(), 0.0f);
+            }
+        }
+        }
+        if ((v & 3) == 3) {
+            g.load(16, GRF(bASv()), scattered(DataSizeLSC::D32, 1), g.A64,
+                    rPtrAS + 4 * (v + 4));
+            g.mov(16, GRF(bASv() + 1).f(), GRF(bASv()).f());
+        }
+    };
 
     // ---- K loop (unrolled by kUnroll 32-deep tiles) --------------------------
     // Rotated body: dpas(u) -> loads(u+1) -> epilogue(u). The u+1 loads'
     // memory latency hides under the epilogue's fp work; their WAR on A/B
     // releases as soon as dpas(u) has read its sources.
     if (kMode != 2 && kUnroll > 1) emitLoads(0);
+    if (kP2) // ws tile 0 -> buffer 0 (P2 keeps ws loads out of emitLoads)
+        g.load(1, GRF(bWS()), block(DataSizeLSC::D32, 16), g.A64,
+                GRF(kAddrWS));
     Label lTop;
     g.mark(lTop);
     if (kBarrier) g.barrier(rTmp, GRF(0)); // lockstep for L1 temporal reuse
+    if (kP2) {
+        // P2 rotated body: dpas(u) -> loads(u+1, A/B only) -> epilogue(u-1)
+        // -> ws load(u+1). dpas(u) writes S[u&1] while epilogue(u-1) reads
+        // S[(u-1)&1], so the DPAS pipe no longer drains behind the full
+        // epilogue issue. The ws load for tile u+1 targets buffer (u+1)&1
+        // == (u-1)&1 and must issue after epilogue(u-1)'s reads (WAR).
+        GRF rAddrWS0(kAddrWS);
+        for (int u = 0; u < kUnroll; u++) {
+            for (int h = 0; h < 2; h++) // src0 = zero -> fresh s32/tile
+                g.dpas(16, 8, 8,
+                        GRF(((u & 1) ? kP2S1 : kP2S0) + 8 * h).d(),
+                        GRF(kZ).d(), GRF(kA).b(), GRF(bB() + 2 * h).s4());
+            emitLoads(u + 1);
+            if (kPrefetch) emitPrefetch(u);
+            if (u > 0) emitEpilogueP2(u - 1);
+            const int v = u + 1;
+            const int wb = (v == kUnroll) ? 0 : (v & 1);
+            g.load(1, GRF(wb ? kWS2 : bWS()),
+                    block(DataSizeLSC::D32, 16), g.A64,
+                    rAddrWS0 + v * kN * 4);
+        }
+        emitEpilogueP2(kUnroll - 1); // drain the trailing epilogue
+    } else
     for (int u = 0; u < kUnroll; u++) {
         if (kUnroll == 1 && kMode != 2)
             emitLoads(0); // serial body: no cross-tile pipelining
@@ -260,6 +381,7 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
                             GRF(kZ).d(), GRF(kA).b(),
                             GRF(bB() + 4 * t + 2 * h).s4());
         if (kMode != 2 && kUnroll > 1) emitLoads(u + 1);
+        if (kPrefetch && kMode != 2) emitPrefetch(u);
         if (kMode == 0) {
             // Per-tile rescale: Cfp += act_s * w_s[n] * cvt(s32).
             for (int t = 0; t < kTiles; t++) {
@@ -314,7 +436,7 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
     for (int t = 0; t < kTiles; t++)
         for (int n = 0; n < 16; n++)
             g.store(16, scattered(DataSizeLSC::D32, 1), g.A64,
-                    rPtrC + 4 * (t * 16 + n), GRF(bC() + t * 16 + n));
+                    rPtrC + 4 * (t * 16 + n), GRF(cBase + t * 16 + n));
 }
 
 } // namespace w4a8gemm

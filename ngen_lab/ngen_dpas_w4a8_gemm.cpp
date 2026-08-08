@@ -256,6 +256,7 @@ int main() {
     kWgZ = int(envU32("NGEN_LAB_W4A8_WGZ", 1));
     kBarrier = envU32("NGEN_LAB_W4A8_BAR", 0) != 0;
     kSwz = envU32("NGEN_LAB_W4A8_SWZ", 0) != 0;
+    kP2 = envU32("NGEN_LAB_W4A8_P2", 0) != 0;
     const int reps = int(envU32("NGEN_LAB_W4A8_REPS", 20));
     const char *checkEnv = std::getenv("NGEN_LAB_W4A8_CHECK");
     // NGEN_LAB_W4A8_CACHE: 0=default, 1=L1UC_L3C, 2=L1C_L3C, 3=L1S_L3C.
@@ -272,13 +273,31 @@ int main() {
                 "need M%%(16*WGY)==0, K%%32==0, N%%(16*T*WGZ)==0, T in [1,2]\n");
         return 1;
     }
+    if (kP2 && (kTiles != 1 || (kMode != 0 && kMode != 4 && kMode != 5))) {
+        std::fprintf(stderr,
+                "P2 requires T=1 and MODE=0 (4: ablation, 5: mad epilogue)\n");
+        return 1;
+    }
     const int Kt = K / 32;               // 32-deep K tiles
     const int G128 = (K + 127) / 128;    // per-128 activation scale groups
     kN = N; kK = K; kKt = Kt;
     kUnroll = int(envU32("NGEN_LAB_W4A8_U", 4));
-    // ws ping-pong requires even kUnroll (or 1 = serial, no rotation).
-    while (kUnroll > 1 && (Kt % kUnroll || (kUnroll & 1))) kUnroll--;
-    const bool doCheck = kMode == 0
+
+    // ws ping-pong requires even kUnroll (or 1 = serial, no rotation). P2
+    // needs U%4==0 so the g128 act_s boundary stays inside the unroll body.
+    if (kP2) {
+        while (kUnroll > 4 && (Kt % kUnroll || (kUnroll & 3))) kUnroll--;
+        if (Kt % kUnroll || (kUnroll & 3)) {
+            std::fprintf(stderr,
+                    "P2: no kUnroll (multiple of 4) divides Kt=%d\n", Kt);
+            return 1;
+        }
+    } else {
+        while (kUnroll > 1 && (Kt % kUnroll || (kUnroll & 1))) kUnroll--;
+    }
+    kPrefetch = int(envU32("NGEN_LAB_W4A8_PF", 0));
+    // Mode 4 is an ablation (epilogue sources garbage); mode 5 is exact.
+    const bool doCheck = (kMode == 0 || kMode == 5)
             && (checkEnv ? std::atoi(checkEnv) != 0
                          : (double)M * N * K <= 1e9);
 
@@ -299,7 +318,7 @@ int main() {
     std::vector<float> hAS((size_t)M * Kt + 64, 0.0f);
     {
         std::vector<float> g128((size_t)M * G128);
-        for (auto &v : g128) v = distAS(rng);
+        for (auto &v : g128) v = envU32("NGEN_LAB_W4A8_ASCONST", 0) ? 0.01f : distAS(rng);
         for (int m = 0; m < M; m++)
             for (int t = 0; t < Kt; t++)
                 hAS[(size_t)m * Kt + t] = g128[(size_t)m * G128 + t / 4];
@@ -316,7 +335,7 @@ int main() {
     L0 l0;
     // Tail pad for the rotated pipeline's never-consumed u+1 loads past the
     // last unroll group (A: +512B, B: +256B, ws: one WG row, as: +kUnroll).
-    constexpr size_t kPad = 4096;
+    constexpr size_t kPad = 16384; // covers prefetch-ahead over-reads too
     void *dA = l0.alloc((size_t)M * K + kPad);
     void *dB = l0.alloc((size_t)N * K / 2 + kPad);
     void *dWS = l0.alloc((size_t)Kt * N * 4 + kPad);
@@ -402,9 +421,9 @@ int main() {
     const double bytes = double(M) * K + double(N) * K / 2
             + double(Kt) * N * 4 + double(M) * Kt * 4
             + double(M) * N * 4;
-    std::printf("[perf] w4a8 gemm M=%d N=%d K=%d T=%d U=%d mode=%d  %8.3f ms"
+    std::printf("[perf] w4a8 gemm M=%d N=%d K=%d T=%d U=%d mode=%d p2=%d  %8.3f ms"
                 "  %7.2f TFLOP/s  %7.1f GB/s (min traffic)\n",
-            M, N, K, kTiles, kUnroll, kMode, best * 1e3, flops / best / 1e12,
-            bytes / best / 1e9);
+            M, N, K, kTiles, kUnroll, kMode, int(kP2), best * 1e3,
+            flops / best / 1e12, bytes / best / 1e9);
     return 0;
 }
