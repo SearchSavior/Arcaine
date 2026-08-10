@@ -45,7 +45,7 @@ Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
     }
     std::printf("[qwen35] %d GPU(s), layer split=%d, NVFP4 DPAS=%s, "
                 "XMX attention=%s, ESIMD DeltaNet=%s, "
-                "fused Delta decode=%s, fused BA=%s, "
+                "fused Delta decode=%s, fused BA (decode only)=%s, "
                 "persistent IO=%s\n",
                 GpuEngine::count(), split_layer_,
                 qwen35_nvfp4_dpas_enabled() ? "on" : "off",

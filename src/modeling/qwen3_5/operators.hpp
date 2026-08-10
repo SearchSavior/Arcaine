@@ -115,6 +115,10 @@ inline void matmul_proj(const bf16* A, int M, int K, const Qwen35Proj& W,
         matmul_int4(A, M, K, std::get<Int4Linear>(W), C, context);
 }
 
+// Gates the fused [b|a] projection on the M=1 decode path only. The
+// multi-token prefill path cannot use it - the fused output interleaves b and
+// a per token, which is not the layout its consumers read - and no longer
+// consults this flag.
 inline bool qwen35_fused_ba_projection_enabled() {
     static bool enabled = [] {
         const char* value =
@@ -265,8 +269,38 @@ inline void qwen35_linear_attention_forward(
     // Only the recurrent core loops. The projection above is already batched
     // over the whole window, so this re-reads the recurrent state and the small
     // conv/gate tensors, not the weights.
+    // qwen35_esimd_delta_enabled() belongs here even though this arm never
+    // calls qwen35_recurrent_delta_esimd.
+    //
+    // Both arms advance the same cache.recurrent_state, and the three
+    // recurrent implementations do not agree on its layout:
+    //
+    //   qwen35_recurrent_delta        state[head*K*V + k*V + v]  [head][key][value]
+    //   qwen35_recurrent_delta_esimd  state[head*V*K + v*K + k]  [head][value][key]
+    //   qwen35_delta_decode_fused_esimd (below)                  [head][value][key]
+    //
+    // K and V are both 128 here, so a mismatch is exactly size-compatible:
+    // nothing faults, the state is silently transposed between the prefill
+    // that wrote it and the decode that reads it.
+    //
+    // Without this term, ARCAINE_QWEN35_ESIMD_DELTA=0 selects the scalar
+    // kernel for prefill while leaving the fused ESIMD core on for decode, and
+    // the two corrupt each other across every generation. Measured over 400
+    // teacher-forced records, that arm agreed with the default configuration on
+    // 33.75% of tokens, against 92% or better for every other kernel flag.
+    // An fp64 host reference puts both recurrent kernels within 0.67 bf16 ULP
+    // of the true recurrence, so neither was ever at fault - only the pairing.
+    // With this term the same arm reports 92.75%, in line with the rest.
+    //
+    // kernels.hpp already noted that a cache must not switch layouts
+    // mid-stream; nothing enforced it. The flag now switches the whole
+    // DeltaNet path coherently, which is what a baseline A/B switch should do.
+    // The deeper fix is to give the scalar kernel the same [head][value][key]
+    // layout so no combination can mix them; this makes the unsafe one
+    // unreachable meanwhile.
     if (seq >= 1 && seq <= qwen35_fused_decode_max_seq() &&
-        weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled()) {
+        weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled() &&
+        qwen35_esimd_delta_enabled()) {
         for (int token = 0; token < seq; ++token) {
             const bf16* token_hidden = hidden + (size_t)token * c.hidden_size;
             const bf16* projected =
@@ -336,15 +370,31 @@ inline void qwen35_linear_attention_forward(
                     workspace.tmp0.data(), context);
     bf16* beta = workspace.tmp1.data();
     bf16* g = workspace.tmp1.data() + head_values;
-    if (qwen35_fused_ba_projection_enabled())
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_ba.data(),
-                    2 * heads, beta, context);
-    else {
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_b.data(), heads,
-                    beta, context);
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
-                    g, context);
-    }
+    // Two matmuls, deliberately, even though a fused [b|a] weight exists.
+    //
+    // matmul_bf16 writes C(M,N) row-major, and in_proj_ba stacks b's rows then
+    // a's, so C(seq, 2*heads) comes back with each token's b and a adjacent:
+    // token t occupies [t*2*heads, (t+1)*2*heads). The two consumers below read
+    // separate contiguous blocks instead - beta at tmp1 and g at
+    // tmp1 + seq*heads, both indexed [token * heads + head] - which describes
+    // the same bytes only when seq == 1.
+    //
+    // Using the fused matmul here therefore fed the DeltaNet recurrence some
+    // other token's gate values for every token after the first, on the
+    // default configuration, for any prompt longer than the fused-decode
+    // guard's 8 tokens. Measured against a corrected engine over 1000 records:
+    // top-1 agreement 0.87 and perplexity 191.99 against 186.16.
+    //
+    // It survived because the decode path above builds ba per token at M=1,
+    // where the two layouts coincide, and because scrambled gates perturb the
+    // output rather than obviously breaking it.
+    //
+    // These are hidden_size x heads GEMMs, launch-bound at any sequence
+    // length: pp512 measures 664.45 -> 664.20 t/s, inside run-to-run noise.
+    matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_b.data(), heads,
+                beta, context);
+    matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
+                g, context);
     sigmoid_inplace(queue, beta, head_values);
     qwen35_compute_g(queue, g, weights.A_log.data(), weights.dt_bias.data(),
                      g, seq, heads);
