@@ -128,7 +128,7 @@ int run(int argc, char** argv) {
             sigmoid_inplace(queue, gate.data(), value_heads);
             qwen35_compute_g(queue, gate.data() + value_heads, A.data(), dt.data(),
                              gate.data() + value_heads, 1, value_heads);
-            qwen35_recurrent_delta_esimd(
+            qwen35_recurrent_delta_esimd_opt(
                 queue, query.data(), key.data(), value.data(), gate.data(),
                 gate.data() + value_heads, state_baseline.data(), value.data(),
                 1, value_heads, key_dim, value_dim);

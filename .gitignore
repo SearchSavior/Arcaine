@@ -53,3 +53,5 @@
 
 /.venv
 __pycache__/
+
+/ngen_lab/ovino

@@ -674,6 +674,798 @@ build l0_min_s7: CXX_EXECUTABLE_LINKER__l0_min_s7_ CMakeFiles/l0_min_s7.dir/l0_m
   TARGET_FILE = l0_min_s7
   TARGET_PDB = l0_min_s7.dbg
 
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_gdn_spv
+
+
+#############################################
+# Order-only phony target for ovino_gdn_spv
+
+build cmake_object_order_depends_target_ovino_gdn_spv: phony || CMakeFiles/ovino_gdn_spv.dir
+
+build CMakeFiles/ovino_gdn_spv.dir/ovino/ovino_gdn_spv.cpp.o: CXX_COMPILER__ovino_gdn_spv_unscanned_ /workspace/ngen_lab/ovino/ovino_gdn_spv.cpp || cmake_object_order_depends_target_ovino_gdn_spv
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_gdn_spv.dir/ovino/ovino_gdn_spv.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_gdn_spv.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_gdn_spv.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_gdn_spv
+
+
+#############################################
+# Link the executable ovino_gdn_spv
+
+build ovino_gdn_spv: CXX_EXECUTABLE_LINKER__ovino_gdn_spv_ CMakeFiles/ovino_gdn_spv.dir/ovino/ovino_gdn_spv.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_gdn_spv.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_gdn_spv
+  TARGET_PDB = ovino_gdn_spv.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_subgroup_probe
+
+
+#############################################
+# Order-only phony target for ovino_subgroup_probe
+
+build cmake_object_order_depends_target_ovino_subgroup_probe: phony || CMakeFiles/ovino_subgroup_probe.dir
+
+build CMakeFiles/ovino_subgroup_probe.dir/ovino/subgroup_probe.cpp.o: CXX_COMPILER__ovino_subgroup_probe_unscanned_ /workspace/ngen_lab/ovino/subgroup_probe.cpp || cmake_object_order_depends_target_ovino_subgroup_probe
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_subgroup_probe.dir/ovino/subgroup_probe.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_subgroup_probe.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_subgroup_probe.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_subgroup_probe
+
+
+#############################################
+# Link the executable ovino_subgroup_probe
+
+build ovino_subgroup_probe: CXX_EXECUTABLE_LINKER__ovino_subgroup_probe_ CMakeFiles/ovino_subgroup_probe.dir/ovino/subgroup_probe.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_subgroup_probe.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_subgroup_probe
+  TARGET_PDB = ovino_subgroup_probe.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_probe2
+
+
+#############################################
+# Order-only phony target for ovino_probe2
+
+build cmake_object_order_depends_target_ovino_probe2: phony || CMakeFiles/ovino_probe2.dir
+
+build CMakeFiles/ovino_probe2.dir/ovino/probe2.cpp.o: CXX_COMPILER__ovino_probe2_unscanned_ /workspace/ngen_lab/ovino/probe2.cpp || cmake_object_order_depends_target_ovino_probe2
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_probe2.dir/ovino/probe2.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_probe2.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_probe2.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_probe2
+
+
+#############################################
+# Link the executable ovino_probe2
+
+build ovino_probe2: CXX_EXECUTABLE_LINKER__ovino_probe2_ CMakeFiles/ovino_probe2.dir/ovino/probe2.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_probe2.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_probe2
+  TARGET_PDB = ovino_probe2.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diag
+
+
+#############################################
+# Order-only phony target for ovino_diag
+
+build cmake_object_order_depends_target_ovino_diag: phony || CMakeFiles/ovino_diag.dir
+
+build CMakeFiles/ovino_diag.dir/ovino/diag.cpp.o: CXX_COMPILER__ovino_diag_unscanned_ /workspace/ngen_lab/ovino/diag.cpp || cmake_object_order_depends_target_ovino_diag
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diag.dir/ovino/diag.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diag.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diag.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diag
+
+
+#############################################
+# Link the executable ovino_diag
+
+build ovino_diag: CXX_EXECUTABLE_LINKER__ovino_diag_ CMakeFiles/ovino_diag.dir/ovino/diag.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diag.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diag
+  TARGET_PDB = ovino_diag.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diag2
+
+
+#############################################
+# Order-only phony target for ovino_diag2
+
+build cmake_object_order_depends_target_ovino_diag2: phony || CMakeFiles/ovino_diag2.dir
+
+build CMakeFiles/ovino_diag2.dir/ovino/diag2.cpp.o: CXX_COMPILER__ovino_diag2_unscanned_ /workspace/ngen_lab/ovino/diag2.cpp || cmake_object_order_depends_target_ovino_diag2
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diag2.dir/ovino/diag2.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diag2.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diag2.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diag2
+
+
+#############################################
+# Link the executable ovino_diag2
+
+build ovino_diag2: CXX_EXECUTABLE_LINKER__ovino_diag2_ CMakeFiles/ovino_diag2.dir/ovino/diag2.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diag2.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diag2
+  TARGET_PDB = ovino_diag2.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diag3
+
+
+#############################################
+# Order-only phony target for ovino_diag3
+
+build cmake_object_order_depends_target_ovino_diag3: phony || CMakeFiles/ovino_diag3.dir
+
+build CMakeFiles/ovino_diag3.dir/ovino/diag3.cpp.o: CXX_COMPILER__ovino_diag3_unscanned_ /workspace/ngen_lab/ovino/diag3.cpp || cmake_object_order_depends_target_ovino_diag3
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diag3.dir/ovino/diag3.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diag3.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diag3.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diag3
+
+
+#############################################
+# Link the executable ovino_diag3
+
+build ovino_diag3: CXX_EXECUTABLE_LINKER__ovino_diag3_ CMakeFiles/ovino_diag3.dir/ovino/diag3.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diag3.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diag3
+  TARGET_PDB = ovino_diag3.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diag3_small
+
+
+#############################################
+# Order-only phony target for ovino_diag3_small
+
+build cmake_object_order_depends_target_ovino_diag3_small: phony || CMakeFiles/ovino_diag3_small.dir
+
+build CMakeFiles/ovino_diag3_small.dir/ovino/diag3_small.cpp.o: CXX_COMPILER__ovino_diag3_small_unscanned_ /workspace/ngen_lab/ovino/diag3_small.cpp || cmake_object_order_depends_target_ovino_diag3_small
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diag3_small.dir/ovino/diag3_small.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diag3_small.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diag3_small.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diag3_small
+
+
+#############################################
+# Link the executable ovino_diag3_small
+
+build ovino_diag3_small: CXX_EXECUTABLE_LINKER__ovino_diag3_small_ CMakeFiles/ovino_diag3_small.dir/ovino/diag3_small.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diag3_small.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diag3_small
+  TARGET_PDB = ovino_diag3_small.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diag3_512
+
+
+#############################################
+# Order-only phony target for ovino_diag3_512
+
+build cmake_object_order_depends_target_ovino_diag3_512: phony || CMakeFiles/ovino_diag3_512.dir
+
+build CMakeFiles/ovino_diag3_512.dir/ovino/diag3_512.cpp.o: CXX_COMPILER__ovino_diag3_512_unscanned_ /workspace/ngen_lab/ovino/diag3_512.cpp || cmake_object_order_depends_target_ovino_diag3_512
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diag3_512.dir/ovino/diag3_512.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diag3_512.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diag3_512.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diag3_512
+
+
+#############################################
+# Link the executable ovino_diag3_512
+
+build ovino_diag3_512: CXX_EXECUTABLE_LINKER__ovino_diag3_512_ CMakeFiles/ovino_diag3_512.dir/ovino/diag3_512.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diag3_512.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diag3_512
+  TARGET_PDB = ovino_diag3_512.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_gdn_spv_x
+
+
+#############################################
+# Order-only phony target for ovino_gdn_spv_x
+
+build cmake_object_order_depends_target_ovino_gdn_spv_x: phony || CMakeFiles/ovino_gdn_spv_x.dir
+
+build CMakeFiles/ovino_gdn_spv_x.dir/ovino/ovino_gdn_spv_x.cpp.o: CXX_COMPILER__ovino_gdn_spv_x_unscanned_ /workspace/ngen_lab/ovino/ovino_gdn_spv_x.cpp || cmake_object_order_depends_target_ovino_gdn_spv_x
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_gdn_spv_x.dir/ovino/ovino_gdn_spv_x.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_gdn_spv_x.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_gdn_spv_x.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_gdn_spv_x
+
+
+#############################################
+# Link the executable ovino_gdn_spv_x
+
+build ovino_gdn_spv_x: CXX_EXECUTABLE_LINKER__ovino_gdn_spv_x_ CMakeFiles/ovino_gdn_spv_x.dir/ovino/ovino_gdn_spv_x.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_gdn_spv_x.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_gdn_spv_x
+  TARGET_PDB = ovino_gdn_spv_x.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diag4
+
+
+#############################################
+# Order-only phony target for ovino_diag4
+
+build cmake_object_order_depends_target_ovino_diag4: phony || CMakeFiles/ovino_diag4.dir
+
+build CMakeFiles/ovino_diag4.dir/ovino/diag4.cpp.o: CXX_COMPILER__ovino_diag4_unscanned_ /workspace/ngen_lab/ovino/diag4.cpp || cmake_object_order_depends_target_ovino_diag4
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diag4.dir/ovino/diag4.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diag4.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diag4.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diag4
+
+
+#############################################
+# Link the executable ovino_diag4
+
+build ovino_diag4: CXX_EXECUTABLE_LINKER__ovino_diag4_ CMakeFiles/ovino_diag4.dir/ovino/diag4.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diag4.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diag4
+  TARGET_PDB = ovino_diag4.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diag5
+
+
+#############################################
+# Order-only phony target for ovino_diag5
+
+build cmake_object_order_depends_target_ovino_diag5: phony || CMakeFiles/ovino_diag5.dir
+
+build CMakeFiles/ovino_diag5.dir/ovino/diag5.cpp.o: CXX_COMPILER__ovino_diag5_unscanned_ /workspace/ngen_lab/ovino/diag5.cpp || cmake_object_order_depends_target_ovino_diag5
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diag5.dir/ovino/diag5.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diag5.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diag5.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diag5
+
+
+#############################################
+# Link the executable ovino_diag5
+
+build ovino_diag5: CXX_EXECUTABLE_LINKER__ovino_diag5_ CMakeFiles/ovino_diag5.dir/ovino/diag5.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diag5.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diag5
+  TARGET_PDB = ovino_diag5.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diagB
+
+
+#############################################
+# Order-only phony target for ovino_diagB
+
+build cmake_object_order_depends_target_ovino_diagB: phony || CMakeFiles/ovino_diagB.dir
+
+build CMakeFiles/ovino_diagB.dir/ovino/diagB.cpp.o: CXX_COMPILER__ovino_diagB_unscanned_ /workspace/ngen_lab/ovino/diagB.cpp || cmake_object_order_depends_target_ovino_diagB
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diagB.dir/ovino/diagB.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diagB.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diagB.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diagB
+
+
+#############################################
+# Link the executable ovino_diagB
+
+build ovino_diagB: CXX_EXECUTABLE_LINKER__ovino_diagB_ CMakeFiles/ovino_diagB.dir/ovino/diagB.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diagB.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diagB
+  TARGET_PDB = ovino_diagB.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diagC
+
+
+#############################################
+# Order-only phony target for ovino_diagC
+
+build cmake_object_order_depends_target_ovino_diagC: phony || CMakeFiles/ovino_diagC.dir
+
+build CMakeFiles/ovino_diagC.dir/ovino/diagC.cpp.o: CXX_COMPILER__ovino_diagC_unscanned_ /workspace/ngen_lab/ovino/diagC.cpp || cmake_object_order_depends_target_ovino_diagC
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diagC.dir/ovino/diagC.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diagC.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diagC.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diagC
+
+
+#############################################
+# Link the executable ovino_diagC
+
+build ovino_diagC: CXX_EXECUTABLE_LINKER__ovino_diagC_ CMakeFiles/ovino_diagC.dir/ovino/diagC.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diagC.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diagC
+  TARGET_PDB = ovino_diagC.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_state_pass
+
+
+#############################################
+# Order-only phony target for ovino_state_pass
+
+build cmake_object_order_depends_target_ovino_state_pass: phony || CMakeFiles/ovino_state_pass.dir
+
+build CMakeFiles/ovino_state_pass.dir/ovino/state_pass.cpp.o: CXX_COMPILER__ovino_state_pass_unscanned_ /workspace/ngen_lab/ovino/state_pass.cpp || cmake_object_order_depends_target_ovino_state_pass
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_state_pass.dir/ovino/state_pass.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_state_pass.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_state_pass.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_state_pass
+
+
+#############################################
+# Link the executable ovino_state_pass
+
+build ovino_state_pass: CXX_EXECUTABLE_LINKER__ovino_state_pass_ CMakeFiles/ovino_state_pass.dir/ovino/state_pass.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_state_pass.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_state_pass
+  TARGET_PDB = ovino_state_pass.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_red_test
+
+
+#############################################
+# Order-only phony target for ovino_red_test
+
+build cmake_object_order_depends_target_ovino_red_test: phony || CMakeFiles/ovino_red_test.dir
+
+build CMakeFiles/ovino_red_test.dir/ovino/red_test.cpp.o: CXX_COMPILER__ovino_red_test_unscanned_ /workspace/ngen_lab/ovino/red_test.cpp || cmake_object_order_depends_target_ovino_red_test
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_red_test.dir/ovino/red_test.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_red_test.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_red_test.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_red_test
+
+
+#############################################
+# Link the executable ovino_red_test
+
+build ovino_red_test: CXX_EXECUTABLE_LINKER__ovino_red_test_ CMakeFiles/ovino_red_test.dir/ovino/red_test.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_red_test.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_red_test
+  TARGET_PDB = ovino_red_test.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_diag2_big
+
+
+#############################################
+# Order-only phony target for ovino_diag2_big
+
+build cmake_object_order_depends_target_ovino_diag2_big: phony || CMakeFiles/ovino_diag2_big.dir
+
+build CMakeFiles/ovino_diag2_big.dir/ovino/diag2_big.cpp.o: CXX_COMPILER__ovino_diag2_big_unscanned_ /workspace/ngen_lab/ovino/diag2_big.cpp || cmake_object_order_depends_target_ovino_diag2_big
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_diag2_big.dir/ovino/diag2_big.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_diag2_big.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_diag2_big.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_diag2_big
+
+
+#############################################
+# Link the executable ovino_diag2_big
+
+build ovino_diag2_big: CXX_EXECUTABLE_LINKER__ovino_diag2_big_ CMakeFiles/ovino_diag2_big.dir/ovino/diag2_big.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_diag2_big.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_diag2_big
+  TARGET_PDB = ovino_diag2_big.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_decay_test
+
+
+#############################################
+# Order-only phony target for ovino_decay_test
+
+build cmake_object_order_depends_target_ovino_decay_test: phony || CMakeFiles/ovino_decay_test.dir
+
+build CMakeFiles/ovino_decay_test.dir/ovino/decay_test.cpp.o: CXX_COMPILER__ovino_decay_test_unscanned_ /workspace/ngen_lab/ovino/decay_test.cpp || cmake_object_order_depends_target_ovino_decay_test
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_decay_test.dir/ovino/decay_test.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_decay_test.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_decay_test.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_decay_test
+
+
+#############################################
+# Link the executable ovino_decay_test
+
+build ovino_decay_test: CXX_EXECUTABLE_LINKER__ovino_decay_test_ CMakeFiles/ovino_decay_test.dir/ovino/decay_test.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_decay_test.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_decay_test
+  TARGET_PDB = ovino_decay_test.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_scalar
+
+
+#############################################
+# Order-only phony target for ovino_scalar
+
+build cmake_object_order_depends_target_ovino_scalar: phony || CMakeFiles/ovino_scalar.dir
+
+build CMakeFiles/ovino_scalar.dir/ovino/ovino_scalar.cpp.o: CXX_COMPILER__ovino_scalar_unscanned_ /workspace/ngen_lab/ovino/ovino_scalar.cpp || cmake_object_order_depends_target_ovino_scalar
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_scalar.dir/ovino/ovino_scalar.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_scalar.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_scalar.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_scalar
+
+
+#############################################
+# Link the executable ovino_scalar
+
+build ovino_scalar: CXX_EXECUTABLE_LINKER__ovino_scalar_ CMakeFiles/ovino_scalar.dir/ovino/ovino_scalar.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_scalar.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_scalar
+  TARGET_PDB = ovino_scalar.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_slm_probe
+
+
+#############################################
+# Order-only phony target for ovino_slm_probe
+
+build cmake_object_order_depends_target_ovino_slm_probe: phony || CMakeFiles/ovino_slm_probe.dir
+
+build CMakeFiles/ovino_slm_probe.dir/ovino/slm_probe.cpp.o: CXX_COMPILER__ovino_slm_probe_unscanned_ /workspace/ngen_lab/ovino/slm_probe.cpp || cmake_object_order_depends_target_ovino_slm_probe
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_slm_probe.dir/ovino/slm_probe.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_slm_probe.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_slm_probe.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_slm_probe
+
+
+#############################################
+# Link the executable ovino_slm_probe
+
+build ovino_slm_probe: CXX_EXECUTABLE_LINKER__ovino_slm_probe_ CMakeFiles/ovino_slm_probe.dir/ovino/slm_probe.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_slm_probe.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_slm_probe
+  TARGET_PDB = ovino_slm_probe.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_vec
+
+
+#############################################
+# Order-only phony target for ovino_vec
+
+build cmake_object_order_depends_target_ovino_vec: phony || CMakeFiles/ovino_vec.dir
+
+build CMakeFiles/ovino_vec.dir/ovino/ovino_vec.cpp.o: CXX_COMPILER__ovino_vec_unscanned_ /workspace/ngen_lab/ovino/ovino_vec.cpp || cmake_object_order_depends_target_ovino_vec
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_vec.dir/ovino/ovino_vec.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_vec.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_vec.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_vec
+
+
+#############################################
+# Link the executable ovino_vec
+
+build ovino_vec: CXX_EXECUTABLE_LINKER__ovino_vec_ CMakeFiles/ovino_vec.dir/ovino/ovino_vec.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_vec.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_vec
+  TARGET_PDB = ovino_vec.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_barrier_probe
+
+
+#############################################
+# Order-only phony target for ovino_barrier_probe
+
+build cmake_object_order_depends_target_ovino_barrier_probe: phony || CMakeFiles/ovino_barrier_probe.dir
+
+build CMakeFiles/ovino_barrier_probe.dir/ovino/barrier_probe.cpp.o: CXX_COMPILER__ovino_barrier_probe_unscanned_ /workspace/ngen_lab/ovino/barrier_probe.cpp || cmake_object_order_depends_target_ovino_barrier_probe
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_barrier_probe.dir/ovino/barrier_probe.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_barrier_probe.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_barrier_probe.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_barrier_probe
+
+
+#############################################
+# Link the executable ovino_barrier_probe
+
+build ovino_barrier_probe: CXX_EXECUTABLE_LINKER__ovino_barrier_probe_ CMakeFiles/ovino_barrier_probe.dir/ovino/barrier_probe.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_barrier_probe.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_barrier_probe
+  TARGET_PDB = ovino_barrier_probe.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_native
+
+
+#############################################
+# Order-only phony target for ovino_native
+
+build cmake_object_order_depends_target_ovino_native: phony || CMakeFiles/ovino_native.dir
+
+build CMakeFiles/ovino_native.dir/ovino/ovino_native.cpp.o: CXX_COMPILER__ovino_native_unscanned_ /workspace/ngen_lab/ovino/ovino_native.cpp || cmake_object_order_depends_target_ovino_native
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_native.dir/ovino/ovino_native.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_native.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_native.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_native
+
+
+#############################################
+# Link the executable ovino_native
+
+build ovino_native: CXX_EXECUTABLE_LINKER__ovino_native_ CMakeFiles/ovino_native.dir/ovino/ovino_native.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_native.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_native
+  TARGET_PDB = ovino_native.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ovino_native_ocl
+
+
+#############################################
+# Order-only phony target for ovino_native_ocl
+
+build cmake_object_order_depends_target_ovino_native_ocl: phony || CMakeFiles/ovino_native_ocl.dir
+
+build CMakeFiles/ovino_native_ocl.dir/ovino/ovino_native_ocl.cpp.o: CXX_COMPILER__ovino_native_ocl_unscanned_ /workspace/ngen_lab/ovino/ovino_native_ocl.cpp || cmake_object_order_depends_target_ovino_native_ocl
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ovino_native_ocl.dir/ovino/ovino_native_ocl.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ovino_native_ocl.dir
+  OBJECT_FILE_DIR = CMakeFiles/ovino_native_ocl.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ovino_native_ocl
+
+
+#############################################
+# Link the executable ovino_native_ocl
+
+build ovino_native_ocl: CXX_EXECUTABLE_LINKER__ovino_native_ocl_ CMakeFiles/ovino_native_ocl.dir/ovino/ovino_native_ocl.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ovino_native_ocl.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ovino_native_ocl
+  TARGET_PDB = ovino_native_ocl.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target gdn_onednn_gemm
+
+
+#############################################
+# Order-only phony target for gdn_onednn_gemm
+
+build cmake_object_order_depends_target_gdn_onednn_gemm: phony || CMakeFiles/gdn_onednn_gemm.dir
+
+build CMakeFiles/gdn_onednn_gemm.dir/ovino/gdn_onednn_gemm.cpp.o: CXX_COMPILER__gdn_onednn_gemm_unscanned_ /workspace/ngen_lab/ovino/gdn_onednn_gemm.cpp || cmake_object_order_depends_target_gdn_onednn_gemm
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/gdn_onednn_gemm.dir/ovino/gdn_onednn_gemm.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen -I/opt/onednn/include
+  OBJECT_DIR = CMakeFiles/gdn_onednn_gemm.dir
+  OBJECT_FILE_DIR = CMakeFiles/gdn_onednn_gemm.dir/ovino
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target gdn_onednn_gemm
+
+
+#############################################
+# Link the executable gdn_onednn_gemm
+
+build gdn_onednn_gemm: CXX_EXECUTABLE_LINKER__gdn_onednn_gemm_ CMakeFiles/gdn_onednn_gemm.dir/ovino/gdn_onednn_gemm.cpp.o
+  LINK_LIBRARIES = -ldnnl  -ldl
+  OBJECT_DIR = CMakeFiles/gdn_onednn_gemm.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = gdn_onednn_gemm
+  TARGET_PDB = gdn_onednn_gemm.dbg
+
 
 #############################################
 # Utility command for edit_cache
@@ -708,7 +1500,7 @@ build rebuild_cache: phony CMakeFiles/rebuild_cache.util
 #############################################
 # Folder: /workspace/ngen_lab/build
 
-build all: phony ngen_lab ngen_dpas_8x8_matmul_s8_16x16x32 ngen_dpas_8x8_matmul_s4_16x16x32 ngen_dpas_8x8_matmul_w8a2_16x16x32 ngen_dpas_8x8_matmul_w4a8_16x16x32 ngen_dpas_w4a8_gemm ngen_lab_asmdump iga_dis l0_min_s0 l0_min_s1 l0_min_s2 l0_min_s3 l0_min_s4 l0_min_s5 l0_min_s6 l0_min_s7
+build all: phony ngen_lab ngen_dpas_8x8_matmul_s8_16x16x32 ngen_dpas_8x8_matmul_s4_16x16x32 ngen_dpas_8x8_matmul_w8a2_16x16x32 ngen_dpas_8x8_matmul_w4a8_16x16x32 ngen_dpas_w4a8_gemm ngen_lab_asmdump iga_dis l0_min_s0 l0_min_s1 l0_min_s2 l0_min_s3 l0_min_s4 l0_min_s5 l0_min_s6 l0_min_s7 ovino_gdn_spv ovino_subgroup_probe ovino_probe2 ovino_diag ovino_diag2 ovino_diag3 ovino_diag3_small ovino_diag3_512 ovino_gdn_spv_x ovino_diag4 ovino_diag5 ovino_diagB ovino_diagC ovino_state_pass ovino_red_test ovino_diag2_big ovino_decay_test ovino_scalar ovino_slm_probe ovino_vec ovino_barrier_probe ovino_native ovino_native_ocl gdn_onednn_gemm
 
 # =============================================================================
 # Built-in targets

@@ -36,14 +36,14 @@ void usage(const char* program) {
         "  --n <N>            sequential decode tokens (default: 32)\n"
         "  --w <N>            warmup runs per cell (default: 1)\n"
         "  --r <N>            timed runs per cell  (default: 5)\n"
-        "  --kernels <csv>    baseline,esimd       (default: baseline,esimd)\n"
+         "  --kernels <csv>    baseline,esimd_opt (default: baseline,esimd_opt)\n"
         "  --device <N>       visible Level Zero GPU\n",
         program);
 }
 
 int run(int argc, char** argv) {
     std::string p_csv = "512,1024";
-    std::string kernels_csv = "baseline,esimd";
+    std::string kernels_csv = "baseline,esimd_opt";
     std::string device;
     int decode_tokens = 32;
     int warmup = 1;
@@ -118,7 +118,7 @@ int run(int argc, char** argv) {
                       g(host_g.size(), queue), output(vectors, queue),
                       reference(vectors, queue);
     GpuBuffer<float> baseline_state(state_values, queue),
-                     esimd_state(state_values, queue);
+                     esimd_opt_state(state_values, queue);
     q.upload(host_q.data(), host_q.size());
     k.upload(host_k.data(), host_k.size());
     v.upload(host_v.data(), host_v.size());
@@ -127,7 +127,7 @@ int run(int argc, char** argv) {
 
     auto reset = [&](const std::string& kernel) {
         if (kernel == "baseline") baseline_state.zero();
-        else if (kernel == "esimd") esimd_state.zero();
+        else if (kernel == "esimd_opt") esimd_opt_state.zero();
         else throw std::runtime_error("unknown kernel: " + kernel);
     };
     auto run_prefill = [&](const std::string& kernel, bf16* destination, int seq) {
@@ -135,10 +135,11 @@ int run(int argc, char** argv) {
             qwen35_recurrent_delta(queue, q.data(), k.data(), v.data(), beta.data(),
                                    g.data(), baseline_state.data(), destination, seq,
                                    heads, key_dim, value_dim);
-        else if (kernel == "esimd")
-            qwen35_recurrent_delta_esimd(queue, q.data(), k.data(), v.data(),
-                                         beta.data(), g.data(), esimd_state.data(),
-                                         destination, seq, heads, key_dim, value_dim);
+        else if (kernel == "esimd_opt")
+            qwen35_recurrent_delta_esimd_opt(queue, q.data(), k.data(), v.data(),
+                                             beta.data(), g.data(),
+                                             esimd_opt_state.data(), destination,
+                                             seq, heads, key_dim, value_dim);
         else
             throw std::runtime_error("unknown kernel: " + kernel);
     };
@@ -152,25 +153,25 @@ int run(int argc, char** argv) {
                     v.data() + vector_offset, beta.data() + gate_offset,
                     g.data() + gate_offset, baseline_state.data(),
                     destination + vector_offset, 1, heads, key_dim, value_dim);
-            else if (kernel == "esimd")
-                qwen35_recurrent_delta_esimd(
+            else if (kernel == "esimd_opt")
+                qwen35_recurrent_delta_esimd_opt(
                     queue, q.data() + vector_offset, k.data() + vector_offset,
                     v.data() + vector_offset, beta.data() + gate_offset,
-                    g.data() + gate_offset, esimd_state.data(),
+                    g.data() + gate_offset, esimd_opt_state.data(),
                     destination + vector_offset, 1, heads, key_dim, value_dim);
             else
                 throw std::runtime_error("unknown kernel: " + kernel);
         }
     };
 
-    auto correctness = [&](int tokens, bool decode) {
+    auto correctness = [&](const std::string& kernel, int tokens, bool decode) {
         reset("baseline");
         if (decode) run_decode("baseline", reference.data(), tokens);
         else run_prefill("baseline", reference.data(), tokens);
         queue.wait();
-        reset("esimd");
-        if (decode) run_decode("esimd", output.data(), tokens);
-        else run_prefill("esimd", output.data(), tokens);
+        reset(kernel);
+        if (decode) run_decode(kernel, output.data(), tokens);
+        else run_prefill(kernel, output.data(), tokens);
         queue.wait();
         size_t count = (size_t)tokens * heads * value_dim;
         std::vector<bf16> expected(count), actual(count);
@@ -189,8 +190,8 @@ int run(int argc, char** argv) {
 
     std::printf("[bench] Qwen3.5 DeltaNet core: heads=48 K=128 V=128 state=FP32\n");
     auto benchmark = [&](const char* kind, int tokens, bool decode) {
-        auto errors = correctness(tokens, decode);
         for (const auto& kernel : kernels) {
+            auto errors = correctness(kernel, tokens, decode);
             for (int i = 0; i < warmup; ++i) {
                 reset(kernel);
                 if (decode) run_decode(kernel, output.data(), tokens);
@@ -224,6 +225,6 @@ int run(int argc, char** argv) {
 }  // namespace
 
 REGISTER_BENCH("qwen35-deltanet",
-    "Qwen3.5 Gated DeltaNet recurrent core (baseline vs ESIMD) at 48x128x128",
+    "Qwen3.5 Gated DeltaNet recurrent core (baseline vs ESIMD vs hybrid) at 48x128x128",
     run)
 

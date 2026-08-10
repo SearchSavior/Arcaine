@@ -273,9 +273,11 @@ int main() {
                 "need M%%(16*WGY)==0, K%%32==0, N%%(16*T*WGZ)==0, T in [1,2]\n");
         return 1;
     }
-    if (kP2 && (kTiles != 1 || (kMode != 0 && kMode != 4 && kMode != 5))) {
+    if (kP2 && (kTiles != 1 || (kMode != 0 && kMode != 4 && kMode != 5
+            && kMode != 6))) {
         std::fprintf(stderr,
-                "P2 requires T=1 and MODE=0 (4: ablation, 5: mad epilogue)\n");
+                "P2 requires T=1 and MODE=0 (4: ablation, 5: direct-C, "
+                "6: direct-C + 2-tile delay)\n");
         return 1;
     }
     const int Kt = K / 32;               // 32-deep K tiles
@@ -296,8 +298,8 @@ int main() {
         while (kUnroll > 1 && (Kt % kUnroll || (kUnroll & 1))) kUnroll--;
     }
     kPrefetch = int(envU32("NGEN_LAB_W4A8_PF", 0));
-    // Mode 4 is an ablation (epilogue sources garbage); mode 5 is exact.
-    const bool doCheck = (kMode == 0 || kMode == 5)
+    // Mode 4 is an ablation (epilogue sources garbage); modes 5/6 are exact.
+    const bool doCheck = (kMode == 0 || kMode == 5 || kMode == 6)
             && (checkEnv ? std::atoi(checkEnv) != 0
                          : (double)M * N * K <= 1e9);
 

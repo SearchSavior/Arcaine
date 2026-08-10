@@ -32,18 +32,6 @@ inline bool qwen35_nvfp4_dpas_enabled() {
     return enabled;
 }
 
-inline bool qwen35_subgroup_attention_enabled() {
-    static bool enabled = [] {
-        const char* value = std::getenv("ARCAINE_QWEN35_SUBGROUP_ATTENTION");
-        // Experimental scalar/SIMD baseline. The production optimization is
-        // the XMX/DPAS tiled attention path, not this reduction-only variant.
-        if (!value) return false;
-        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
-               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
-    }();
-    return enabled;
-}
-
 inline bool qwen35_xmx_attention_enabled() {
     static bool enabled = [] {
         const char* value = std::getenv("ARCAINE_QWEN35_XMX_ATTENTION");
@@ -61,8 +49,9 @@ inline bool qwen35_splitkv_decode_enabled() {
         // each keeping flash-softmax partials (m_p, l_p, O_p), combined in a
         // second kernel. The long-KV decode is latency-bound (serial 16-key
         // blocks + 2 barriers each in the general kernel), so S-way scan
-        // parallelism hides the latency. Opt-in for A/B.
-        if (!value) return false;
+        // parallelism hides the latency. Default ON (3x at d8192 decode,
+        // neutral at d0); set to 0 to fall back to the general XMX kernel.
+        if (!value) return true;
         return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
                std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
     }();
@@ -79,28 +68,6 @@ inline int qwen35_splitkv_decode_slices() {
         return parsed > 0 ? parsed : 16;
     }();
     return slices;
-}
-
-inline bool qwen35_xmx_decode_gqa_enabled() {
-    static bool enabled = [] {
-        const char* value = std::getenv("ARCAINE_QWEN35_DECODE_XMX_GQA");
-        // Decode-optimized GQA-reuse XMX kernel: one WG per (KV head,
-        // partition) loads K/V once and reuses it across the GQA group, vs
-        // the general per-(query, output)-tile kernel which re-reads the same
-        // KV head's cache for each query head (up to 6x redundant loads at
-        // GQA 6:1).
-        //
-        // A/B (2026-08-08): this swap is essentially throughput-neutral on the
-        // measured sweep (tg128 @ d0 24.93 vs 25.02, @ d8192 6.21 vs 6.76) —
-        // the long-KV decode is bounded by the online-softmax KV-scan
-        // *latency* (per-block barriers over 24 WGs), not by KV DRAM traffic,
-        // which the GQA reuse does not reduce. Default OFF keeps the
-        // general-kernel behavior; keep this opt-in for A/B only.
-        if (!value) return false;
-        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
-               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
-    }();
-    return enabled;
 }
 
 inline bool qwen35_esimd_delta_enabled() {
@@ -234,24 +201,16 @@ inline void qwen35_full_attention_forward(
             const size_t qdim = (size_t)seq * query_dim;
             queue.memcpy(workspace.tmp2.data(), workspace.tmp4.data(),
                          qdim * sizeof(bf16));
-        } else if (seq == 1 && qwen35_xmx_decode_gqa_enabled() &&
-            c.num_attention_heads % c.num_key_value_heads == 0 &&
-            c.num_attention_heads / c.num_key_value_heads <= 8) {
-            // M=1 decode: the GQA-reuse kernel computes a KV head's query
-            // group together, loading K/V once per KV head instead of once per
-            // query head (6x redundant KV traffic at GQA 6:1). It reads query
-            // across the whole head group while partitions write disjoint
-            // output dims, so query and output MUST be separate buffers —
-            // write to tmp4 (free after the KV cache store) then copy back to
-            // tmp2 to keep the downstream in-place flow.
-            qwen35_xmx_attention_decode_gqa(
+        } else if (seq > 1) {
+            // Prefill: restructured flash-style XMX kernel (128-query tiles,
+            // register-resident Q/O per subgroup, SG-local softmax, K via 32B
+            // vector loads, V^T staged in SLM). ~4-5x over the original at
+            // p2048-p4096 with identical numerics class.
+            qwen35_xmx_attention_v2(
                 queue, workspace.tmp2.data(), cache.key.data(),
-                cache.value.data(), workspace.tmp4.data(), past,
+                cache.value.data(), workspace.tmp2.data(), seq, past,
                 c.num_attention_heads, c.num_key_value_heads, c.head_dim,
                 1.0f / std::sqrt((float)c.head_dim));
-            const size_t qdim = (size_t)seq * query_dim;
-            queue.memcpy(workspace.tmp2.data(), workspace.tmp4.data(),
-                         qdim * sizeof(bf16));
         } else {
             qwen35_xmx_attention(
                 queue, workspace.tmp2.data(), cache.key.data(),
@@ -259,12 +218,6 @@ inline void qwen35_full_attention_forward(
                 c.num_attention_heads, c.num_key_value_heads, c.head_dim,
                 1.0f / std::sqrt((float)c.head_dim));
         }
-    } else if (qwen35_subgroup_attention_enabled()) {
-        qwen35_online_attention_subgroup(
-            queue, workspace.tmp2.data(), cache.key.data(), cache.value.data(),
-            workspace.tmp2.data(), seq, past, c.num_attention_heads,
-            c.num_key_value_heads, c.head_dim,
-            1.0f / std::sqrt((float)c.head_dim));
     } else {
         qwen35_online_attention(queue, workspace.tmp2.data(), cache.key.data(),
                                 cache.value.data(), workspace.tmp2.data(), seq, past,
@@ -395,8 +348,9 @@ inline void qwen35_linear_attention_forward(
     sigmoid_inplace(queue, beta, head_values);
     qwen35_compute_g(queue, g, weights.A_log.data(), weights.dt_bias.data(),
                      g, seq, heads);
-    if (qwen35_esimd_delta_enabled()) {
-        qwen35_recurrent_delta_esimd(
+    if (qwen35_esimd_delta_enabled() && c.linear_key_head_dim == 128 &&
+        c.linear_value_head_dim == 128) {
+        qwen35_recurrent_delta_esimd_opt(
             queue, workspace.tmp2.data(), workspace.tmp3.data(),
             workspace.tmp4.data(), beta, g, cache.recurrent_state.data(),
             workspace.tmp4.data(), seq, heads, c.linear_key_head_dim,

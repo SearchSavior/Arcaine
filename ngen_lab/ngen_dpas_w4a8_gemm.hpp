@@ -225,6 +225,15 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
     // Even kUnroll only: group parity must not flip between groups.
     constexpr int kWS2 = 124;
     auto wsBuf = [&](int v, int t) {
+        if (kP2 && kMode == 6) {
+            // 4-buffer rotation for the 2-tile-delayed epilogue (see below).
+            switch (v & 3) {
+            case 0: return GRF(bWS() + t);
+            case 1: return GRF(kWS2 + t);
+            case 2: return GRF(125 + t);
+            default: return GRF(126 + t);
+            }
+        }
         return GRF(((v & 1) ? kWS2 : bWS()) + t);
     };
     // Loads for K-tile v (v == kUnroll targets the next unroll-group's tile 0
@@ -280,7 +289,7 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
 
     // Preload activation-scale lane vector for K tile 0 (duplicated into 2
     // GRFs so the SIMD32 epilogue can use it as a full-width operand).
-    if (kMode == 0 || kMode == 3 || kMode == 4 || kMode == 5) {
+    if (kMode == 0 || kMode == 3 || kMode == 4 || kMode == 5 || kMode == 6) {
         g.load(16, GRF(bASv()), scattered(DataSizeLSC::D32, 1), g.A64, rPtrAS);
         g.mov(16, GRF(bASv() + 1).f(), GRF(bASv()).f());
     }
@@ -295,9 +304,13 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
         // dpas) to remove the dpas->cvt RAW while keeping the instruction
         // stream identical. NB: kZ is only 8 GRFs -- using it here clobbered
         // rIt/address registers above it and hung the loop.
-        const int sBase = kMode == 4 ? kP2Ctmp : ((v & 1) ? kP2S1 : kP2S0);
+        // Mode 6: S is triple-buffered (S2 = Ctmp, unused by the mode-5/6
+        // epilogue); the epilogue runs 2 tiles behind the dpas.
+        const int sBase = kMode == 4 ? kP2Ctmp
+                : kMode == 6 ? kP2S0 + 16 * (v % 3)
+                : ((v & 1) ? kP2S1 : kP2S0);
         GRF rWS = wsBuf(v, 0);
-        if (kMode == 5) {
+        if (kMode == 5 || kMode == 6) {
             // Direct-C accumulate (no Ctmp, no g128 flush). as is constant
             // across the g128 group so applying it per tile is exact. NB:
             // mad(32) with 2-GRF sources hits fixup_ternary_rgn
@@ -355,21 +368,34 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
         // epilogue issue. The ws load for tile u+1 targets buffer (u+1)&1
         // == (u-1)&1 and must issue after epilogue(u-1)'s reads (WAR).
         GRF rAddrWS0(kAddrWS);
+        const bool delay2 = kMode == 6;
+        auto sBuf = [&](int u) {
+            return delay2 ? kP2S0 + 16 * (u % 3)
+                          : ((u & 1) ? kP2S1 : kP2S0);
+        };
         for (int u = 0; u < kUnroll; u++) {
             for (int h = 0; h < 2; h++) // src0 = zero -> fresh s32/tile
                 g.dpas(16, 8, 8,
-                        GRF(((u & 1) ? kP2S1 : kP2S0) + 8 * h).d(),
+                        GRF(sBuf(u) + 8 * h).d(),
                         GRF(kZ).d(), GRF(kA).b(), GRF(bB() + 2 * h).s4());
             emitLoads(u + 1);
             if (kPrefetch) emitPrefetch(u);
-            if (u > 0) emitEpilogueP2(u - 1);
+            if (delay2) {
+                if (u >= 2) emitEpilogueP2(u - 2);
+            } else if (u > 0) emitEpilogueP2(u - 1);
             const int v = u + 1;
-            const int wb = (v == kUnroll) ? 0 : (v & 1);
-            g.load(1, GRF(wb ? kWS2 : bWS()),
+            const int wb = delay2 ? (v & 3)
+                                  : ((v == kUnroll) ? 0 : (v & 1));
+            GRF rWSdst = delay2 ? wsBuf(v, 0) : GRF(wb ? kWS2 : bWS());
+            g.load(1, rWSdst,
                     block(DataSizeLSC::D32, 16), g.A64,
                     rAddrWS0 + v * kN * 4);
         }
-        emitEpilogueP2(kUnroll - 1); // drain the trailing epilogue
+        if (delay2) {
+            emitEpilogueP2(kUnroll - 2);
+            emitEpilogueP2(kUnroll - 1);
+        } else
+            emitEpilogueP2(kUnroll - 1); // drain the trailing epilogue
     } else
     for (int u = 0; u < kUnroll; u++) {
         if (kUnroll == 1 && kMode != 2)
@@ -412,7 +438,7 @@ void gemmKernelBody(Generator &g, ngen::Subregister argA,
         g.add(1, rAddrB.uq(0), rAddrB.uq(0), uint64_t(kUnroll * 256));
         g.add(1, rAddrWS.uq(0), rAddrWS.uq(0), uint64_t(kUnroll * kN * 4));
     }
-    if (kMode == 0 || kMode == 3) {
+    if (kMode == 0 || kMode == 3 || kMode == 4 || kMode == 5 || kMode == 6) {
         g.add(8, rPtrAS.uq(0)(1), rPtrAS.uq(0)(1), uint64_t(kUnroll * 4));
         g.add(8, GRF(kPtrAS + 1).uq(0)(1), GRF(kPtrAS + 1).uq(0)(1),
                 uint64_t(kUnroll * 4));

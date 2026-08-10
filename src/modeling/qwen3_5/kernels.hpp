@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <sycl/ext/intel/esimd.hpp>
 
@@ -273,107 +276,163 @@ ESIMD_INLINE float load_bf16_scalar(const bf16* base, size_t index) {
 
 }  // namespace qwen35_esimd
 
-// Sequential Gated DeltaNet recurrence specialized for Qwen3.5's
-// H=48, K=V=128 shape. Each 64-thread ESIMD work-group owns one value head;
-// each work-item keeps two value rows of the recurrent state in registers for
-// the entire sequence. Q/K are staged once per token in 2 KiB of SLM. The
-// state layout for this path is [head, value, key], unlike the scalar/SIMT
-// baseline's [head, key, value]; a cache must not switch layouts mid-stream.
-inline void qwen35_recurrent_delta_esimd(
+// ---------------------------------------------------------------------------
+// ESIMD Gated DeltaNet prefill core (the P1-P4 optimization program, now the
+// default dense prefill path): 32 threads per head (4 value rows/thread —
+// 48 heads x 32 threads pack into one wave), no SLM, no block barriers; q/k/v
+// are loaded straight into registers one token ahead (software prefetch), so
+// token t+1's global-load latency overlaps token t compute. decay=exp(g) and
+// beta are precomputed to fp32 [seq*heads] by qwen35_esimd_gate_precompute
+// before the main kernel. The state layout is [head, value, key], unlike the
+// scalar/SIMT baseline's [head, key, value]; a cache must not switch layouts
+// mid-stream.
+
+// Grow-only fp32 scratch for precomputed gates (mutex-serialized host reuse).
+struct Qwen35EsimdOptScratch {
+    GpuBuffer<float> decay, beta_f;
+    size_t cap = 0;
+};
+inline Qwen35EsimdOptScratch& qwen35_esimd_opt_scratch() {
+    static Qwen35EsimdOptScratch s;
+    return s;
+}
+inline std::mutex& qwen35_esimd_opt_scratch_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline void qwen35_esimd_gate_precompute(sycl::queue& queue, const bf16* beta,
+                                         const bf16* g, float* beta_out,
+                                         float* decay_out, size_t total) {
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
+            size_t i = id[0];
+            beta_out[i] = bf16_to_float(beta[i]);
+            decay_out[i] = sycl::exp(bf16_to_float(g[i]));
+        });
+    });
+}
+
+template <int WG>
+inline void qwen35_recurrent_delta_esimd_opt_t(
     sycl::queue& queue, const bf16* query, const bf16* key,
-    const bf16* value, const bf16* beta, const bf16* g,
-    float* state, bf16* output, int seq, int heads,
-    int key_dim, int value_dim) {
-    if (key_dim != 128 || value_dim != 128)
-        throw std::runtime_error("Qwen3.5 ESIMD DeltaNet requires K=V=128");
-    constexpr int work_group = 64;
+    const bf16* value, float* state, bf16* output, int seq, int heads,
+    const float* decay_pre, const float* beta_pre) {
+    namespace esimd = sycl::ext::intel::esimd;
+    using native_bf16 = sycl::ext::oneapi::bfloat16;
+    constexpr int ROWS = 128 / WG;
     queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
-            sycl::nd_range<1>((size_t)heads * work_group, work_group),
+            sycl::nd_range<1>((size_t)heads * WG, WG),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
-                namespace esimd = sycl::ext::intel::esimd;
-                using native_bf16 = sycl::ext::oneapi::bfloat16;
-                esimd::slm_init<2048>();
                 int head = static_cast<int>(item.get_group(0));
                 int lane = static_cast<int>(item.get_local_id(0));
-                int value0 = lane * 2;
-                int value1 = value0 + 1;
-                size_t state_base = (size_t)head * value_dim * key_dim;
+                int v0 = lane * ROWS;
+                size_t state_base = (size_t)head * 128 * 128;
 
-                esimd::simd<float, 64> state00 = esimd::block_load<float, 64>(
-                    state + state_base + (size_t)value0 * key_dim);
-                esimd::simd<float, 64> state01 = esimd::block_load<float, 64>(
-                    state + state_base + (size_t)value0 * key_dim + 64);
-                esimd::simd<float, 64> state10 = esimd::block_load<float, 64>(
-                    state + state_base + (size_t)value1 * key_dim);
-                esimd::simd<float, 64> state11 = esimd::block_load<float, 64>(
-                    state + state_base + (size_t)value1 * key_dim + 64);
-
-                for (int token = 0; token < seq; ++token) {
-                    size_t qk_base = ((size_t)token * heads + head) * key_dim;
-                    if (lane < 4) {
-                        const bf16* source = lane < 2 ? query : key;
-                        int half = lane & 1;
-                        auto* native_source = reinterpret_cast<const native_bf16*>(
-                            source + qk_base + half * 64);
-                        esimd::simd<native_bf16, 64> raw =
-                            esimd::block_load<native_bf16, 64>(native_source);
-                        esimd::simd<float, 64> converted = raw;
-                        esimd::slm_block_store<float, 64>(lane * 256, converted);
-                    }
-                    esimd::barrier();
-                    esimd::simd<float, 64> q0 =
-                        esimd::slm_block_load<float, 64>(0);
-                    esimd::simd<float, 64> q1 =
-                        esimd::slm_block_load<float, 64>(256);
-                    esimd::simd<float, 64> k0 =
-                        esimd::slm_block_load<float, 64>(512);
-                    esimd::simd<float, 64> k1 =
-                        esimd::slm_block_load<float, 64>(768);
-
-                    size_t gate_index = (size_t)token * heads + head;
-                    float decay = esimd::exp(
-                        esimd::simd<float, 8>(
-                            qwen35_esimd::load_bf16_scalar(g, gate_index)))[0];
-                    float beta_value =
-                        qwen35_esimd::load_bf16_scalar(beta, gate_index);
-                    state00 *= decay;
-                    state01 *= decay;
-                    state10 *= decay;
-                    state11 *= decay;
-
-                    float memory0 = qwen35_esimd::dot128(state00, state01, k0, k1);
-                    float memory1 = qwen35_esimd::dot128(state10, state11, k0, k1);
-                    size_t value_base = ((size_t)token * heads + head) * value_dim;
-                    float input0 = qwen35_esimd::load_bf16_scalar(value, value_base + value0);
-                    float input1 = qwen35_esimd::load_bf16_scalar(value, value_base + value1);
-                    float delta0 = (input0 - memory0) * beta_value;
-                    float delta1 = (input1 - memory1) * beta_value;
-                    state00 += delta0 * k0;
-                    state01 += delta0 * k1;
-                    state10 += delta1 * k0;
-                    state11 += delta1 * k1;
-
-                    esimd::simd<float, 2> result;
-                    result[0] = qwen35_esimd::dot128(state00, state01, q0, q1);
-                    result[1] = qwen35_esimd::dot128(state10, state11, q0, q1);
-                    auto* destination = reinterpret_cast<native_bf16*>(
-                        output + value_base + value0);
-                    esimd::block_store<native_bf16, 2>(
-                        destination, esimd::simd<native_bf16, 2>(result));
-                    esimd::barrier();
+                esimd::simd<float, 64> st[ROWS][2];
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    st[r][0] = esimd::block_load<float, 64>(
+                        state + state_base + (size_t)(v0 + r) * 128);
+                    st[r][1] = esimd::block_load<float, 64>(
+                        state + state_base + (size_t)(v0 + r) * 128 + 64);
                 }
 
-                esimd::block_store<float, 64>(
-                    state + state_base + (size_t)value0 * key_dim, state00);
-                esimd::block_store<float, 64>(
-                    state + state_base + (size_t)value0 * key_dim + 64, state01);
-                esimd::block_store<float, 64>(
-                    state + state_base + (size_t)value1 * key_dim, state10);
-                esimd::block_store<float, 64>(
-                    state + state_base + (size_t)value1 * key_dim + 64, state11);
+                // Next-token prefetch registers (raw bf16; converted at use).
+                esimd::simd<native_bf16, 64> nq0, nq1, nk0, nk1;
+                esimd::simd<native_bf16, ROWS> nv;
+                float ndecay, nbeta;
+
+                auto prefetch = [&](int t) SYCL_ESIMD_FUNCTION {
+                    size_t qk_base = ((size_t)t * heads + head) * 128;
+                    nq0 = esimd::block_load<native_bf16, 64>(
+                        reinterpret_cast<const native_bf16*>(query + qk_base));
+                    nq1 = esimd::block_load<native_bf16, 64>(
+                        reinterpret_cast<const native_bf16*>(query + qk_base + 64));
+                    nk0 = esimd::block_load<native_bf16, 64>(
+                        reinterpret_cast<const native_bf16*>(key + qk_base));
+                    nk1 = esimd::block_load<native_bf16, 64>(
+                        reinterpret_cast<const native_bf16*>(key + qk_base + 64));
+                    nv = esimd::block_load<native_bf16, ROWS>(
+                        reinterpret_cast<const native_bf16*>(
+                            value + qk_base + v0));
+                    size_t gi = (size_t)t * heads + head;
+                    ndecay = esimd::block_load<float, 1>(decay_pre + gi)[0];
+                    nbeta = esimd::block_load<float, 1>(beta_pre + gi)[0];
+                };
+
+                prefetch(0);
+                for (int t = 0; t < seq; ++t) {
+                    esimd::simd<float, 64> q0 = nq0, q1 = nq1;
+                    esimd::simd<float, 64> k0 = nk0, k1 = nk1;
+                    esimd::simd<float, ROWS> vv = nv;
+                    float decay = ndecay;
+                    float beta_value = nbeta;
+                    if (t + 1 < seq) prefetch(t + 1);
+
+                    float delta[ROWS];
+                    float result[ROWS];
+#pragma unroll
+                    for (int r = 0; r < ROWS; ++r) {
+                        st[r][0] *= decay;
+                        st[r][1] *= decay;
+                    }
+#pragma unroll
+                    for (int r = 0; r < ROWS; ++r) {
+                        float memory = qwen35_esimd::dot128(st[r][0], st[r][1],
+                                                            k0, k1);
+                        delta[r] = (vv[r] - memory) * beta_value;
+                    }
+#pragma unroll
+                    for (int r = 0; r < ROWS; ++r) {
+                        st[r][0] += delta[r] * k0;
+                        st[r][1] += delta[r] * k1;
+                    }
+#pragma unroll
+                    for (int r = 0; r < ROWS; ++r)
+                        result[r] = qwen35_esimd::dot128(st[r][0], st[r][1],
+                                                         q0, q1);
+                    esimd::simd<float, ROWS> result_v;
+#pragma unroll
+                    for (int r = 0; r < ROWS; ++r) result_v[r] = result[r];
+                    esimd::block_store<native_bf16, ROWS>(
+                        reinterpret_cast<native_bf16*>(
+                            output + ((size_t)t * heads + head) * 128 + v0),
+                        esimd::simd<native_bf16, ROWS>(result_v));
+                }
+
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    esimd::block_store<float, 64>(
+                        state + state_base + (size_t)(v0 + r) * 128, st[r][0]);
+                    esimd::block_store<float, 64>(
+                        state + state_base + (size_t)(v0 + r) * 128 + 64,
+                        st[r][1]);
+                }
             });
     });
+}
+
+inline void qwen35_recurrent_delta_esimd_opt(
+    sycl::queue& queue, const bf16* query, const bf16* key,
+    const bf16* value, const bf16* beta, const bf16* g, float* state,
+    bf16* output, int seq, int heads, int key_dim, int value_dim) {
+    if (key_dim != 128 || value_dim != 128)
+        throw std::runtime_error("Qwen3.5 ESIMD-opt DeltaNet requires K=V=128");
+    size_t total = (size_t)seq * heads;
+    std::lock_guard<std::mutex> lock(qwen35_esimd_opt_scratch_mutex());
+    auto& sc = qwen35_esimd_opt_scratch();
+    if (sc.cap < total) {
+        sc.decay = GpuBuffer<float>(total, queue);
+        sc.beta_f = GpuBuffer<float>(total, queue);
+        sc.cap = total;
+    }
+    qwen35_esimd_gate_precompute(queue, beta, g, sc.beta_f.data(),
+                                 sc.decay.data(), total);
+    qwen35_recurrent_delta_esimd_opt_t<32>(queue, query, key, value, state,
+                                           output, seq, heads, sc.decay.data(),
+                                           sc.beta_f.data());
 }
 
 // M=1 fused DeltaNet decode core. It consumes sequential [q|k|v|z]
@@ -684,78 +743,6 @@ inline void qwen35_online_attention(sycl::queue& queue,
     });
 }
 
-// Xe2-optimized counterpart of qwen35_online_attention. The baseline performs
-// an eight-stage work-group reduction through SLM for every visible KV row.
-// BMG has native 16-wide subgroup reductions, so reduce each subgroup in
-// registers and combine the sixteen subgroup totals with one more subgroup.
-// The online-softmax state uses separate SLM slots, which also removes the
-// baseline's trailing barrier from every KV iteration.
-inline void qwen35_online_attention_subgroup(
-    sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
-    bf16* output, int seq, int past, int query_heads, int key_heads,
-    int head_dim, float scale) {
-    if (head_dim != 256)
-        throw std::runtime_error(
-            "Qwen3.5 subgroup attention currently requires head_dim=256");
-    constexpr size_t local = 256;
-    constexpr int subgroup_size = 16;
-    constexpr int subgroups = static_cast<int>(local) / subgroup_size;
-    queue.submit([&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> shared(subgroups + 2, handler);
-        handler.parallel_for(
-            sycl::nd_range<1>((size_t)seq * query_heads * local, local),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                int group = static_cast<int>(item.get_group(0));
-                int token = group / query_heads;
-                int query_head = group % query_heads;
-                int key_head = query_head / (query_heads / key_heads);
-                int dim = static_cast<int>(item.get_local_id(0));
-                auto subgroup = item.get_sub_group();
-                int subgroup_id = static_cast<int>(subgroup.get_group_linear_id());
-                int lane = static_cast<int>(subgroup.get_local_linear_id());
-                float out_acc = 0.0f;
-                float running_max = -INFINITY;
-                float running_sum = 0.0f;
-                const bf16* qrow = query +
-                    ((size_t)token * query_heads + query_head) * head_dim;
-                int visible = past + token + 1;
-                for (int position = 0; position < visible; ++position) {
-                    const bf16* krow = key +
-                        ((size_t)position * key_heads + key_head) * head_dim;
-                    float partial = bf16_to_float(qrow[dim]) *
-                                    bf16_to_float(krow[dim]);
-                    float subgroup_sum = sycl::reduce_over_group(
-                        subgroup, partial, sycl::plus<float>());
-                    if (lane == 0) shared[subgroup_id] = subgroup_sum;
-                    item.barrier(sycl::access::fence_space::local_space);
-
-                    if (subgroup_id == 0) {
-                        float block_partial = lane < subgroups ? shared[lane] : 0.0f;
-                        float score = sycl::reduce_over_group(
-                            subgroup, block_partial, sycl::plus<float>()) * scale;
-                        if (lane == 0) {
-                            float next_max = sycl::fmax(running_max, score);
-                            shared[subgroups] = sycl::exp(running_max - next_max);
-                            shared[subgroups + 1] = sycl::exp(score - next_max);
-                            running_sum = running_sum * shared[subgroups] +
-                                          shared[subgroups + 1];
-                            running_max = next_max;
-                        }
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-                    const bf16* vrow = value +
-                        ((size_t)position * key_heads + key_head) * head_dim;
-                    out_acc = out_acc * shared[subgroups] +
-                              bf16_to_float(vrow[dim]) * shared[subgroups + 1];
-                }
-                if (dim == 0) shared[subgroups] = running_sum;
-                item.barrier(sycl::access::fence_space::local_space);
-                output[((size_t)token * query_heads + query_head) * head_dim + dim] =
-                    float_to_bf16(out_acc / shared[subgroups]);
-            });
-    });
-}
-
 // Flash-style causal GQA attention mapped to Battlemage XMX through the
 // SPV_INTEL_subgroup_matrix_multiply_accumulate DPAS intrinsic. One work-group
 // owns an 8-query x 256-output tile for one query head:
@@ -910,158 +897,199 @@ inline void qwen35_xmx_attention(
     });
 }
 
-// Decode-only XMX GQA kernel. One work-group owns a KV head and computes its
-// six query heads together as the M rows of the 8x16 DPAS tile. K and V tiles
-// are therefore loaded once and reused across the full GQA group.
-inline void qwen35_xmx_attention_decode_gqa(
+// Flash-style causal GQA attention on XMX, restructured vs qwen35_xmx_attention:
+// one work-group (16 subgroups x 16 lanes) owns a 128-query x 256-dim tile for
+// one query head and each subgroup owns an 8-row M-tile end to end:
+//   per SG: Q[8,256] resident in registers (16 A-fragments), KV scanned in
+//   KV_BLOCK-key blocks; S[8,KV_BLOCK] via DPAS (K B-fragments are single 32B
+//   vector loads from global: the bf16 dim pairs DPAS packs are contiguous in
+//   the [pos][dim] layout), SG-local online softmax (2 subgroup reductions per
+//   row per block, no SLM score exchange), O[8,256] accumulated in registers.
+// V is staged transposed in SLM once per block (cooperative coalesced loads,
+// padded stride keeps the DPAS B-fragment vector loads bank-conflict-free).
+// 2 barriers per KV_BLOCK keys (vs 2 per 16 in the original) and all 16 SGs
+// issue DPAS (vs subgroup 0 alone for QK^T). KV_BLOCK is a template parameter
+// (32 -> 3 WGs/core SLM occupancy, 64 -> 1 WG/core) for A/B.
+template <int KV_BLOCK>
+inline void qwen35_xmx_attention_v2_t(
     sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
-    bf16* output, int past, int query_heads, int key_heads,
+    bf16* output, int seq, int past, int query_heads, int key_heads,
     int head_dim, float scale) {
-    if (head_dim != 256 || query_heads % key_heads != 0 ||
-        query_heads / key_heads > 8)
-        throw std::runtime_error("Qwen3.5 GQA-reuse decode kernel shape mismatch");
-    constexpr int subgroup_size = 16;
-    constexpr int rows = 8;
-    constexpr int output_tiles = 16;
-    constexpr int partitions = 4;
-    constexpr int output_tiles_per_partition = output_tiles / partitions;
-    constexpr int work_group =
-        subgroup_size * output_tiles_per_partition;
-    int queries_per_key = query_heads / key_heads;
-    int visible_tokens = past + 1;
+    if (head_dim != 256)
+        throw std::runtime_error("Qwen3.5 XMX v2 attention requires head_dim=256");
+    if (query_heads % key_heads != 0)
+        throw std::runtime_error("Qwen3.5 XMX v2 attention requires integral GQA ratio");
+    constexpr int sg_size = 16;
+    constexpr int subgroups = 16;
+    constexpr int wg_size = sg_size * subgroups;
+    constexpr int query_tile = subgroups * 8;
+    constexpr int k_tiles = 256 / sg_size;
+    constexpr int score_tiles = KV_BLOCK / sg_size;
+    constexpr int pairs = KV_BLOCK / 2;
+    constexpr int slm_stride = pairs + 1;  // odd stride: conflict-free banks
+    int query_tiles = (seq + query_tile - 1) / query_tile;
     queue.submit([&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> shared(
-            rows * subgroup_size + 2 * rows, handler);
+        sycl::local_accessor<int32_t, 1> v_t(256 * slm_stride, handler);
         handler.parallel_for(
             sycl::nd_range<1>(
-                (size_t)key_heads * partitions * work_group, work_group),
+                (size_t)query_tiles * query_heads * wg_size, wg_size),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
-                int group = static_cast<int>(item.get_group(0));
-                int key_head = group / partitions;
-                int partition = group % partitions;
+                int workgroup = static_cast<int>(item.get_group(0));
+                int tile = workgroup / query_heads;
+                int query_head = workgroup % query_heads;
+                int key_head = query_head / (query_heads / key_heads);
+                int query0 = tile * query_tile;
                 auto subgroup = item.get_sub_group();
-                int local_output_tile =
-                    static_cast<int>(subgroup.get_group_linear_id());
-                int output_tile = partition * output_tiles_per_partition +
-                    local_output_tile;
+                int sg = static_cast<int>(subgroup.get_group_linear_id());
                 int lane = static_cast<int>(subgroup.get_local_linear_id());
-                int query_head0 = key_head * queries_per_key;
-                diff_dpas_v8f output_acc = {0, 0, 0, 0, 0, 0, 0, 0};
-                float running_max[rows];
-                float running_sum[rows];
-                for (int row = 0; row < rows; ++row) {
-                    running_max[row] = -INFINITY;
-                    running_sum[row] = 0.0f;
+                int row0 = query0 + sg * 8;
+                int dim = static_cast<int>(item.get_local_id(0));
+
+                // Q fragments, resident for the whole KV scan.
+                diff_dpas_v8s q_frag[k_tiles];
+                for (int kt = 0; kt < k_tiles; ++kt) {
+                    int d = kt * sg_size + lane;
+                    for (int m = 0; m < 8; ++m) {
+                        int token = row0 + m;
+                        q_frag[kt][m] = token < seq
+                            ? static_cast<short>(query[
+                                  ((size_t)token * query_heads + query_head) *
+                                      256 + d])
+                            : static_cast<short>(0);
+                    }
+                }
+                diff_dpas_v8f output_acc[k_tiles];
+                for (int nt = 0; nt < k_tiles; ++nt)
+                    for (int m = 0; m < 8; ++m) output_acc[nt][m] = 0.0f;
+                float running_max[8];
+                float running_sum[8];
+                for (int m = 0; m < 8; ++m) {
+                    running_max[m] = -INFINITY;
+                    running_sum[m] = 0.0f;
                 }
 
-                int blocks = (visible_tokens + subgroup_size - 1) / subgroup_size;
+                int visible_max = past + sycl::min(query0 + query_tile, seq);
+                int blocks = (visible_max + KV_BLOCK - 1) / KV_BLOCK;
+                size_t kv_row_stride = (size_t)key_heads * 256;
+                const bf16* v_base = value + (size_t)key_head * 256 + dim;
                 for (int block = 0; block < blocks; ++block) {
-                    int key0 = block * subgroup_size;
-                    if (local_output_tile == 0) {
-                        diff_dpas_v8f scores = {0, 0, 0, 0, 0, 0, 0, 0};
-                        for (int kt = 0; kt < head_dim / subgroup_size; ++kt) {
-                            int dimension = kt * subgroup_size + lane;
-                            diff_dpas_v8s query_fragment;
-                            for (int row = 0; row < rows; ++row) {
-                                query_fragment[row] = row < queries_per_key
-                                    ? static_cast<short>(query[
-                                        (size_t)(query_head0 + row) * head_dim +
-                                        dimension])
-                                    : 0;
-                            }
-                            diff_dpas_v8i key_fragment;
-                            int key_position = key0 + lane;
-                            for (int pair = 0; pair < 8; ++pair) {
-                                uint32_t packed = 0;
-                                if (key_position < visible_tokens) {
-                                    const bf16* key_row = key +
-                                        ((size_t)key_position * key_heads + key_head) *
-                                            head_dim;
-                                    packed = static_cast<uint32_t>(
-                                        key_row[kt * 16 + pair * 2]) |
-                                        (static_cast<uint32_t>(
-                                            key_row[kt * 16 + pair * 2 + 1]) << 16);
-                                }
-                                key_fragment[pair] = static_cast<int>(packed);
-                            }
-                            scores = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
-                                16, query_fragment, key_fragment, scores,
-                                kNvfp4DpasBF16);
-                        }
-
-                        for (int row = 0; row < rows; ++row) {
-                            int key_position = key0 + lane;
-                            bool visible = row < queries_per_key &&
-                                           key_position < visible_tokens;
-                            float score = visible ? scores[row] * scale : -INFINITY;
-                            float block_max = sycl::reduce_over_group(
-                                subgroup, score, sycl::maximum<float>());
-                            float next_max = sycl::fmax(running_max[row], block_max);
-                            float alpha = sycl::exp(running_max[row] - next_max);
-                            float probability = visible
-                                ? sycl::exp(score - next_max) : 0.0f;
-                            float block_sum = sycl::reduce_over_group(
-                                subgroup, probability, sycl::plus<float>());
-                            running_sum[row] =
-                                running_sum[row] * alpha + block_sum;
-                            running_max[row] = next_max;
-                            shared[row * subgroup_size + lane] = probability;
-                            if (lane == 0)
-                                shared[rows * subgroup_size + row] = alpha;
-                        }
+                    int key0 = block * KV_BLOCK;
+                    if (block > 0)
+                        item.barrier(sycl::access::fence_space::local_space);
+                    // Cooperative V^T stage: thread d packs dim d of every
+                    // key pair, zero-filling past visible_max.
+                    for (int p = 0; p < pairs; ++p) {
+                        int k0 = key0 + 2 * p;
+                        uint32_t lo = 0, hi = 0;
+                        if (k0 < visible_max)
+                            lo = v_base[(size_t)k0 * kv_row_stride];
+                        if (k0 + 1 < visible_max)
+                            hi = v_base[(size_t)(k0 + 1) * kv_row_stride];
+                        v_t[dim * slm_stride + p] =
+                            static_cast<int32_t>(lo | (hi << 16));
                     }
                     item.barrier(sycl::access::fence_space::local_space);
 
-                    for (int row = 0; row < rows; ++row)
-                        output_acc[row] *= shared[rows * subgroup_size + row];
-                    diff_dpas_v8s probability_fragment;
-                    for (int row = 0; row < rows; ++row)
-                        probability_fragment[row] = static_cast<short>(
-                            float_to_bf16(shared[row * subgroup_size + lane]));
-                    diff_dpas_v8i value_fragment;
-                    int output_dimension = output_tile * subgroup_size + lane;
-                    for (int pair = 0; pair < 8; ++pair) {
-                        int key_position0 = key0 + pair * 2;
-                        uint32_t packed = 0;
-                        if (key_position0 < visible_tokens) {
-                            bf16 low = value[
-                                ((size_t)key_position0 * key_heads + key_head) *
-                                    head_dim + output_dimension];
-                            bf16 high = 0;
-                            if (key_position0 + 1 < visible_tokens)
-                                high = value[
-                                    ((size_t)(key_position0 + 1) * key_heads + key_head) *
-                                        head_dim + output_dimension];
-                            packed = static_cast<uint32_t>(low) |
-                                     (static_cast<uint32_t>(high) << 16);
+                    // S = Q K^T for this block; B-fragment = one 32B load.
+                    diff_dpas_v8f scores[score_tiles];
+                    for (int nt = 0; nt < score_tiles; ++nt) {
+                        diff_dpas_v8f acc = {0, 0, 0, 0, 0, 0, 0, 0};
+                        int kpos = key0 + nt * sg_size + lane;
+                        const bf16* krow =
+                            key + ((size_t)kpos * key_heads + key_head) * 256;
+                        if (kpos < visible_max) {
+                            for (int kt = 0; kt < k_tiles; ++kt) {
+                                diff_dpas_v8i k_frag =
+                                    *reinterpret_cast<const diff_dpas_v8i*>(
+                                        krow + kt * sg_size);
+                                acc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                                    16, q_frag[kt], k_frag, acc,
+                                    kNvfp4DpasBF16);
+                            }
                         }
-                        value_fragment[pair] = static_cast<int>(packed);
+                        scores[nt] = acc;
                     }
-                    output_acc = __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
-                        16, probability_fragment, value_fragment, output_acc,
-                        kNvfp4DpasBF16);
-                    item.barrier(sycl::access::fence_space::local_space);
+
+                    // SG-local online softmax; P fragments are the softmaxed
+                    // score tiles rounded to bf16 (same numerics class as the
+                    // original kernel's SLM round-trip).
+                    float alpha[8];
+                    diff_dpas_v8s p_frag[score_tiles];
+                    for (int m = 0; m < 8; ++m) {
+                        int token = row0 + m;
+                        float block_max = -INFINITY;
+                        for (int nt = 0; nt < score_tiles; ++nt) {
+                            int kpos = key0 + nt * sg_size + lane;
+                            bool vis =
+                                token < seq && kpos <= past + token;
+                            float s = vis ? scores[nt][m] * scale : -INFINITY;
+                            scores[nt][m] = s;
+                            block_max = sycl::fmax(block_max, s);
+                        }
+                        block_max = sycl::reduce_over_group(
+                            subgroup, block_max, sycl::maximum<float>());
+                        float next_max = sycl::fmax(running_max[m], block_max);
+                        alpha[m] = sycl::exp(running_max[m] - next_max);
+                        float psum = 0.0f;
+                        for (int nt = 0; nt < score_tiles; ++nt) {
+                            float p = sycl::exp(scores[nt][m] - next_max);
+                            psum += p;
+                            scores[nt][m] = p;
+                            p_frag[nt][m] =
+                                static_cast<short>(float_to_bf16(p));
+                        }
+                        float block_sum = sycl::reduce_over_group(
+                            subgroup, psum, sycl::plus<float>());
+                        running_sum[m] =
+                            running_sum[m] * alpha[m] + block_sum;
+                        running_max[m] = next_max;
+                    }
+
+                    // O = O * alpha + P V.
+                    for (int nt = 0; nt < k_tiles; ++nt)
+                        for (int m = 0; m < 8; ++m)
+                            output_acc[nt][m] *= alpha[m];
+                    for (int nt = 0; nt < k_tiles; ++nt) {
+                        int d = nt * sg_size + lane;
+                        const int32_t* vrow = &v_t[d * slm_stride];
+                        for (int kt = 0; kt < score_tiles; ++kt) {
+                            diff_dpas_v8i v_frag =
+                                *reinterpret_cast<const diff_dpas_v8i*>(
+                                    vrow + kt * 8);
+                            output_acc[nt] =
+                                __spirv_SubgroupMatrixMultiplyAccumulateINTEL(
+                                    16, p_frag[kt], v_frag, output_acc[nt],
+                                    kNvfp4DpasBF16);
+                        }
+                    }
                 }
 
-                if (local_output_tile == 0 && lane == 0)
-                    for (int row = 0; row < rows; ++row)
-                        shared[rows * (subgroup_size + 1) + row] =
-                            running_sum[row];
-                item.barrier(sycl::access::fence_space::local_space);
-                for (int row = 0; row < queries_per_key; ++row) {
-                    float denominator =
-                        shared[rows * (subgroup_size + 1) + row];
-                    output[((size_t)query_head0 + row) * head_dim +
-                           output_tile * subgroup_size + lane] =
-                        float_to_bf16(output_acc[row] / denominator);
+                for (int nt = 0; nt < k_tiles; ++nt) {
+                    int d = nt * sg_size + lane;
+                    for (int m = 0; m < 8; ++m) {
+                        int token = row0 + m;
+                        if (token < seq)
+                            output[((size_t)token * query_heads + query_head) *
+                                       256 + d] =
+                                float_to_bf16(output_acc[nt][m] /
+                                              running_sum[m]);
+                    }
                 }
             });
     });
 }
 
-// Flash-style split-KV GQA decode attention. The long-KV decode scan in
-// qwen35_xmx_attention_decode_gqa is latency-bound: one WG per (key_head,
-// partition) serially scans the whole KV cache in 16-key blocks with two
+inline void qwen35_xmx_attention_v2(
+    sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
+    bf16* output, int seq, int past, int query_heads, int key_heads,
+    int head_dim, float scale) {
+    qwen35_xmx_attention_v2_t<64>(queue, query, key, value, output, seq, past,
+                                  query_heads, key_heads, head_dim, scale);
+}
+
+// Flash-style split-KV GQA decode attention. The long-KV decode scan is
+// latency-bound with one WG per (key_head, partition) serially scanning the
+// whole KV cache in 16-key blocks with two
 // full-WG barriers per block, so at past=8192 it runs ~512 serial iterations
 // and the small grid cannot hide the barrier/DPAS latency (measured effective
 // bandwidth ~4 GB/s/layer vs 792 GB/s peak — not bandwidth-bound). This
