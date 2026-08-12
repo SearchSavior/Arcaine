@@ -202,11 +202,13 @@ inline void qwen35_full_attention_forward(
             queue.memcpy(workspace.tmp2.data(), workspace.tmp4.data(),
                          qdim * sizeof(bf16));
         } else if (seq > 1) {
-            // Prefill: restructured flash-style XMX kernel (128-query tiles,
-            // register-resident Q/O per subgroup, SG-local softmax, K via 32B
-            // vector loads, V^T staged in SLM). ~4-5x over the original at
-            // p2048-p4096 with identical numerics class.
-            qwen35_xmx_attention_v2(
+            // Prefill: pure-ESIMD streamed K/V mainloop (vllm-xpu
+            // chunk_prefill recipe), fp16 dpas, grf_size<256>, KV_BLOCK=32.
+            // A/B vs the former SLM-staged v2: 2-4x kernel-level in every
+            // cell (q128-q4096, kv up to 131072), bit-exact numerics;
+            // e2e -p 512,1024,2048,4096 at d32000: 354/330/361/354 ->
+            // 647/798/800/791 t/s.
+            qwen35_xmx_attention_v3(
                 queue, workspace.tmp2.data(), cache.key.data(),
                 cache.value.data(), workspace.tmp2.data(), seq, past,
                 c.num_attention_heads, c.num_key_value_heads, c.head_dim,

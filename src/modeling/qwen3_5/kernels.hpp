@@ -7,6 +7,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include "runtime/gpu/buffer.hpp"
 #include "runtime/quantization/nvfp4.hpp"
@@ -1086,6 +1087,303 @@ inline void qwen35_xmx_attention_v2(
     qwen35_xmx_attention_v2_t<64>(queue, query, key, value, output, seq, past,
                                   query_heads, key_heads, head_dim, scale);
 }
+
+// Flash-style causal GQA attention on XMX, v3. Pure-ESIMD port of the
+// vllm-xpu/sycl-tla chunk_prefill mainloop recipe:
+//   - no SLM anywhere in the KV scan and zero work-group barriers (v2 stages
+//     V^T in SLM with 2 full-WG barriers per KV block);
+//   - K and V B-fragments stream gmem->registers via 2D block loads; rows
+//     past the end of the KV cache are zero-filled by the hardware
+//     (declared surface height == past+seq), replacing v2's guarded loads;
+//   - V uses the single-instruction VNNI-transformed 2D load which yields
+//     the dpas B word layout directly (probe tools/esimd_dpas_probe.cpp T2);
+//     K needs an 8x16 u32 in-register transpose (8 strided selects/frag);
+//   - next-block K+V rows are L2-prefetched (thread-partitioned) before the
+//     current block's compute;
+//   - online softmax in the exp2 domain (scale*log2(e) folded in).
+// Numeric path: fp16 dpas (bf16 dpas miscompiles under JIT on this stack;
+// fp16 passes all probes). bf16 operands convert bf16->fp32->fp16 at load;
+// the conversion is exact for finite values inside fp16 range (bf16's 8-bit
+// mantissa fits fp16's 11-bit one), so Q/K/V are exact, and P (in [0,1])
+// is exactly representable except below fp16 subnormal range.
+// Layout: WG = 16 ESIMD threads; each thread owns an 8-row M-tile x all 256
+// head dims end to end (one former SG tile per thread, whole-register
+// ESIMD form), 128 queries per WG. The kernel launches with grf_size<256>:
+// auto-large-GRF mode (-cl-intel-enable-auto-large-GRF-mode emitted for
+// grf_size_automatic) is ignored by the VC/ESIMD codegen path, which then
+// allocates numGRF=128 and spills ~10KB/thread to scratch (~1.9x slower).
+// At numGRF=256 the register allocator additionally uses the 8 hardware
+// accumulators (numAcc=8) and spill drops to 64B/thread. KV_BLOCK keys per
+// iteration (A/B knob, 32 or 64; 32 wins at numGRF=256 since 64 spills
+// 2304B/thread).
+template <int KV_BLOCK>
+inline void qwen35_xmx_attention_v3_t(
+    sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
+    bf16* output, int seq, int past, int query_heads, int key_heads,
+    int head_dim, float scale) {
+    if (head_dim != 256)
+        throw std::runtime_error("Qwen3.5 XMX v3 attention requires head_dim=256");
+    if (query_heads % key_heads != 0)
+        throw std::runtime_error("Qwen3.5 XMX v3 attention requires integral GQA ratio");
+    static_assert(KV_BLOCK == 32 || KV_BLOCK == 64,
+                  "xmx3 KV_BLOCK must be 32 or 64");
+    constexpr int wg_size = 16;
+    constexpr int query_tile = wg_size * 8;  // 128 queries per WG
+    constexpr int k_tiles = 256 / 16;        // 16-dim dpas K steps
+    constexpr int ntiles = KV_BLOCK / 16;    // 16-key score tiles per block
+    const float scale_log2e = scale * 1.4426950408889634f;
+    int query_tiles = (seq + query_tile - 1) / query_tile;
+    const unsigned row_bytes = (unsigned)key_heads * 256 * 2;
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                (size_t)query_tiles * query_heads * wg_size, wg_size),
+            sycl::ext::oneapi::experimental::properties{
+                sycl::ext::intel::experimental::grf_size<256>},
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                namespace esimd = sycl::ext::intel::esimd;
+                using fp16 = sycl::half;
+                using bf16x = sycl::ext::oneapi::bfloat16;
+                using pf_props_t = esimd::detail::make_L1_L2_properties_t<
+                    esimd::cache_hint::uncached, esimd::cache_hint::cached>;
+                int workgroup = static_cast<int>(item.get_group(0));
+                int tile = workgroup / query_heads;
+                int query_head = workgroup % query_heads;
+                int key_head = query_head / (query_heads / key_heads);
+                int query0 = tile * query_tile;
+                int thr = static_cast<int>(item.get_local_id(0));
+                int row0 = query0 + thr * 8;
+                if (row0 >= seq) return;
+
+                const uint16_t* k_head =
+                    reinterpret_cast<const uint16_t*>(
+                        key + (size_t)key_head * 256);
+                const uint16_t* v_head =
+                    reinterpret_cast<const uint16_t*>(
+                        value + (size_t)key_head * 256);
+                const unsigned surf_w = row_bytes - 1;
+                const unsigned surf_h = (unsigned)(past + seq - 1);
+
+                // Q -> fp16 dpas A fragments (8 rows x 256 dims, resident).
+                esimd::simd<fp16, 128> aQ[k_tiles];
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    int token = row0 + m;
+                    if (token > seq - 1) token = seq - 1;
+                    const bf16x* qrow = reinterpret_cast<const bf16x*>(
+                        query + ((size_t)token * query_heads + query_head) *
+                                    256);
+                    esimd::simd<bf16x, 256> qb;
+                    qb.template select<128, 1>(0) =
+                        esimd::block_load<bf16x, 128>(qrow);
+                    qb.template select<128, 1>(128) =
+                        esimd::block_load<bf16x, 128>(qrow + 128);
+                    esimd::simd<float, 256> qf = qb;
+                    esimd::simd<fp16, 256> qh = qf;
+#pragma unroll
+                    for (int kt = 0; kt < k_tiles; ++kt)
+                        aQ[kt].template select<16, 1>(m * 16) =
+                            qh.template select<16, 1>(kt * 16);
+                }
+
+                esimd::simd<float, 128> acc[k_tiles];
+#pragma unroll
+                for (int nt = 0; nt < k_tiles; ++nt) acc[nt] = 0.0f;
+                float running_max[8];
+                float running_sum[8];
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    running_max[m] = -INFINITY;
+                    running_sum[m] = 0.0f;
+                }
+                esimd::simd<int, KV_BLOCK> key_iota;
+#pragma unroll
+                for (int i = 0; i < KV_BLOCK; ++i) key_iota[i] = i;
+
+                int visible = past + (row0 + 8 < seq ? row0 + 8 : seq);
+                int blocks = (visible + KV_BLOCK - 1) / KV_BLOCK;
+                for (int block = 0; block < blocks; ++block) {
+                    int key0 = block * KV_BLOCK;
+                    // L2 prefetch of the next block's K/V rows,
+                    // thread-partitioned (rows_per_thread rows x 8 64B chunks).
+                    if (block + 1 < blocks) {
+                        constexpr int rows_per_thread = KV_BLOCK / wg_size;
+#pragma unroll
+                        for (int r = 0; r < rows_per_thread; ++r) {
+                            int y = key0 + KV_BLOCK + thr * rows_per_thread +
+                                    r;
+                            if (y < visible) {
+#pragma unroll
+                                for (int x = 0; x < 8; ++x) {
+                                    esimd::prefetch_2d<uint16_t, 32, 1>(
+                                        k_head, surf_w, surf_h, surf_w,
+                                        x * 32, y, pf_props_t{});
+                                    esimd::prefetch_2d<uint16_t, 32, 1>(
+                                        v_head, surf_w, surf_h, surf_w,
+                                        x * 32, y, pf_props_t{});
+                                }
+                            }
+                        }
+                    }
+
+                    // S = Q K^T for this block. K dpas B word (kp,n) =
+                    // pack(K[key n][dim 2kp], K[key n][dim 2kp+1]); a plain
+                    // row-major 16x16 u16 2D load has that u32 at [n*8+kp],
+                    // so repack with 8 strided selects per fragment.
+                    esimd::simd<float, 128> scores[ntiles];
+#pragma unroll
+                    for (int nt = 0; nt < ntiles; ++nt) {
+                        esimd::simd<float, 128> sacc = 0.0f;
+                        int key_base = key0 + nt * 16;
+#pragma unroll
+                        for (int kt = 0; kt < k_tiles; ++kt) {
+                            auto kraw = esimd::load_2d<uint16_t, 16, 16, 1,
+                                                       false, false>(
+                                k_head, surf_w, surf_h, surf_w, kt * 16,
+                                key_base);
+                            auto kraw_u32 =
+                                kraw.template bit_cast_view<uint32_t>();
+                            esimd::simd<uint32_t, 128> b_word;
+#pragma unroll
+                            for (int kp = 0; kp < 8; ++kp)
+                                b_word.template select<16, 1>(kp * 16) =
+                                    kraw_u32.template select<16, 8>(kp)
+                                        .read();
+                            esimd::simd<bf16x, 256> kb =
+                                b_word.template bit_cast_view<bf16x>().read();
+                            esimd::simd<float, 256> kf = kb;
+                            esimd::simd<fp16, 256> kh = kf;
+                            sacc = esimd::xmx::dpas<
+                                8, 8, float, float, fp16, fp16,
+                                esimd::xmx::dpas_argument_type::fp16,
+                                esimd::xmx::dpas_argument_type::fp16>(
+                                sacc, kh, aQ[kt]);
+                        }
+                        scores[nt] = sacc;
+                    }
+
+                    // Online softmax in the exp2 domain, per M-row.
+                    float alpha[8];
+                    esimd::simd<fp16, 128> p_frag[ntiles];
+#pragma unroll
+                    for (int m = 0; m < 8; ++m) {
+                        int token = row0 + m;
+                        if (token > seq - 1) token = seq - 1;
+                        esimd::simd<float, KV_BLOCK> srow;
+#pragma unroll
+                        for (int nt = 0; nt < ntiles; ++nt)
+                            srow.template select<16, 1>(nt * 16) =
+                                scores[nt].template select<16, 1>(m * 16);
+                        srow *= scale_log2e;
+                        esimd::simd<int, KV_BLOCK> kidx = key_iota + key0;
+                        esimd::simd<uint16_t, KV_BLOCK> invis =
+                            kidx > (past + token);
+                        srow.merge(-INFINITY, invis);
+                        float block_max = -INFINITY;
+#pragma unroll
+                        for (int nt = 0; nt < ntiles; ++nt) {
+                            float tile_max = esimd::hmax<float>(
+                                srow.template select<16, 1>(nt * 16)
+                                    .read());
+                            block_max =
+                                tile_max > block_max ? tile_max : block_max;
+                        }
+                        float next_max = block_max > running_max[m]
+                                             ? block_max
+                                             : running_max[m];
+                        alpha[m] = esimd::exp2(
+                            esimd::simd<float, 8>(
+                                running_max[m] - next_max))[0];
+                        float psum = 0.0f;
+#pragma unroll
+                        for (int nt = 0; nt < ntiles; ++nt) {
+                            auto p16 = esimd::exp2(
+                                srow.template select<16, 1>(nt * 16).read() -
+                                next_max);
+                            psum += esimd::reduce<float, float, 16>(
+                                p16, std::plus<float>());
+                            esimd::simd<fp16, 16> ph = p16;
+                            p_frag[nt].template select<16, 1>(m * 16) = ph;
+                        }
+                        running_sum[m] =
+                            running_sum[m] * alpha[m] + psum;
+                        running_max[m] = next_max;
+                    }
+
+                    // O = O * alpha + P V; the VNNI-transformed V 2D load
+                    // yields the PV dpas B word layout directly.
+                    esimd::simd<float, 128> alpha_rep;
+#pragma unroll
+                    for (int m = 0; m < 8; ++m)
+                        alpha_rep.template select<16, 1>(m * 16) = alpha[m];
+#pragma unroll
+                    for (int nt = 0; nt < k_tiles; ++nt)
+                        acc[nt] *= alpha_rep;
+#pragma unroll
+                    for (int nt = 0; nt < k_tiles; ++nt) {
+#pragma unroll
+                        for (int kt = 0; kt < ntiles; ++kt) {
+                            auto vraw = esimd::load_2d<uint16_t, 16, 16, 1,
+                                                       false, true>(
+                                v_head, surf_w, surf_h, surf_w, nt * 16,
+                                key0 + kt * 16);
+                            esimd::simd<bf16x, 256> vb =
+                                vraw.template bit_cast_view<bf16x>().read();
+                            esimd::simd<float, 256> vf = vb;
+                            esimd::simd<fp16, 256> vh = vf;
+                            acc[nt] = esimd::xmx::dpas<
+                                8, 8, float, float, fp16, fp16,
+                                esimd::xmx::dpas_argument_type::fp16,
+                                esimd::xmx::dpas_argument_type::fp16>(
+                                acc[nt], vh, p_frag[kt]);
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int nt = 0; nt < k_tiles; ++nt) {
+#pragma unroll
+                    for (int m = 0; m < 8; ++m) {
+                        int token = row0 + m;
+                        if (token < seq) {
+                            esimd::simd<float, 16> out =
+                                acc[nt].template select<16, 1>(m * 16) /
+                                running_sum[m];
+                            esimd::simd<bf16x, 16> out_b = out;
+                            esimd::block_store<bf16x, 16>(
+                                reinterpret_cast<bf16x*>(
+                                    output +
+                                    ((size_t)token * query_heads +
+                                     query_head) * 256 + nt * 16),
+                                out_b);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+inline void qwen35_xmx_attention_v3(
+    sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
+    bf16* output, int seq, int past, int query_heads, int key_heads,
+    int head_dim, float scale) {
+    // KV-block A/B knob; 32 beats 64 in every measured cell at numGRF=256
+    // (64 spills 2304B/thread to scratch; 32 spills 64B).
+    static int kv_block = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_XMXV3_KV_BLOCK");
+        int parsed = value ? std::atoi(value) : 32;
+        return parsed > 0 ? parsed : 32;
+    }();
+    if (kv_block == 32)
+        qwen35_xmx_attention_v3_t<32>(queue, query, key, value, output, seq,
+                                      past, query_heads, key_heads, head_dim,
+                                      scale);
+    else
+        qwen35_xmx_attention_v3_t<64>(queue, query, key, value, output, seq,
+                                      past, query_heads, key_heads, head_dim,
+                                      scale);
+}
+
 
 // Flash-style split-KV GQA decode attention. The long-KV decode scan is
 // latency-bound with one WG per (key_head, partition) serially scanning the

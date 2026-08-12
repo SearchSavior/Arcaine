@@ -28,6 +28,15 @@ struct Qwen35Workspace {
     static constexpr int decode_part_dims = 64;
     GpuBuffer<float> decode_part_out;
     GpuBuffer<float> decode_part_state;
+    // Prefill split-KV (xmx3) partials. Region layout from the kernel:
+    // [(tile*query_heads + query_head)*slices + slice][row(128)][dim(256)]
+    // floats for part_out, [region][row][2] floats for part_state (m, l in
+    // the exp2 domain). Caps: seq <= 1024 (8 tiles of 128), slices <= 8.
+    static constexpr int prefill_max_tiles = 8;
+    static constexpr int prefill_max_kv_slices = 8;
+    static constexpr int prefill_rows_per_tile = 128;
+    GpuBuffer<float> prefill_part_out;
+    GpuBuffer<float> prefill_part_state;
 
     void init(const Qwen35Config& config, int max_seq, sycl::queue& queue) {
         max_seq_len = max_seq;

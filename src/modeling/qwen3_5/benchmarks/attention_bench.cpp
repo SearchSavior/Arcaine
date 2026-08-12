@@ -35,9 +35,11 @@ void usage(const char* program) {
         "Usage: %s [options]\n"
         "  --p <csv>          prefill query lengths       (default: 128,512)\n"
         "  --d <csv>          decode KV depths           (default: 0,512,1024)\n"
+        "  --pp <csv>         prefill-at-depth KV pasts, crossed with -p\n"
+        "                     (default: none)\n"
         "  --w <N>            warmup runs per cell       (default: 1)\n"
         "  --r <N>            timed runs per cell        (default: 5)\n"
-        "  --kernels <csv>    baseline,xmx,xmx2   (default: baseline,xmx)\n"
+         "  --kernels <csv>    baseline,xmx,xmx2,xmx3   (default: baseline,xmx)\n"
         "  --device <N>       visible Level Zero GPU\n",
         program);
 }
@@ -45,6 +47,7 @@ void usage(const char* program) {
 int run(int argc, char** argv) {
     std::string p_csv = "128,512";
     std::string d_csv = "0,512,1024";
+    std::string pp_csv = "";
     std::string kernels_csv = "baseline,xmx";
     std::string device;
     int warmup = 1;
@@ -58,6 +61,7 @@ int run(int argc, char** argv) {
         if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }
         else if (arg == "-p" || arg == "--p") p_csv = next();
         else if (arg == "-d" || arg == "--d") d_csv = next();
+        else if (arg == "--pp") pp_csv = next();
         else if (arg == "-w" || arg == "--w") warmup = std::stoi(next());
         else if (arg == "-r" || arg == "--r") runs = std::stoi(next());
         else if (arg == "--kernels") kernels_csv = next();
@@ -67,6 +71,8 @@ int run(int argc, char** argv) {
     if (!device.empty()) gpu_device_control::apply_device_index(device);
     std::vector<int> prefills = parse_int_csv(p_csv);
     std::vector<int> depths = parse_int_csv(d_csv);
+    std::vector<int> pp_depths = pp_csv.empty() ? std::vector<int>{}
+                                                : parse_int_csv(pp_csv);
     std::vector<std::string> kernels = split_csv(kernels_csv);
     if (prefills.empty() || depths.empty() || kernels.empty() || warmup < 0 || runs <= 0)
         throw std::runtime_error("invalid benchmark arguments");
@@ -77,7 +83,10 @@ int run(int argc, char** argv) {
     constexpr float scale = 0.0625f;
     int max_query = *std::max_element(prefills.begin(), prefills.end());
     int max_depth = *std::max_element(depths.begin(), depths.end());
-    int max_kv = std::max(max_query, max_depth + 1);
+    int max_pp = pp_depths.empty()
+                     ? 0
+                     : *std::max_element(pp_depths.begin(), pp_depths.end());
+    int max_kv = std::max({max_query, max_depth + 1, max_pp + max_query});
     auto& queue = GpuEngine::get(0).queue;
 
     std::vector<bf16> host_q((size_t)max_query * query_heads * head_dim);
@@ -112,6 +121,9 @@ int run(int argc, char** argv) {
         else if (kernel == "xmx2")
             qwen35_xmx_attention_v2(queue, q.data(), k.data(), v.data(), destination,
                                     seq, past, query_heads, key_heads, head_dim, scale);
+        else if (kernel == "xmx3")
+             qwen35_xmx_attention_v3(queue, q.data(), k.data(), v.data(), destination,
+                                     seq, past, query_heads, key_heads, head_dim, scale);
         else
             throw std::runtime_error("unknown kernel: " + kernel);
     };
@@ -155,6 +167,9 @@ int run(int argc, char** argv) {
 
     for (int seq : prefills) benchmark_cell("prefill", seq, 0);
     for (int depth : depths) benchmark_cell("decode", 1, depth);
+    for (int seq : prefills)
+        for (int past : pp_depths)
+            benchmark_cell("prefill_at_depth", seq, past);
     return 0;
 }
 
