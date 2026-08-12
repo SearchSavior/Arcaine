@@ -316,15 +316,68 @@ inline void act_quant_s8_report(const bf16* ref, const bf16* test, size_t n,
                 rms_diff / (rms_ref + 1e-12));
 }
 
+// ---------------------------------------------------------------------------
+// Asymmetric zp correction scratch (ARCAINE_QWEN35_INT4_ZP_SCRATCH, default on).
+//
+// The dense qwen3_5 path calls matmul_int4 ~4x per layer; every call with
+// asymmetric zp previously heap-allocated rowsum + corr GpuBuffers, violating
+// the workspace contract ("no layer-forward path allocates device memory").
+// This switch uses caller-provided workspace buffers instead. Measured neutral
+// (warm) vs the heap path on BMG; strictly fewer device allocations. Set to 0
+// to restore per-call allocation.
+// ---------------------------------------------------------------------------
+inline bool& int4_zp_scratch_ref() {
+    static bool scratch = [] {
+        const char* env = std::getenv("ARCAINE_QWEN35_INT4_ZP_SCRATCH");
+        if (env && (std::string(env) == "0" || std::string(env) == "off"))
+            return false;
+        return true;
+    }();
+    return scratch;
+}
+inline bool int4_zp_scratch() { return int4_zp_scratch_ref(); }
+inline void int4_zp_scratch_set(bool v) { int4_zp_scratch_ref() = v; }
+
+// rowsum[m,g] = bf16(sum_{k in group g} A[m,k]), group size gs. Shared by every
+// INT4 projection consuming A (hoisted once per activation). Must be called on
+// ctx's queue before the GEMM it feeds.
+inline void int4_rowsum(const bf16* A, int M, int K, int gs, bf16* out,
+                        sycl::queue& queue) {
+    int G = K / gs;
+    queue.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t)M, (size_t)G),
+                       [=](sycl::id<2> id) {
+            size_t m = id[0], g = id[1];
+            float acc = 0.0f;
+            const bf16* row = A + m * (size_t)K + g * (size_t)gs;
+            for (int k = 0; k < gs; ++k) acc += bf16_to_float(row[k]);
+            out[m * (size_t)G + g] = float_to_bf16(acc);
+        });
+    });
+}
+
 // C (M,N) = A (M,K) @ dequant(W)^T, where W is logical (N,K) s4 with per-group
 // BF16 scales.  A and C are BF16.  Async on ctx's stream.
+//
+// Optional trailing args (qwen3_5 dense uses these; other callers keep default):
+//   rowsum_scratch     - caller-owned M*ceil(K/group) bf16 buffer. Avoids the
+//                        per-call heap allocation for the zp rowsum. May be
+//                        nullptr (heap fallback).
+//   corr_scratch       - caller-owned M*N bf16 buffer for the zp correction
+//                        GEMM output. Avoids the per-call heap allocation.
+//                        May be nullptr (heap fallback).
+//   precomputed_rowsum - rowsum(A) already computed (e.g. shared by two
+//                        projections on the same activation). nullptr = compute.
 inline void matmul_int4(
     const bf16* A,
     int M,
     int K,
     const Int4Linear& W,
     bf16* C,
-    GpuEngine& ctx = GpuEngine::get(0))
+    GpuEngine& ctx = GpuEngine::get(0),
+    bf16* rowsum_scratch = nullptr,
+    bf16* corr_scratch = nullptr,
+    const bf16* precomputed_rowsum = nullptr)
 {
     if (W.in_features != K)
         throw std::runtime_error("matmul_int4: K does not match weight shape");
@@ -362,30 +415,30 @@ inline void matmul_int4(
             // True dequant is w = scale * (q_u - zp_u); the s4 GEMM above computed
             // scale * (q_u - 8), so subtract scale * (zp_u - 8) summed over each
             // K-group: C[m,n] -= rowsum(A)[m,g] * zp_offset[g,n].
-            GpuBuffer<bf16> rowsum((size_t)M * G, ctx.queue);
-            const bf16* A_ptr = A_in;
-            bf16* R_ptr = rowsum.data();
-            int Kc = K, gs = W.group_size;
-            ctx.queue.submit([&](sycl::handler& h) {
-                h.parallel_for(sycl::range<2>((size_t)M, (size_t)G),
-                               [=](sycl::id<2> id) {
-                    size_t m = id[0], g = id[1];
-                    float acc = 0.0f;
-                    const bf16* row = A_ptr + m * (size_t)Kc + g * (size_t)gs;
-                    for (int k = 0; k < gs; ++k) acc += bf16_to_float(row[k]);
-                    R_ptr[m * (size_t)G + g] = float_to_bf16(acc);
-                });
-            });
-
-            GpuBuffer<bf16> corr((size_t)M * N, ctx.queue);
-            matmul_bf16_nn(rowsum.data(), M, G, W.zp_offset.data(), N, corr.data(), ctx);
+            const bf16* rs = precomputed_rowsum;
+            GpuBuffer<bf16> rowsum_heap, corr_heap;
+            bf16* rowsum_ptr = int4_zp_scratch() ? rowsum_scratch : nullptr;
+            if (!rs) {
+                if (!rowsum_ptr) {
+                    rowsum_heap = GpuBuffer<bf16>((size_t)M * G, ctx.queue);
+                    rowsum_ptr = rowsum_heap.data();
+                }
+                int4_rowsum(A_in, M, K, W.group_size, rowsum_ptr, ctx.queue);
+                rs = rowsum_ptr;
+            }
+            bf16* corr_ptr = int4_zp_scratch() ? corr_scratch : nullptr;
+            if (!corr_ptr) {
+                corr_heap = GpuBuffer<bf16>((size_t)M * N, ctx.queue);
+                corr_ptr = corr_heap.data();
+            }
+            matmul_bf16_nn(rs, M, G, W.zp_offset.data(), N, corr_ptr, ctx);
 
             bf16* C_ptr = C_out;
-            const bf16* corr_ptr = corr.data();
+            const bf16* corr_data = corr_ptr;
             ctx.queue.submit([&](sycl::handler& h) {
                 h.parallel_for(sycl::range<1>((size_t)M * N), [=](sycl::id<1> id) {
                     C_ptr[id[0]] = float_to_bf16(
-                        bf16_to_float(C_ptr[id[0]]) - bf16_to_float(corr_ptr[id[0]]));
+                        bf16_to_float(C_ptr[id[0]]) - bf16_to_float(corr_data[id[0]]));
                 });
             });
         }

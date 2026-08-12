@@ -682,6 +682,85 @@ inline void qwen35_apply_mrope(sycl::queue& queue, bf16* query, bf16* key,
     submit(key, key_heads);
 }
 
+// Fused per-head RMS norm (q_norm/k_norm) + MRoPE, one launch.
+//
+// Replaces the three-launch sequence in qwen35_full_attention_forward:
+// rms_norm(q) + rms_norm(k) + qwen35_apply_mrope. One work-group per
+// (token, head) across the query and key head sets; norm reduction and
+// write-back round exactly like runtime rms_norm (same thread-to-dim map,
+// same fp32 reduction order, same bf16 stores), then the normed row is
+// rotated in place with the identical MRoPE arithmetic. Bit-exact vs the
+// unfused launches.
+inline void qwen35_norm_rope_fused(
+    sycl::queue& queue, bf16* query, bf16* key,
+    const bf16* q_weight, const bf16* k_weight,
+    const int32_t* positions, int seq,
+    int query_heads, int key_heads, int head_dim,
+    int rotary_dim, float theta,
+    const std::vector<int>& section_vector, float eps) {
+    if (section_vector.size() != 3)
+        throw std::runtime_error("Qwen3.5 MRoPE needs three sections");
+    int sections[3] = {section_vector[0], section_vector[1], section_vector[2]};
+    int half = rotary_dim / 2;
+    size_t local = std::min<size_t>(256, head_dim);
+    while (local & (local - 1)) local--;
+    int total_heads = query_heads + key_heads;
+
+    queue.submit([&](sycl::handler& handler) {
+        sycl::local_accessor<float, 1> lmem(local, handler);
+        handler.parallel_for(
+            sycl::nd_range<1>((size_t)seq * total_heads * local, local),
+            [=](sycl::nd_item<1> item) {
+                int group = item.get_group(0);
+                int token = group / total_heads;
+                int head = group % total_heads;
+                int lid = item.get_local_id(0);
+                int lsz = item.get_local_range(0);
+                bool is_q = head < query_heads;
+                int h = is_q ? head : head - query_heads;
+                int row_heads = is_q ? query_heads : key_heads;
+                const bf16* wrow = is_q ? q_weight : k_weight;
+                bf16* row = (is_q ? query : key) +
+                            ((size_t)token * row_heads + h) * head_dim;
+
+                float ss = 0.0f;
+                for (int d = lid; d < head_dim; d += lsz) {
+                    float v = bf16_to_float(row[d]);
+                    ss += v * v;
+                }
+                lmem[lid] = ss;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int s = (int)(lsz >> 1); s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] += lmem[lid + s];
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                float rms_inv = sycl::rsqrt(lmem[0] / (float)head_dim + eps);
+                for (int d = lid; d < head_dim; d += lsz) {
+                    float v = bf16_to_float(row[d]) * rms_inv *
+                              bf16_to_float(wrow[d]);
+                    row[d] = float_to_bf16(v);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                if (lid < half) {
+                    int frequency = lid;
+                    int axis = qwen35_mrope_axis(frequency, sections);
+                    int position = positions[(size_t)axis * seq + token];
+                    float inv = 1.0f / sycl::pow(theta,
+                                                 2.0f * frequency / rotary_dim);
+                    float angle = position * inv;
+                    float cosine = sycl::cos(angle);
+                    float sine = sycl::sin(angle);
+                    float x0 = bf16_to_float(row[frequency]);
+                    float x1 = bf16_to_float(row[frequency + half]);
+                    row[frequency] = float_to_bf16(x0 * cosine - x1 * sine);
+                    row[frequency + half] =
+                        float_to_bf16(x0 * sine + x1 * cosine);
+                }
+            });
+    });
+}
+
 // Online-softmax causal GQA attention. One work-group owns one (query token,
 // query head); 256 work-items own output dimensions and stream the KV cache.
 inline void qwen35_online_attention(sycl::queue& queue,

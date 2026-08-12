@@ -30,6 +30,20 @@ bool qwen35_persistent_io_enabled() {
     return enabled;
 }
 
+// ARCAINE_QWEN35_FUSE_ADD_NORM: fuse each raw residual add with the following
+// RMS norm (add_rms_norm, runtime/kernels/rms_norm.hpp) instead of the two
+// separate launches. Removes one launch + one hidden-sized read/write round-trip
+// per layer. Bit-exact vs the unfused add_inplace + rms_norm sequence.
+bool qwen35_fuse_add_norm_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_FUSE_ADD_NORM");
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
@@ -215,8 +229,16 @@ void Qwen35Model::run_layer(
             workspace, normalized, sublayer, seq, config_);
     }
     add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
-    rms_norm(context.queue, hidden, layer.post_attention_layernorm.data(), normalized,
-             seq, c.hidden_size, c.rms_norm_eps);
+    if (qwen35_fuse_add_norm_enabled()) {
+        // One launch: hidden += sublayer (bf16-rounded) then normalized =
+        // rms_norm(hidden). Bit-exact vs add_inplace + rms_norm above.
+        add_rms_norm(context.queue, sublayer, hidden,
+                     layer.post_attention_layernorm.data(), normalized,
+                     seq, c.hidden_size, c.rms_norm_eps);
+    } else {
+        rms_norm(context.queue, hidden, layer.post_attention_layernorm.data(), normalized,
+                 seq, c.hidden_size, c.rms_norm_eps);
+    }
     qwen35_mlp_forward(context, layer.mlp, workspace, normalized, sublayer, seq, config_);
     add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
 }

@@ -124,6 +124,63 @@ inline void rms_norm_add_rms_norm(
 }
 
 // ---------------------------------------------------------------------------
+// Fused: residual[row] += x[row];  out[row] = rms_norm(residual[row], weight)
+//
+// Replaces: add_inplace(residual, x) + rms_norm(residual, w, out).
+// One kernel, one reduction pass. The residual add rounds to BF16 exactly like
+// add_inplace before the rms reduction reads it, so the result is bit-identical
+// to the two-launch sequence. This is the residual-then-norm order used by the
+// standard AR decoder (Qwen3.5): raw sublayer output is added, then normed.
+// ---------------------------------------------------------------------------
+inline void add_rms_norm(
+    sycl::queue& q,
+    const bf16* x,          // sublayer output (attn/ffn delta)
+    bf16* residual,         // hidden state, updated in-place
+    const bf16* weight,     // next norm weights (may be nullptr for unit norm)
+    bf16* out,              // normed output for next sub-layer
+    int seq_len, int H, float eps
+) {
+    size_t local_size = std::min(256, H);
+    while (local_size & (local_size - 1)) local_size--;
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lmem(local_size, h);
+        bool has_weight = (weight != nullptr);
+
+        h.parallel_for(
+            sycl::nd_range<1>(seq_len * local_size, local_size),
+            [=](sycl::nd_item<1> it) {
+                int tok = it.get_group(0);
+                int lid = it.get_local_id(0);
+                int lsz = it.get_local_range(0);
+                const bf16* xrow = x        + tok * H;
+                bf16*       rrow = residual  + tok * H;
+                bf16*       orow = out       + tok * H;
+
+                float ss = 0.0f;
+                for (int d = lid; d < H; d += lsz) {
+                    float r = bf16_to_float(rrow[d]) + bf16_to_float(xrow[d]);
+                    rrow[d] = float_to_bf16(r);   // add_inplace rounding
+                    float v = bf16_to_float(rrow[d]);  // rms reads rounded value
+                    ss += v * v;
+                }
+                lmem[lid] = ss;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz>>1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] += lmem[lid+s];
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float rms_inv = sycl::rsqrt(lmem[0] / float(H) + eps);
+                for (int d = lid; d < H; d += lsz) {
+                    float v = bf16_to_float(rrow[d]) * rms_inv;
+                    if (has_weight) v *= bf16_to_float(weight[d]);
+                    orow[d] = float_to_bf16(v);
+                }
+            });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Fused: residual[row] = (residual[row] + rms_norm(x[row], weight)) * scalar
 //
 // Replaces: rms_norm(x,w,tmp) + add_inplace(residual,tmp) + scale_inplace(residual,scalar)

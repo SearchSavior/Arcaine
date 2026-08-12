@@ -32,4 +32,5 @@ arcaine_add_model(NAME qwen3_5
     KERNEL_BENCH_SOURCES
         benchmarks/attention_bench.cpp
         benchmarks/deltanet_bench.cpp
-        benchmarks/delta_decode_fusion_bench.cpp)
+        benchmarks/delta_decode_fusion_bench.cpp
+        benchmarks/int4_fusion_bench.cpp)
