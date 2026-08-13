@@ -16,6 +16,7 @@
 #include "../../runtime/gpu/ops.hpp"
 #include "runtime/kernels/elementwise.hpp"
 #include "runtime/kernels/rms_norm.hpp"
+#include "runtime/profiling/launch_prof.hpp"
 
 using namespace qwen35_kernels;
 
@@ -114,6 +115,42 @@ inline bf16* qwen35_int4_corr_scratch(Qwen35Workspace& ws, int seq) {
                ? ws.int4_corr_decode.data() : nullptr;
 }
 
+// ARCAINE_QWEN35_INT4_CORR_FUSED: fold the asymmetric-zp subtract into the
+// consumer kernels (split / swiglu / conv / add_inplace) instead of a dedicated
+// subtract launch. Bit-identical output (the consumers bf16-round the C - corr
+// difference exactly like the subtract kernel). Removes one launch per int4
+// projection and the C write-back the subtract performed.
+inline bool qwen35_int4_corr_fused_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_INT4_CORR_FUSED");
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
+// Grow-only per-forward corr buffer (sized seq*max_n, grown to the largest N
+// seen; the workspace reserves max_seq-sized buffers but the corr output only
+// needs the current forward's rows).
+inline bf16* qwen35_int4_corr_work(Qwen35Workspace& ws, int seq,
+                                   sycl::queue& queue, int max_n) {
+    size_t need = (size_t)seq * max_n;
+    if (ws.int4_corr_work_seq < (size_t)seq || ws.int4_corr_work.count() < need) {
+        ws.int4_corr_work = GpuBuffer<bf16>(need, queue);
+        ws.int4_corr_work_seq = seq;
+    }
+    return ws.int4_corr_work.data();
+}
+
+// Residual-add corr state returned by the operator forwards: when non-null, the
+// caller's add_inplace should fold corr (i.e. hidden += C - corr) instead of
+// the plain add. corr is (seq, N) with N = the projection's out_features.
+struct Qwen35CorrOut {
+    const bf16* corr = nullptr;
+    int N = 0;
+};
+
 inline void matmul_proj(const bf16* A, int M, int K, const Qwen35Proj& W,
                         bf16* C, GpuEngine& context,
                         bf16* int4_rowsum_scratch = nullptr,
@@ -149,7 +186,36 @@ inline bool qwen35_fused_norm_rope_enabled() {
     return enabled;
 }
 
-inline void qwen35_full_attention_forward(
+// ARCAINE_QWEN35_SPLIT_WRITE_CACHE: the fused qkv split writes K/V straight
+// into the KV cache (at past*kv_dim) instead of tmp1/tmp4 followed by two D2D
+// memcpys. Bit-exact (same bytes, same layout). Removes 2 launches per
+// full-attention layer.
+inline bool qwen35_split_write_cache_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_SPLIT_WRITE_CACHE");
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
+// ARCAINE_QWEN35_SPLITKV_FUSED_EPILOGUE: the splitkv combine kernel writes
+// O*sigmoid(gate) directly to the query buffer (safe: it runs after the part
+// kernels finish reading query) instead of tmp4 + copy-back + mul_sigmoid.
+// Bit-exact. Removes 2 launches per decode full-attention layer.
+inline bool qwen35_splitkv_fused_epilogue_enabled() {
+    static bool enabled = [] {
+        const char* value =
+            std::getenv("ARCAINE_QWEN35_SPLITKV_FUSED_EPILOGUE");
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
+inline Qwen35CorrOut qwen35_full_attention_forward(
     GpuEngine& context,
     const Qwen35FullAttentionWeights& weights,
     Qwen35KvLayerCache& cache,
@@ -170,13 +236,34 @@ inline void qwen35_full_attention_forward(
         throw std::runtime_error("Qwen3.5 KV cache overflow");
 
     if (weights.fused_projections) {
-        matmul_proj(hidden, seq, c.hidden_size, weights.qkv_proj,
-                    workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
-                    qwen35_int4_corr_scratch(workspace, seq));
-        qwen35_split_q_gate_kv(
-            queue, workspace.tmp0.data(), workspace.tmp2.data(),
-            workspace.tmp3.data(), workspace.tmp1.data(), workspace.tmp4.data(),
-            seq, c.num_attention_heads, c.num_key_value_heads, c.head_dim);
+        bool cache_write = qwen35_split_write_cache_enabled();
+        bf16* cache_key = cache_write ? cache.key.data() : nullptr;
+        bf16* cache_value = cache_write ? cache.value.data() : nullptr;
+        if (qwen35_int4_corr_fused_enabled() &&
+            std::holds_alternative<Int4Linear>(weights.qkv_proj) &&
+            std::get<Int4Linear>(weights.qkv_proj).has_zp()) {
+            const auto& w = std::get<Int4Linear>(weights.qkv_proj);
+            int N = 2 * query_dim + 2 * key_value_dim;
+            bf16* corr = qwen35_int4_corr_work(workspace, seq, queue, N);
+            matmul_int4_zp_corr(hidden, seq, c.hidden_size, w,
+                                workspace.tmp0.data(), context,
+                                workspace.int4_rowsum.data(), corr);
+            qwen35_split_q_gate_kv(
+                queue, workspace.tmp0.data(), workspace.tmp2.data(),
+                workspace.tmp3.data(), workspace.tmp1.data(),
+                workspace.tmp4.data(), seq, c.num_attention_heads,
+                c.num_key_value_heads, c.head_dim, cache_key, cache_value,
+                past, corr);
+        } else {
+            matmul_proj(hidden, seq, c.hidden_size, weights.qkv_proj,
+                        workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
+                        qwen35_int4_corr_scratch(workspace, seq));
+            qwen35_split_q_gate_kv(
+                queue, workspace.tmp0.data(), workspace.tmp2.data(),
+                workspace.tmp3.data(), workspace.tmp1.data(), workspace.tmp4.data(),
+                seq, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                cache_key, cache_value, past, nullptr);
+        }
     } else {
         matmul_proj(hidden, seq, c.hidden_size, weights.q_proj,
                     workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
@@ -209,12 +296,17 @@ inline void qwen35_full_attention_forward(
                            c.head_dim, c.rotary_dim(), c.rope.theta, c.rope.mrope_section);
     }
 
-    size_t offset = (size_t)past * key_value_dim;
-    size_t count = (size_t)seq * key_value_dim;
-    queue.memcpy(cache.key.data() + offset, workspace.tmp1.data(), count * sizeof(bf16));
-    queue.memcpy(cache.value.data() + offset, workspace.tmp4.data(), count * sizeof(bf16));
+    if (!(weights.fused_projections && qwen35_split_write_cache_enabled())) {
+        size_t offset = (size_t)past * key_value_dim;
+        size_t count = (size_t)seq * key_value_dim;
+        auto _ev_k = queue.memcpy(cache.key.data() + offset, workspace.tmp1.data(), count * sizeof(bf16));
+        auto _ev_v = queue.memcpy(cache.value.data() + offset, workspace.tmp4.data(), count * sizeof(bf16));
+        launchprof::record("cache_k_memcpy", _ev_k);
+        launchprof::record("cache_v_memcpy", _ev_v);
+    }
     cache.filled = past + seq;
 
+    bool attn_gate_applied = false;
     if (qwen35_xmx_attention_enabled()) {
         if (seq == 1 && qwen35_splitkv_decode_enabled() &&
             c.num_attention_heads % c.num_key_value_heads == 0 &&
@@ -228,16 +320,32 @@ inline void qwen35_full_attention_forward(
             int slices = qwen35_splitkv_decode_slices();
             if (slices > Qwen35Workspace::decode_max_kv_slices)
                 slices = Qwen35Workspace::decode_max_kv_slices;
-            qwen35_xmx_attention_decode_gqa_splitkv(
-                queue, workspace.tmp2.data(), cache.key.data(),
-                cache.value.data(), workspace.tmp4.data(), past,
-                c.num_attention_heads, c.num_key_value_heads, c.head_dim,
-                1.0f / std::sqrt((float)c.head_dim),
-                workspace.decode_part_out.data(),
-                workspace.decode_part_state.data(), slices);
-            const size_t qdim = (size_t)seq * query_dim;
-            queue.memcpy(workspace.tmp2.data(), workspace.tmp4.data(),
-                         qdim * sizeof(bf16));
+            bool fused_epi = qwen35_splitkv_fused_epilogue_enabled();
+            if (fused_epi) {
+                // Combine runs after all part WGs (in-order queue), so it may
+                // write tmp2 (query) directly, applying sigmoid(gate) inline.
+                qwen35_xmx_attention_decode_gqa_splitkv(
+                    queue, workspace.tmp2.data(), cache.key.data(),
+                    cache.value.data(), workspace.tmp2.data(), past,
+                    c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                    1.0f / std::sqrt((float)c.head_dim),
+                    workspace.decode_part_out.data(),
+                    workspace.decode_part_state.data(), slices,
+                    workspace.tmp3.data());
+                attn_gate_applied = true;
+            } else {
+                qwen35_xmx_attention_decode_gqa_splitkv(
+                    queue, workspace.tmp2.data(), cache.key.data(),
+                    cache.value.data(), workspace.tmp4.data(), past,
+                    c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                    1.0f / std::sqrt((float)c.head_dim),
+                    workspace.decode_part_out.data(),
+                    workspace.decode_part_state.data(), slices);
+                const size_t qdim = (size_t)seq * query_dim;
+                auto _ev_cp = queue.memcpy(workspace.tmp2.data(), workspace.tmp4.data(),
+                                           qdim * sizeof(bf16));
+                launchprof::record("splitkv_copy_back", _ev_cp);
+            }
         } else if (seq > 1) {
             // Prefill: pure-ESIMD streamed K/V mainloop (vllm-xpu
             // chunk_prefill recipe), fp16 dpas, grf_size<256>, KV_BLOCK=32.
@@ -263,14 +371,69 @@ inline void qwen35_full_attention_forward(
                                 c.num_attention_heads, c.num_key_value_heads,
                                 c.head_dim, 1.0f / std::sqrt((float)c.head_dim));
     }
-    mul_sigmoid_inplace(queue, workspace.tmp2.data(), workspace.tmp3.data(),
-                        (size_t)seq * query_dim);
-    matmul_proj(workspace.tmp2.data(), seq, query_dim, weights.o_proj, output, context,
-                workspace.int4_rowsum.data(),
-                qwen35_int4_corr_scratch(workspace, seq));
+    if (!attn_gate_applied)
+        mul_sigmoid_inplace(queue, workspace.tmp2.data(), workspace.tmp3.data(),
+                            (size_t)seq * query_dim);
+    Qwen35CorrOut corr_out;
+    if (qwen35_int4_corr_fused_enabled() &&
+        std::holds_alternative<Int4Linear>(weights.o_proj) &&
+        std::get<Int4Linear>(weights.o_proj).has_zp()) {
+        const auto& w = std::get<Int4Linear>(weights.o_proj);
+        bf16* corr = qwen35_int4_corr_work(workspace, seq, queue, c.hidden_size);
+        matmul_int4_zp_corr(workspace.tmp2.data(), seq, query_dim, w, output,
+                            context, workspace.int4_rowsum.data(), corr);
+        corr_out = {corr, c.hidden_size};
+    } else {
+        matmul_proj(workspace.tmp2.data(), seq, query_dim, weights.o_proj, output, context,
+                    workspace.int4_rowsum.data(),
+                    qwen35_int4_corr_scratch(workspace, seq));
+    }
+    return corr_out;
 }
 
-inline void qwen35_linear_attention_forward(
+// out_proj (and MLP down_proj) with optional fused-corr: returns the corr state
+// so the caller's residual add can fold the subtract (hidden += C - corr).
+// W is either Qwen35Proj (attn/GDN) or the MLP variant; the MLP callers only
+// reach this from their Int4Linear branch.
+template <typename W>
+inline Qwen35CorrOut qwen35_residual_proj(GpuEngine& context, const bf16* core,
+                                          int seq, int K, const W& Wt,
+                                          bf16* output, Qwen35Workspace& ws,
+                                          int out_n) {
+    if (qwen35_int4_corr_fused_enabled() &&
+        std::holds_alternative<Int4Linear>(Wt) &&
+        std::get<Int4Linear>(Wt).has_zp()) {
+        const auto& w = std::get<Int4Linear>(Wt);
+        bf16* corr = qwen35_int4_corr_work(ws, seq, context.queue, out_n);
+        matmul_int4_zp_corr(core, seq, K, w, output, context,
+                            ws.int4_rowsum.data(), corr);
+        return {corr, out_n};
+    }
+    if constexpr (std::is_same_v<W, Qwen35Proj>) {
+        matmul_proj(core, seq, K, Wt, output, context, ws.int4_rowsum.data(),
+                    qwen35_int4_corr_scratch(ws, seq));
+    } else {
+        matmul_int4(core, seq, K, std::get<Int4Linear>(Wt), output, context,
+                    ws.int4_rowsum.data(), qwen35_int4_corr_scratch(ws, seq));
+    }
+    return {};
+}
+
+// ARCAINE_QWEN35_GDN_FUSIONS: chunked-path micro-fusions, each bit-exact:
+//   conv_causal + update_conv_state -> one launch
+//   l2norm(q) + l2norm(k) + scale(q) -> one launch
+//   sigmoid(beta) + compute_g(g)     -> one launch
+inline bool qwen35_gdn_fusions_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_GDN_FUSIONS");
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
+inline Qwen35CorrOut qwen35_linear_attention_forward(
     GpuEngine& context,
     const Qwen35LinearAttentionWeights& weights,
     Qwen35DeltaLayerCache& cache,
@@ -288,16 +451,9 @@ inline void qwen35_linear_attention_forward(
     size_t head_values = (size_t)seq * heads;
 
     int projected_stride = conv_dim;
-    if (weights.fused_projections) {
+    if (weights.fused_projections)
         projected_stride = conv_dim + value_dim;
-        matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkvz,
-                    workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
-                    qwen35_int4_corr_scratch(workspace, seq));
-    } else {
-        matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkv,
-                    workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
-                    qwen35_int4_corr_scratch(workspace, seq));
-    }
+
     // The fused decode core handles one token, so a short batch runs it once
     // per token rather than falling through to the chunked path below. Batch
     // size then stops selecting between two implementations that do not agree
@@ -305,11 +461,16 @@ inline void qwen35_linear_attention_forward(
     // over the same tokens produced different logits, which is visible as soon
     // as anything verifies a batch against sequential decoding.
     //
-    // Only the recurrent core loops. The projection above is already batched
+    // Only the recurrent core loops. The projection below is already batched
     // over the whole window, so this re-reads the recurrent state and the small
     // conv/gate tensors, not the weights.
     if (seq >= 1 && seq <= qwen35_fused_decode_max_seq() &&
         weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled()) {
+        // The esimd core consumes the projection directly, so the zp correction
+        // stays materialized (matmul_proj -> matmul_int4 with subtract).
+        matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkvz,
+                    workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
+                    qwen35_int4_corr_scratch(workspace, seq));
         for (int token = 0; token < seq; ++token) {
             const bf16* token_hidden = hidden + (size_t)token * c.hidden_size;
             const bf16* projected =
@@ -349,29 +510,72 @@ inline void qwen35_linear_attention_forward(
             queue, workspace.tmp4.data(), workspace.tmp2.data(),
             weights.norm.data(), workspace.tmp4.data(), seq * heads,
             c.linear_value_head_dim, c.rms_norm_eps);
-        matmul_proj(workspace.tmp4.data(), seq, value_dim, weights.out_proj,
-                    output, context, workspace.int4_rowsum.data(),
-                    qwen35_int4_corr_scratch(workspace, seq));
-        return;
+        return qwen35_residual_proj(context, workspace.tmp4.data(), seq,
+                                    value_dim, weights.out_proj, output,
+                                    workspace, c.hidden_size);
     }
-    qwen35_conv_causal(queue, workspace.tmp0.data(), weights.conv1d.data(),
-                       cache.conv_state.data(), workspace.tmp1.data(), seq,
-                       conv_dim, c.linear_conv_kernel_dim, cache.has_state,
-                       projected_stride);
-    qwen35_update_conv_state(queue, workspace.tmp0.data(), cache.conv_state.data(),
-                             seq, conv_dim, c.linear_conv_kernel_dim, cache.has_state,
-                             projected_stride);
+    if (weights.fused_projections &&
+        qwen35_int4_corr_fused_enabled() &&
+        std::holds_alternative<Int4Linear>(weights.in_proj_qkvz) &&
+        std::get<Int4Linear>(weights.in_proj_qkvz).has_zp()) {
+        const auto& w = std::get<Int4Linear>(weights.in_proj_qkvz);
+        int N = conv_dim + value_dim;
+        bf16* corr = qwen35_int4_corr_work(workspace, seq, queue, N);
+        matmul_int4_zp_corr(hidden, seq, c.hidden_size, w, workspace.tmp0.data(),
+                            context, workspace.int4_rowsum.data(), corr);
+        qwen35_conv_causal_corr(queue, workspace.tmp0.data(), corr,
+                                weights.conv1d.data(), cache.conv_state.data(),
+                                workspace.tmp1.data(), seq, conv_dim,
+                                c.linear_conv_kernel_dim, cache.has_state,
+                                projected_stride);
+    } else {
+        if (weights.fused_projections)
+            matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkvz,
+                        workspace.tmp0.data(), context,
+                        workspace.int4_rowsum.data(),
+                        qwen35_int4_corr_scratch(workspace, seq));
+        else
+            matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkv,
+                        workspace.tmp0.data(), context,
+                        workspace.int4_rowsum.data(),
+                        qwen35_int4_corr_scratch(workspace, seq));
+        if (qwen35_gdn_fusions_enabled())
+            qwen35_conv_causal_state(queue, workspace.tmp0.data(),
+                                     weights.conv1d.data(),
+                                     cache.conv_state.data(),
+                                     workspace.tmp1.data(),
+                                     cache.conv_state.data(), seq, conv_dim,
+                                     c.linear_conv_kernel_dim, cache.has_state,
+                                     projected_stride);
+        else {
+            qwen35_conv_causal(queue, workspace.tmp0.data(), weights.conv1d.data(),
+                               cache.conv_state.data(), workspace.tmp1.data(), seq,
+                               conv_dim, c.linear_conv_kernel_dim, cache.has_state,
+                               projected_stride);
+            qwen35_update_conv_state(queue, workspace.tmp0.data(),
+                                     cache.conv_state.data(), seq, conv_dim,
+                                     c.linear_conv_kernel_dim, cache.has_state,
+                                     projected_stride);
+        }
+    }
     qwen35_extract_qkv(queue, workspace.tmp1.data(), workspace.tmp2.data(),
                        workspace.tmp3.data(), workspace.tmp4.data(), seq,
                        c.linear_num_key_heads, heads, c.linear_key_head_dim,
                        c.linear_value_head_dim);
-    l2norm(queue, workspace.tmp2.data(), workspace.tmp2.data(), seq * heads,
-           c.linear_key_head_dim, c.rms_norm_eps);
-    l2norm(queue, workspace.tmp3.data(), workspace.tmp3.data(), seq * heads,
-           c.linear_key_head_dim, c.rms_norm_eps);
-    scale_inplace(queue, workspace.tmp2.data(),
-                  (size_t)seq * heads * c.linear_key_head_dim,
-                  1.0f / std::sqrt((float)c.linear_key_head_dim));
+    if (qwen35_gdn_fusions_enabled()) {
+        qwen35_l2norm_scale_k(queue, workspace.tmp2.data(), workspace.tmp3.data(),
+                              workspace.tmp2.data(), workspace.tmp3.data(),
+                              seq * heads, c.linear_key_head_dim, c.rms_norm_eps,
+                              1.0f / std::sqrt((float)c.linear_key_head_dim));
+    } else {
+        l2norm(queue, workspace.tmp2.data(), workspace.tmp2.data(), seq * heads,
+               c.linear_key_head_dim, c.rms_norm_eps);
+        l2norm(queue, workspace.tmp3.data(), workspace.tmp3.data(), seq * heads,
+               c.linear_key_head_dim, c.rms_norm_eps);
+        scale_inplace(queue, workspace.tmp2.data(),
+                      (size_t)seq * heads * c.linear_key_head_dim,
+                      1.0f / std::sqrt((float)c.linear_key_head_dim));
+    }
 
     // The unfused path reuses tmp0 for z. The fused path keeps z at the tail
     // of each projected row until the recurrent core has consumed q/k/v.
@@ -390,9 +594,14 @@ inline void qwen35_linear_attention_forward(
         matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
                     g, context);
     }
-    sigmoid_inplace(queue, beta, head_values);
-    qwen35_compute_g(queue, g, weights.A_log.data(), weights.dt_bias.data(),
-                     g, seq, heads);
+    if (qwen35_gdn_fusions_enabled()) {
+        qwen35_sigmoid_beta_compute_g(queue, beta, g, weights.A_log.data(),
+                                      weights.dt_bias.data(), g, seq, heads);
+    } else {
+        sigmoid_inplace(queue, beta, head_values);
+        qwen35_compute_g(queue, g, weights.A_log.data(), weights.dt_bias.data(),
+                         g, seq, heads);
+    }
     if (qwen35_esimd_delta_enabled() && c.linear_key_head_dim == 128 &&
         c.linear_value_head_dim == 128) {
         qwen35_recurrent_delta_esimd_opt(
@@ -417,12 +626,12 @@ inline void qwen35_linear_attention_forward(
     gated_rmsnorm(queue, workspace.tmp4.data(), z,
                   weights.norm.data(), workspace.tmp4.data(), seq * heads,
                   c.linear_value_head_dim, c.rms_norm_eps);
-    matmul_proj(workspace.tmp4.data(), seq, value_dim, weights.out_proj,
-                output, context, workspace.int4_rowsum.data(),
-                qwen35_int4_corr_scratch(workspace, seq));
+    return qwen35_residual_proj(context, workspace.tmp4.data(), seq, value_dim,
+                                weights.out_proj, output, workspace,
+                                c.hidden_size);
 }
 
-inline void qwen35_mlp_forward(
+inline Qwen35CorrOut qwen35_mlp_forward(
     GpuEngine& context,
     const Qwen35MlpWeights& weights,
     Qwen35Workspace& workspace,
@@ -436,13 +645,20 @@ inline void qwen35_mlp_forward(
     if (std::holds_alternative<Int4Linear>(weights.gate_up)) {
         const auto& gate_up = std::get<Int4Linear>(weights.gate_up);
         const auto& down = std::get<Int4Linear>(weights.down);
-        matmul_int4(hidden, seq, H, gate_up, workspace.tmp0.data(), context,
-                    workspace.int4_rowsum.data(),
-                    qwen35_int4_corr_scratch(workspace, seq));
-        swiglu_strided(queue, workspace.tmp0.data(), workspace.tmp1.data(), seq, I);
-        matmul_int4(workspace.tmp1.data(), seq, I, down, output, context,
-                    workspace.int4_rowsum.data(),
-                    qwen35_int4_corr_scratch(workspace, seq));
+        if (qwen35_int4_corr_fused_enabled() && gate_up.has_zp()) {
+            bf16* corr = qwen35_int4_corr_work(workspace, seq, queue, 2 * I);
+            matmul_int4_zp_corr(hidden, seq, H, gate_up, workspace.tmp0.data(),
+                                context, workspace.int4_rowsum.data(), corr);
+            qwen35_swiglu_strided_corr(queue, workspace.tmp0.data(), corr,
+                                       workspace.tmp1.data(), seq, I);
+        } else {
+            matmul_int4(hidden, seq, H, gate_up, workspace.tmp0.data(), context,
+                        workspace.int4_rowsum.data(),
+                        qwen35_int4_corr_scratch(workspace, seq));
+            swiglu_strided(queue, workspace.tmp0.data(), workspace.tmp1.data(), seq, I);
+        }
+        return qwen35_residual_proj(context, workspace.tmp1.data(), seq, I,
+                                    weights.down, output, workspace, H);
     } else if (std::holds_alternative<Nvfp4Linear>(weights.gate_up)) {
         const auto& gate_up = std::get<Nvfp4Linear>(weights.gate_up);
         const auto& down = std::get<Nvfp4Linear>(weights.down);
@@ -465,11 +681,13 @@ inline void qwen35_mlp_forward(
                          workspace.activation_packed.data(),
                          workspace.activation_scale.data());
         }
+        return {};
     } else {
         const auto& gate_up = std::get<Fp8Linear>(weights.gate_up);
         const auto& down = std::get<Fp8Linear>(weights.down);
         matmul_fp8(hidden, seq, H, gate_up, workspace.tmp0.data(), context);
         swiglu_strided(queue, workspace.tmp0.data(), workspace.tmp1.data(), seq, I);
         matmul_fp8(workspace.tmp1.data(), seq, I, down, output, context);
+        return {};
     }
 }

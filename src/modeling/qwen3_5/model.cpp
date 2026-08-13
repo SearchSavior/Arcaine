@@ -17,6 +17,7 @@
 #include "runtime/kernels/rms_norm.hpp"
 #include "runtime/kernels/scatter.hpp"
 #include "../../preprocessing/chat_template.hpp"
+#include "runtime/profiling/launch_prof.hpp"
 
 namespace {
 
@@ -37,6 +38,22 @@ bool qwen35_persistent_io_enabled() {
 bool qwen35_fuse_add_norm_enabled() {
     static bool enabled = [] {
         const char* value = std::getenv("ARCAINE_QWEN35_FUSE_ADD_NORM");
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
+// ARCAINE_QWEN35_LOGITS_F32: run the (bf16-weight) lm_head GEMM with an f32
+// dst so oneDNN stores its fp32 accumulator directly. The default path rounds
+// the accumulator to bf16 and converts back for the sampler (quantized logits,
+// ~3 decimal digits); the f32 path removes that loss plus the bf16->f32 kernel
+// and the bf16 logits buffer. Numeric change (logits differ by <=1 bf16 ulp),
+// gated; the bf16 path stays the bit-exact baseline.
+bool qwen35_logits_f32_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_LOGITS_F32");
         if (!value) return false;
         return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
                std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
@@ -219,16 +236,21 @@ void Qwen35Model::run_layer(
     const auto& c = config_.text;
     rms_norm(context.queue, hidden, layer.input_layernorm.data(), normalized,
              seq, c.hidden_size, c.rms_norm_eps);
+    Qwen35CorrOut corr;
     if (layer.full_attention) {
-        qwen35_full_attention_forward(
+        corr = qwen35_full_attention_forward(
             context, std::get<Qwen35FullAttentionWeights>(layer.mixer), kv,
             workspace, normalized, positions, sublayer, seq, past, config_);
     } else {
-        qwen35_linear_attention_forward(
+        corr = qwen35_linear_attention_forward(
             context, std::get<Qwen35LinearAttentionWeights>(layer.mixer), delta,
             workspace, normalized, sublayer, seq, config_);
     }
-    add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
+    if (corr.corr)
+        qwen35_add_inplace_corr(context.queue, hidden, sublayer, corr.corr,
+                                (size_t)seq * c.hidden_size);
+    else
+        add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
     if (qwen35_fuse_add_norm_enabled()) {
         // One launch: hidden += sublayer (bf16-rounded) then normalized =
         // rms_norm(hidden). Bit-exact vs add_inplace + rms_norm above.
@@ -239,8 +261,13 @@ void Qwen35Model::run_layer(
         rms_norm(context.queue, hidden, layer.post_attention_layernorm.data(), normalized,
                  seq, c.hidden_size, c.rms_norm_eps);
     }
-    qwen35_mlp_forward(context, layer.mlp, workspace, normalized, sublayer, seq, config_);
-    add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
+    Qwen35CorrOut corr2 = qwen35_mlp_forward(context, layer.mlp, workspace,
+                                             normalized, sublayer, seq, config_);
+    if (corr2.corr)
+        qwen35_add_inplace_corr(context.queue, hidden, sublayer, corr2.corr,
+                                (size_t)seq * c.hidden_size);
+    else
+        add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
 }
 
 std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
@@ -249,12 +276,14 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
         throw std::runtime_error("Qwen3.5 forward sequence length out of range");
     auto& context0 = GpuEngine::get(0);
     auto& queue0 = context0.queue;
+    launchprof::reset();
     std::vector<int32_t> host_ids(input.token_ids.begin(), input.token_ids.end());
     GpuBuffer<int32_t> token_ids_local;
     int32_t* token_ids = nullptr;
     if (qwen35_persistent_io_enabled()) {
         token_ids = token_ids0_.data();
-        queue0.memcpy(token_ids, host_ids.data(), host_ids.size() * sizeof(int32_t));
+        auto _ev_tid = queue0.memcpy(token_ids, host_ids.data(), host_ids.size() * sizeof(int32_t));
+        launchprof::record("token_ids_upload", _ev_tid);
     } else {
         token_ids_local = GpuBuffer<int32_t>(seq, queue0);
         token_ids_local.upload(host_ids.data(), host_ids.size());
@@ -262,6 +291,7 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
     }
     embedding_lookup(queue0, weights_.embed_tokens.data(), token_ids,
                      hidden0_.data(), seq, config_.text.hidden_size, 1.0f);
+    launchprof::record("embedding_lookup");
 
     if (input.past_len == 0 && input.images && !input.images->empty()) {
         int search_from = 0;
@@ -292,8 +322,9 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
     int32_t* positions0 = nullptr;
     if (qwen35_persistent_io_enabled()) {
         positions0 = positions0_.data();
-        queue0.memcpy(positions0, host_positions.data(),
-                      host_positions.size() * sizeof(int32_t));
+        auto _ev_pos = queue0.memcpy(positions0, host_positions.data(),
+                                     host_positions.size() * sizeof(int32_t));
+        launchprof::record("positions_upload", _ev_pos);
     } else {
         positions0_local = GpuBuffer<int32_t>(host_positions.size(), queue0);
         positions0_local.upload(host_positions.data(), host_positions.size());
@@ -320,8 +351,10 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
             transfer = transfer_local.data();
         }
         queue0.memcpy(transfer, hidden0_.data(), hidden_count * sizeof(bf16)).wait();
+        launchprof::record("intergpu_d2h");
         context1.queue.memcpy(hidden1_.data(), transfer,
                               hidden_count * sizeof(bf16)).wait();
+        launchprof::record("intergpu_h2d");
         GpuBuffer<int32_t> positions1_local;
         int32_t* positions1 = nullptr;
         if (qwen35_persistent_io_enabled()) {
@@ -353,6 +386,7 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
 
     rms_norm(queue0, last_device, weights_.final_norm.data(), normalized0_.data(),
              1, config_.text.hidden_size, config_.text.rms_norm_eps);
+    launchprof::record("final_norm");
     GpuBuffer<bf16> logits_bf16_local;
     bf16* logits_bf16 = nullptr;
     if (qwen35_persistent_io_enabled())
@@ -360,14 +394,6 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
     else {
         logits_bf16_local = GpuBuffer<bf16>(config_.text.vocab_size, queue0);
         logits_bf16 = logits_bf16_local.data();
-    }
-    if (const auto* fp8 = std::get_if<Fp8Linear>(&weights_.lm_head)) {
-        matmul_fp8(normalized0_.data(), 1, config_.text.hidden_size,
-                   *fp8, logits_bf16, context0);
-    } else {
-        matmul_bf16(normalized0_.data(), 1, config_.text.hidden_size,
-                    std::get<GpuBuffer<bf16>>(weights_.lm_head).data(),
-                    config_.text.vocab_size, logits_bf16, context0);
     }
     GpuBuffer<float> logits_f32_local;
     float* logits_f32 = nullptr;
@@ -377,10 +403,35 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
         logits_f32_local = GpuBuffer<float>(config_.text.vocab_size, queue0);
         logits_f32 = logits_f32_local.data();
     }
-    bf16_to_f32(queue0, logits_bf16, logits_f32, config_.text.vocab_size);
     std::vector<float> logits(config_.text.vocab_size);
-    queue0.memcpy(logits.data(), logits_f32,
-                  logits.size() * sizeof(float)).wait();
+    const auto* lm_head_bf16 =
+        std::get_if<GpuBuffer<bf16>>(&weights_.lm_head);
+    if (qwen35_logits_f32_enabled() && lm_head_bf16) {
+        // Full-precision logits: oneDNN writes the fp32 accumulator directly.
+        matmul_bf16_f32(normalized0_.data(), 1, config_.text.hidden_size,
+                        lm_head_bf16->data(), config_.text.vocab_size,
+                        logits_f32, context0);
+        auto _ev_d2h = queue0.memcpy(logits.data(), logits_f32,
+                                     logits.size() * sizeof(float));
+        launchprof::record("logits_d2h_f32", _ev_d2h);
+        _ev_d2h.wait();
+    } else {
+        if (const auto* fp8 = std::get_if<Fp8Linear>(&weights_.lm_head)) {
+            matmul_fp8(normalized0_.data(), 1, config_.text.hidden_size,
+                       *fp8, logits_bf16, context0);
+        } else {
+            matmul_bf16(normalized0_.data(), 1, config_.text.hidden_size,
+                        lm_head_bf16->data(), config_.text.vocab_size,
+                        logits_bf16, context0);
+        }
+        bf16_to_f32(queue0, logits_bf16, logits_f32, config_.text.vocab_size);
+        launchprof::record("logits_cvt");
+        auto _ev_d2h = queue0.memcpy(logits.data(), logits_f32,
+                                     logits.size() * sizeof(float));
+        launchprof::record("logits_d2h", _ev_d2h);
+        _ev_d2h.wait();
+    }
+    launchprof::report();
     return logits;
 }
 

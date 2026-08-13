@@ -29,6 +29,14 @@ struct Qwen35Workspace {
     // buffer rather than reserving max_seq rows here.
     static constexpr int int4_corr_rows = 16;
     GpuBuffer<bf16> int4_corr_decode;
+    // Fused-corr path (ARCAINE_QWEN35_INT4_CORR_FUSED): corr GEMM output for
+    // the current forward, reused across every projection in the layer and
+    // consumed by the fused split/swiglu/conv/add_inplace kernels before the
+    // next projection overwrites it. Grown grow-only to seq*2*intermediate
+    // (largest N); sized for the current forward, not max_seq, so it stays
+    // small at deep-KV configs.
+    GpuBuffer<bf16> int4_corr_work;
+    size_t int4_corr_work_seq = 0;
     // Decode split-KV attention partials. Sized for head_dim=256, 8 rows,
     // 4 partitions, 64 output dims/partition, and max_kv_slices (default 16).
     // part_out: [key_heads * slices * 4 * 8 * 64] floats; part_state:
@@ -70,11 +78,12 @@ struct Qwen35Workspace {
         int4_rowsum = GpuBuffer<bf16>(s * max_groups, queue);
         int4_corr_decode = GpuBuffer<bf16>(
             (size_t)int4_corr_rows * 2 * c.intermediate_size, queue);
-        size_t out_elems = (size_t)c.num_key_value_heads * decode_max_kv_slices *
-                           decode_partitions * decode_rows * decode_part_dims;
-        size_t state_elems = (size_t)c.num_key_value_heads * decode_max_kv_slices *
-                             decode_rows * 2;
-        decode_part_out = GpuBuffer<float>(out_elems, queue);
-        decode_part_state = GpuBuffer<float>(state_elems, queue);
-    }
+    size_t out_elems = (size_t)c.num_key_value_heads * decode_max_kv_slices *
+                       decode_partitions * decode_rows * decode_part_dims;
+    size_t state_elems = (size_t)c.num_key_value_heads * decode_max_kv_slices *
+                         decode_rows * 2;
+    decode_part_out = GpuBuffer<float>(out_elems, queue);
+    decode_part_state = GpuBuffer<float>(state_elems, queue);
+    int4_corr_work_seq = 0;
+  }
 };

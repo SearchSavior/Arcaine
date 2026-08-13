@@ -53,17 +53,19 @@ using arcaine::bench::split_csv;
 
 namespace {
 
-enum class Kernel { Int4, Bf16 };
+enum class Kernel { Int4, Bf16, W4a8 };
 
 Kernel parse_kernel(const std::string& s) {
     if (s == "int4") return Kernel::Int4;
     if (s == "bf16") return Kernel::Bf16;
-    throw std::runtime_error("unknown kernel '" + s + "' (use: int4, bf16)");
+    if (s == "w4a8") return Kernel::W4a8;
+    throw std::runtime_error("unknown kernel '" + s + "' (use: int4, bf16, w4a8)");
 }
 const char* kernel_name(Kernel k) {
     switch (k) {
         case Kernel::Int4: return "int4";
         case Kernel::Bf16: return "bf16";
+        case Kernel::W4a8: return "w4a8";
     }
     return "?";
 }
@@ -98,7 +100,7 @@ void usage(const char* p) {
     std::fprintf(stderr,
         "Usage: %s [options]\n"
         "  -p <csv>          M values (default 1,512,1024,2048,4096)\n"
-        "  --kernels <csv>   int4|bf16 (default int4,bf16)\n"
+        "  --kernels <csv>   int4|bf16|w4a8 (default int4,bf16,w4a8)\n"
         "  --shapes <csv>    qkv|o|qkvz|out|gateup|down|ba|lmhead|K:N (default all)\n"
         "  --group-size <G>  int4 group size (default 32, matching the AWQ ckpt)\n"
         "  --symmetric       int4 without the zp_offset side-path (A/B; ckpt is asymmetric)\n"
@@ -256,6 +258,9 @@ int run(int argc, char** argv) {
                         break;
                     case Kernel::Bf16:
                         matmul_bf16(X.data(), M, K, Wbf.data(), N, C.data(), ctx);
+                        break;
+                    case Kernel::W4a8:
+                        matmul_int4_w4a8(X.data(), M, K, W4, C.data(), ctx);
                         break;
                 }
             };

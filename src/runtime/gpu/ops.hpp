@@ -6,6 +6,7 @@
 #include <functional>
 #include "runtime/gpu/engine.hpp"
 #include "runtime/gpu/buffer.hpp"
+#include "runtime/profiling/launch_prof.hpp"
 
 // ---------------------------------------------------------------------------
 // Primitive caches — keyed by (gpu_index, shape) so each GPU gets its own
@@ -129,6 +130,49 @@ inline void matmul_bf16(
             dnnl::memory::desc({M, N}, dt::bf16, tag::ab),
             ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
+    launchprof::record("bf16_gemm");
+}
+
+// ---------------------------------------------------------------------------
+// BF16 matmul with FP32 output: C(M,N) = A(M,K) @ B(N,K)^T. oneDNN keeps the
+// fp32 accumulator and stores it without bf16 rounding. Used by the lm_head so
+// the sampler sees full-precision logits (the bf16-dst variant rounds them).
+// ---------------------------------------------------------------------------
+inline void matmul_bf16_f32(
+    const bf16* A, int M, int K,
+    const bf16* B, int N,
+    float* C,
+    GpuEngine& ctx = GpuEngine::get(0)
+) {
+    static std::unordered_map<MatmulKey, dnnl::matmul, MatmulKeyHash> cache_f32;
+
+    MatmulKey key{ctx.index, M, K, N};
+    auto it = cache_f32.find(key);
+    if (it == cache_f32.end()) {
+        using dt  = dnnl::memory::data_type;
+        using tag = dnnl::memory::format_tag;
+        dnnl::matmul::primitive_desc pd(ctx.engine,
+            dnnl::memory::desc({M, K}, dt::bf16, tag::ab),
+            dnnl::memory::desc({K, N}, dt::bf16, tag::ba),
+            dnnl::memory::desc({M, N}, dt::f32, tag::ab));
+        cache_f32[key] = dnnl::matmul(pd);
+        it = cache_f32.find(key);
+    }
+
+    using dt  = dnnl::memory::data_type;
+    using tag = dnnl::memory::format_tag;
+    it->second.execute(ctx.stream, {
+        {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
+            dnnl::memory::desc({M, K}, dt::bf16, tag::ab),
+            ctx.engine, dnnl::sycl_interop::memory_kind::usm, const_cast<bf16*>(A))},
+        {DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+            dnnl::memory::desc({K, N}, dt::bf16, tag::ba),
+            ctx.engine, dnnl::sycl_interop::memory_kind::usm, const_cast<bf16*>(B))},
+        {DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
+            dnnl::memory::desc({M, N}, dt::f32, tag::ab),
+            ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
+    });
+    launchprof::record("bf16_gemm_f32");
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +212,7 @@ inline void matmul_bf16_nn(
             dnnl::memory::desc({M, N}, dt::bf16, tag::ab),
             ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
+    launchprof::record("bf16_gemm_nn");
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +266,7 @@ inline void matmul_bf16_batched(
                 dnnl::memory::dims{(dnnl_dim_t)M*N, (dnnl_dim_t)N, 1}),
             ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
+    launchprof::record("bf16_gemm_batched");
 }
 
 
@@ -273,6 +319,7 @@ inline void matmul_bf16_batched_strided(
                 dnnl::memory::dims{cs0, cs1, cs2}),
             ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
     });
+    launchprof::record("bf16_gemm_batched_strided");
 }
 
 // ---------------------------------------------------------------------------
@@ -304,4 +351,5 @@ inline void softmax_f32(
         dnnl::memory::desc({rows, cols}, dt::f32, tag::ab),
         ctx.engine, dnnl::sycl_interop::memory_kind::usm, x);
     it->second.execute(ctx.stream, {{DNNL_ARG_SRC, mem}, {DNNL_ARG_DST, mem}});
+    launchprof::record("softmax_f32");
 }

@@ -12,19 +12,21 @@
 #include "runtime/gpu/buffer.hpp"
 #include "runtime/quantization/nvfp4.hpp"
 #include "kernels/qwen_kernels.hpp"
+#include "runtime/profiling/launch_prof.hpp"
 
 inline void qwen35_add_bias(sycl::queue& queue, bf16* x, const bf16* bias,
                             int rows, int cols) {
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<2>(rows, cols), [=](sycl::id<2> id) {
             size_t at = (size_t)id[0] * cols + id[1];
             x[at] = float_to_bf16(bf16_to_float(x[at]) + bf16_to_float(bias[id[1]]));
         });
     });
+    launchprof::record("qwen35_add_bias", _ev);
 }
 
 inline void qwen35_gelu_tanh_inplace(sycl::queue& queue, bf16* x, size_t count) {
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
             float value = bf16_to_float(x[id]);
             constexpr float k = 0.7978845608028654f;
@@ -32,13 +34,14 @@ inline void qwen35_gelu_tanh_inplace(sycl::queue& queue, bf16* x, size_t count) 
             x[id] = float_to_bf16(0.5f * value * (1.0f + sycl::tanh(inner)));
         });
     });
+    launchprof::record("qwen35_gelu_tanh_inplace", _ev);
 }
 
 inline void qwen35_split_q_gate(sycl::queue& queue, const bf16* projected,
                                 bf16* query, bf16* gate,
                                 int seq, int heads, int head_dim) {
     size_t count = (size_t)seq * heads * head_dim;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
             size_t linear = id[0];
             int dim = linear % head_dim;
@@ -49,17 +52,19 @@ inline void qwen35_split_q_gate(sycl::queue& queue, const bf16* projected,
             gate[linear] = projected[src + head_dim];
         });
     });
+    launchprof::record("qwen35_split_q_gate", _ev);
 }
 
 inline void qwen35_split_q_gate_kv(
     sycl::queue& queue, const bf16* projected, bf16* query, bf16* gate,
     bf16* key, bf16* value, int seq, int query_heads, int key_heads,
-    int head_dim) {
+    int head_dim, bf16* cache_key = nullptr, bf16* cache_value = nullptr,
+    int past = 0, const bf16* corr = nullptr) {
     int query_dim = query_heads * head_dim;
     int q_proj_dim = 2 * query_dim;
     int kv_dim = key_heads * head_dim;
     int row_stride = q_proj_dim + 2 * kv_dim;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
             sycl::range<2>((size_t)seq, (size_t)query_dim),
             [=](sycl::id<2> id) {
@@ -68,24 +73,46 @@ inline void qwen35_split_q_gate_kv(
                 int dim = q_col % head_dim;
                 int head = q_col / head_dim;
                 size_t row = (size_t)token * row_stride;
-                query[(size_t)token * query_dim + q_col] =
-                    projected[row + (size_t)head * 2 * head_dim + dim];
-                gate[(size_t)token * query_dim + q_col] =
-                    projected[row + (size_t)head * 2 * head_dim + head_dim + dim];
+                size_t cbase = row;
+                float qv = bf16_to_float(
+                    projected[row + (size_t)head * 2 * head_dim + dim]);
+                float gv = bf16_to_float(
+                    projected[row + (size_t)head * 2 * head_dim + head_dim + dim]);
+                if (corr) {
+                    qv -= bf16_to_float(
+                        corr[cbase + (size_t)head * 2 * head_dim + dim]);
+                    gv -= bf16_to_float(
+                        corr[cbase + (size_t)head * 2 * head_dim + head_dim + dim]);
+                }
+                query[(size_t)token * query_dim + q_col] = float_to_bf16(qv);
+                gate[(size_t)token * query_dim + q_col] = float_to_bf16(gv);
                 if (q_col < kv_dim) {
-                    key[(size_t)token * kv_dim + q_col] =
-                        projected[row + q_proj_dim + q_col];
-                    value[(size_t)token * kv_dim + q_col] =
-                        projected[row + q_proj_dim + kv_dim + q_col];
+                    float kv = bf16_to_float(projected[row + q_proj_dim + q_col]);
+                    float vv = bf16_to_float(
+                        projected[row + q_proj_dim + kv_dim + q_col]);
+                    if (corr) {
+                        kv -= bf16_to_float(corr[cbase + q_proj_dim + q_col]);
+                        vv -= bf16_to_float(
+                            corr[cbase + q_proj_dim + kv_dim + q_col]);
+                    }
+                    if (cache_key) {
+                        size_t tok = (size_t)(past + token) * kv_dim;
+                        cache_key[tok + q_col] = float_to_bf16(kv);
+                        cache_value[tok + q_col] = float_to_bf16(vv);
+                    } else {
+                        key[(size_t)token * kv_dim + q_col] = float_to_bf16(kv);
+                        value[(size_t)token * kv_dim + q_col] = float_to_bf16(vv);
+                    }
                 }
             });
     });
+    launchprof::record("qwen35_split_q_gate_kv", _ev);
 }
 
 inline void qwen35_copy_strided(sycl::queue& queue, const bf16* source,
                                 int source_stride, int source_offset,
                                 bf16* destination, int rows, int columns) {
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
             sycl::range<2>((size_t)rows, (size_t)columns),
             [=](sycl::id<2> id) {
@@ -93,6 +120,7 @@ inline void qwen35_copy_strided(sycl::queue& queue, const bf16* source,
                     source[id[0] * source_stride + source_offset + id[1]];
             });
     });
+    launchprof::record("qwen35_copy_strided", _ev);
 }
 
 inline void qwen35_extract_qkv(sycl::queue& queue, const bf16* mixed,
@@ -106,7 +134,7 @@ inline void qwen35_extract_qkv(sycl::queue& queue, const bf16* mixed,
     int value_dim = value_heads * value_head_dim;
     int conv_dim = 2 * key_dim + value_dim;
     size_t count = (size_t)seq * value_heads * key_head_dim;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
             size_t linear = id[0];
             int dim = linear % key_head_dim;
@@ -122,6 +150,7 @@ inline void qwen35_extract_qkv(sycl::queue& queue, const bf16* mixed,
             }
         });
     });
+    launchprof::record("qwen35_extract_qkv", _ev);
 }
 
 inline void qwen35_conv_causal(sycl::queue& queue, const bf16* input,
@@ -131,7 +160,7 @@ inline void qwen35_conv_causal(sycl::queue& queue, const bf16* input,
     if (input_stride == 0) input_stride = channels;
     size_t count = (size_t)seq * channels;
     int history = kernel - 1;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
             int channel = id[0] % channels;
             int token = id[0] / channels;
@@ -154,6 +183,7 @@ inline void qwen35_conv_causal(sycl::queue& queue, const bf16* input,
             output[id] = float_to_bf16(sum / (1.0f + sycl::exp(-sum)));
         });
     });
+    launchprof::record("qwen35_conv_causal", _ev);
 }
 
 inline void qwen35_update_conv_state(sycl::queue& queue, const bf16* input,
@@ -162,7 +192,7 @@ inline void qwen35_update_conv_state(sycl::queue& queue, const bf16* input,
                                      int input_stride = 0) {
     if (input_stride == 0) input_stride = channels;
     int history = kernel - 1;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<1>(channels), [=](sycl::id<1> id) {
             int channel = id[0];
             bf16 next[8];
@@ -182,13 +212,14 @@ inline void qwen35_update_conv_state(sycl::queue& queue, const bf16* input,
                 state[(size_t)slot * channels + channel] = next[slot];
         });
     });
+    launchprof::record("qwen35_update_conv_state", _ev);
 }
 
 inline void qwen35_compute_g(sycl::queue& queue, const bf16* a,
                              const bf16* A_log, const bf16* dt_bias,
                              bf16* g, int seq, int heads) {
     size_t count = (size_t)seq * heads;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
             int head = id[0] % heads;
             float x = bf16_to_float(a[id]) + bf16_to_float(dt_bias[head]);
@@ -196,6 +227,7 @@ inline void qwen35_compute_g(sycl::queue& queue, const bf16* a,
             g[id] = float_to_bf16(-sycl::exp(bf16_to_float(A_log[head])) * softplus);
         });
     });
+    launchprof::record("qwen35_compute_g", _ev);
 }
 
 // Work-group per value head. Each of 128 work-items owns one value column of
@@ -207,7 +239,7 @@ inline void qwen35_recurrent_delta(sycl::queue& queue,
                                    int seq, int heads, int key_dim, int value_dim) {
     if (value_dim > 256 || key_dim <= 0)
         throw std::runtime_error("Unsupported DeltaNet recurrent tile");
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> local_state((size_t)key_dim * value_dim, handler);
         handler.parallel_for(
             sycl::nd_range<1>((size_t)heads * value_dim, (size_t)value_dim),
@@ -246,6 +278,7 @@ inline void qwen35_recurrent_delta(sycl::queue& queue,
                         local_state[(size_t)k * value_dim + value_index];
             });
     });
+    launchprof::record("qwen35_recurrent_delta", _ev);
 }
 
 namespace qwen35_esimd {
@@ -305,13 +338,14 @@ inline std::mutex& qwen35_esimd_opt_scratch_mutex() {
 inline void qwen35_esimd_gate_precompute(sycl::queue& queue, const bf16* beta,
                                          const bf16* g, float* beta_out,
                                          float* decay_out, size_t total) {
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
             size_t i = id[0];
             beta_out[i] = bf16_to_float(beta[i]);
             decay_out[i] = sycl::exp(bf16_to_float(g[i]));
         });
     });
+    launchprof::record("qwen35_esimd_gate_precompute", _ev);
 }
 
 template <int WG>
@@ -322,7 +356,7 @@ inline void qwen35_recurrent_delta_esimd_opt_t(
     namespace esimd = sycl::ext::intel::esimd;
     using native_bf16 = sycl::ext::oneapi::bfloat16;
     constexpr int ROWS = 128 / WG;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
             sycl::nd_range<1>((size_t)heads * WG, WG),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
@@ -413,6 +447,7 @@ inline void qwen35_recurrent_delta_esimd_opt_t(
                 }
             });
     });
+    launchprof::record("qwen35_recurrent_delta_esimd_opt_t", _ev);
 }
 
 inline void qwen35_recurrent_delta_esimd_opt(
@@ -454,7 +489,7 @@ inline void qwen35_delta_decode_fused_esimd(
             "fused ESIMD DeltaNet decode requires K=V=128 and conv4");
     constexpr int work_group = 64;
     int value_heads_per_key = value_heads / key_heads;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
             sycl::nd_range<1>((size_t)value_heads * work_group, work_group),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
@@ -624,12 +659,13 @@ inline void qwen35_delta_decode_fused_esimd(
                 esimd::block_store<native_bf16, 2>(z_destination, z_values);
             });
     });
+    launchprof::record("qwen35_delta_decode_fused_esimd", _ev);
 }
 
 inline void qwen35_update_conv_state_time_major(
     sycl::queue& queue, const bf16* projected, int projected_stride,
     bf16* state, int channels) {
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(sycl::range<1>((size_t)channels), [=](sycl::id<1> id) {
             int channel = static_cast<int>(id[0]);
             state[channel] = state[channels + channel];
@@ -637,6 +673,7 @@ inline void qwen35_update_conv_state_time_major(
             state[2 * channels + channel] = projected[channel];
         });
     });
+    launchprof::record("qwen35_update_conv_state_time_major", _ev);
 }
 
 inline int qwen35_mrope_axis(int frequency, const int* sections) {
@@ -659,7 +696,7 @@ inline void qwen35_apply_mrope(sycl::queue& queue, bf16* query, bf16* key,
     int half = rotary_dim / 2;
     auto submit = [&](bf16* tensor, int heads) {
         size_t count = (size_t)seq * heads * half;
-        queue.submit([&](sycl::handler& handler) {
+        auto _ev = queue.submit([&](sycl::handler& handler) {
             handler.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
                 int frequency = id[0] % half;
                 int head = (id[0] / half) % heads;
@@ -677,6 +714,7 @@ inline void qwen35_apply_mrope(sycl::queue& queue, bf16* query, bf16* key,
                 row[frequency + half] = float_to_bf16(x0 * sine + x1 * cosine);
             });
         });
+        launchprof::record("qwen35_apply_mrope", _ev);
     };
     submit(query, query_heads);
     submit(key, key_heads);
@@ -706,7 +744,7 @@ inline void qwen35_norm_rope_fused(
     while (local & (local - 1)) local--;
     int total_heads = query_heads + key_heads;
 
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> lmem(local, handler);
         handler.parallel_for(
             sycl::nd_range<1>((size_t)seq * total_heads * local, local),
@@ -759,6 +797,7 @@ inline void qwen35_norm_rope_fused(
                 }
             });
     });
+    launchprof::record("qwen35_norm_rope_fused", _ev);
 }
 
 // Online-softmax causal GQA attention. One work-group owns one (query token,
@@ -771,7 +810,7 @@ inline void qwen35_online_attention(sycl::queue& queue,
     if (head_dim > 256)
         throw std::runtime_error("Qwen3.5 online attention head_dim exceeds tile");
     size_t local = 256;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> reduce(local + 2, handler);
         handler.parallel_for(
             sycl::nd_range<1>((size_t)seq * query_heads * local, local),
@@ -821,6 +860,7 @@ inline void qwen35_online_attention(sycl::queue& queue,
                 }
             });
     });
+    launchprof::record("qwen35_online_attention", _ev);
 }
 
 // Flash-style causal GQA attention mapped to Battlemage XMX through the
@@ -844,7 +884,7 @@ inline void qwen35_xmx_attention(
     constexpr int output_tiles = 16;
     constexpr int wg_size = sg_size * output_tiles;
     int query_tiles = (seq + query_tile - 1) / query_tile;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         // First 8*16 floats are the current softmax block. The following 8
         // hold output rescale factors, then final denominators.
         sycl::local_accessor<float, 1> shared(
@@ -975,6 +1015,7 @@ inline void qwen35_xmx_attention(
                 }
             });
     });
+    launchprof::record("qwen35_xmx_attention", _ev);
 }
 
 // Flash-style causal GQA attention on XMX, restructured vs qwen35_xmx_attention:
@@ -1008,7 +1049,7 @@ inline void qwen35_xmx_attention_v2_t(
     constexpr int pairs = KV_BLOCK / 2;
     constexpr int slm_stride = pairs + 1;  // odd stride: conflict-free banks
     int query_tiles = (seq + query_tile - 1) / query_tile;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         sycl::local_accessor<int32_t, 1> v_t(256 * slm_stride, handler);
         handler.parallel_for(
             sycl::nd_range<1>(
@@ -1157,6 +1198,7 @@ inline void qwen35_xmx_attention_v2_t(
                 }
             });
     });
+    launchprof::record("qwen35_xmx_attention_v2_t", _ev);
 }
 
 inline void qwen35_xmx_attention_v2(
@@ -1213,7 +1255,7 @@ inline void qwen35_xmx_attention_v3_t(
     const float scale_log2e = scale * 1.4426950408889634f;
     int query_tiles = (seq + query_tile - 1) / query_tile;
     const unsigned row_bytes = (unsigned)key_heads * 256 * 2;
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
             sycl::nd_range<1>(
                 (size_t)query_tiles * query_heads * wg_size, wg_size),
@@ -1440,6 +1482,7 @@ inline void qwen35_xmx_attention_v3_t(
                 }
             });
     });
+    launchprof::record("qwen35_xmx_attention_v3_t", _ev);
 }
 
 inline void qwen35_xmx_attention_v3(
@@ -1478,7 +1521,8 @@ inline void qwen35_xmx_attention_v3(
 inline void qwen35_xmx_attention_decode_gqa_splitkv(
     sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
     bf16* output, int past, int query_heads, int key_heads, int head_dim,
-    float scale, float* part_out, float* part_state, int kv_slices) {
+    float scale, float* part_out, float* part_state, int kv_slices,
+    const bf16* gate = nullptr) {
     if (head_dim != 256 || query_heads % key_heads != 0 ||
         query_heads / key_heads > 8 || kv_slices < 1)
         throw std::runtime_error("Qwen3.5 split-KV decode kernel shape mismatch");
@@ -1498,7 +1542,7 @@ inline void qwen35_xmx_attention_decode_gqa_splitkv(
     const int slice_len = (visible_tokens + kv_slices - 1) / kv_slices;
 
     // Kernel 1: per-(key_head, slice, partition) WG scans only its KV slice.
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev = queue.submit([&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> shared(
             rows * subgroup_size + 2 * rows, handler);
         handler.parallel_for(
@@ -1637,9 +1681,10 @@ inline void qwen35_xmx_attention_decode_gqa_splitkv(
                         output_acc[row];
             });
     });
+    launchprof::record("qwen35_xmx_attention_decode_gqa_splitkv", _ev);
 
     // Kernel 2: combine partials across slices (global-max softmax merge).
-    queue.submit([&](sycl::handler& handler) {
+    auto _ev2 = queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
             sycl::range<1>((size_t)key_heads * queries_per_key * head_dim),
             [=](sycl::id<1> id) {
@@ -1669,8 +1714,281 @@ inline void qwen35_xmx_attention_decode_gqa_splitkv(
                     l += ls * e;
                 }
                 float result = (l > 0.0f) ? (o / l) : 0.0f;
-                output[((size_t)key_head * queries_per_key + row) * head_dim +
-                       dim] = float_to_bf16(result);
+                size_t out_idx =
+                    ((size_t)key_head * queries_per_key + row) * head_dim + dim;
+                if (gate) {
+                    // Fused attn gate (O4): bf16-round the combined result,
+                    // then apply sigmoid(gate) exactly like mul_sigmoid_inplace.
+                    bf16 r1 = float_to_bf16(result);
+                    float g = bf16_to_float(gate[out_idx]);
+                    output[out_idx] = float_to_bf16(
+                        bf16_to_float(r1) * (1.0f / (1.0f + sycl::exp(-g))));
+                } else {
+                    output[out_idx] = float_to_bf16(result);
+                }
             });
     });
+    launchprof::record("qwen35_xmx_attention_decode_gqa_splitkv", _ev2);
+}
+
+// ---------------------------------------------------------------------------
+// Fused zp-correction consumers (ARCAINE_QWEN35_INT4_CORR_FUSED). Each reads
+// the corr buffer produced by matmul_int4_zp_corr (rowsum(A) @ zp_offset) and
+// applies C - corr inline, bf16-rounding the difference first exactly like the
+// separate subtract kernel, so the result is bit-identical to the
+// subtract-then-consume sequence.
+// ---------------------------------------------------------------------------
+
+// SwiGLU with the zp correction folded in. corr is (seq, 2*inter) matching the
+// gate_up GEMM output.
+inline void qwen35_swiglu_strided_corr(sycl::queue& q, const bf16* gate_up,
+                                       const bf16* corr, bf16* out, int seq,
+                                       int inter) {
+    int total = seq * inter;
+    auto _ev = q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>(total), [=](sycl::id<1> gid) {
+            int tok = gid[0] / inter;
+            int dim = gid[0] % inter;
+            size_t base = (size_t)tok * 2 * inter;
+            // bf16-round the difference exactly like the subtract kernel, then
+            // use the rounded value (bit-exact vs subtract + swiglu).
+            float g = bf16_to_float(float_to_bf16(
+                bf16_to_float(gate_up[base + dim]) -
+                bf16_to_float(corr[base + dim])));
+            float u = bf16_to_float(float_to_bf16(
+                bf16_to_float(gate_up[base + inter + dim]) -
+                bf16_to_float(corr[base + inter + dim])));
+            out[tok * inter + dim] = float_to_bf16((g / (1.0f + sycl::exp(-g))) * u);
+        });
+    });
+    launchprof::record("qwen35_swiglu_strided_corr", _ev);
+}
+
+// Causal conv with the zp correction folded in. input is the fused qkvz GEMM
+// output (row stride input_stride = N_full); corr has the same row stride.
+inline void qwen35_conv_causal_corr(
+    sycl::queue& queue, const bf16* input, const bf16* corr,
+    const bf16* weight, const bf16* old_state, bf16* output, int seq,
+    int channels, int kernel, bool has_state, int input_stride = 0) {
+    if (input_stride == 0) input_stride = channels;
+    size_t count = (size_t)seq * channels;
+    int history = kernel - 1;
+    auto _ev = queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
+            int channel = id[0] % channels;
+            int token = id[0] / channels;
+            float sum = 0.0f;
+            for (int tap = 0; tap < kernel; ++tap) {
+                int source_token = token - history + tap;
+                float sample = 0.0f;
+                if (source_token >= 0) {
+                    // bf16-round the difference like the subtract kernel so
+                    // the conv sees the same corrected value as the baseline.
+                    sample = bf16_to_float(float_to_bf16(
+                        bf16_to_float(
+                            input[(size_t)source_token * input_stride + channel]) -
+                        bf16_to_float(
+                            corr[(size_t)source_token * input_stride + channel])));
+                } else if (has_state) {
+                    int state_index = history + source_token;
+                    sample = bf16_to_float(
+                        old_state[(size_t)state_index * channels + channel]);
+                }
+                sum += bf16_to_float(weight[(size_t)channel * kernel + tap]) * sample;
+            }
+            output[id] = float_to_bf16(sum / (1.0f + sycl::exp(-sum)));
+        });
+    });
+    launchprof::record("qwen35_conv_causal_corr", _ev);
+}
+
+// Residual add with the zp correction folded in: a[i] += bf16(C[i] - corr[i]),
+// matching add_inplace(subtract(C, corr)) bit-for-bit.
+inline void qwen35_add_inplace_corr(sycl::queue& q, bf16* a, const bf16* c,
+                                    const bf16* corr, int n) {
+    auto _ev = q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> id) {
+            size_t i = id[0];
+            // bf16-round the difference like the subtract kernel, then add.
+            float diff = bf16_to_float(float_to_bf16(
+                bf16_to_float(c[i]) - bf16_to_float(corr[i])));
+            a[i] = float_to_bf16(bf16_to_float(a[i]) + diff);
+        });
+    });
+    launchprof::record("qwen35_add_inplace_corr", _ev);
+}
+
+// ---------------------------------------------------------------------------
+// O2 fix + O5 GDN micro-fusions (ARCAINE_QWEN35_GDN_FUSIONS).
+// ---------------------------------------------------------------------------
+
+// State update for the corr-fused qkvz path: the GEMM output is raw (the zp
+// correction is applied in conv_causal_corr on the fly), so the values stored
+// into the conv history must have the corr subtracted too — the baseline
+// matmul_int4 stored already-corrected values, and conv reads the state without
+// re-applying the correction. Old-state carries are already corrected.
+inline void qwen35_update_conv_state_corr(sycl::queue& queue, const bf16* input,
+                                          const bf16* corr, bf16* state, int seq,
+                                          int channels, int kernel, bool had_state,
+                                          int input_stride = 0) {
+    if (input_stride == 0) input_stride = channels;
+    int history = kernel - 1;
+    auto _ev = queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(sycl::range<1>(channels), [=](sycl::id<1> id) {
+            int channel = id[0];
+            bf16 next[8];
+            for (int slot = 0; slot < history; ++slot) {
+                int source_token = seq - history + slot;
+                if (source_token >= 0) {
+                    next[slot] = float_to_bf16(
+                        bf16_to_float(
+                            input[(size_t)source_token * input_stride + channel]) -
+                        bf16_to_float(
+                            corr[(size_t)source_token * input_stride + channel]));
+                } else if (had_state) {
+                    next[slot] = state[(size_t)(history + source_token) * channels + channel];
+                } else {
+                    next[slot] = bf16{0};
+                }
+            }
+            for (int slot = 0; slot < history; ++slot)
+                state[(size_t)slot * channels + channel] = next[slot];
+        });
+    });
+    launchprof::record("qwen35_update_conv_state_corr", _ev);
+}
+
+// Causal conv + conv-state update in one launch (O5). Per-element math is
+// identical to qwen35_conv_causal followed by qwen35_update_conv_state.
+inline void qwen35_conv_causal_state(
+    sycl::queue& queue, const bf16* input, const bf16* weight,
+    const bf16* old_state, bf16* output, bf16* state, int seq, int channels,
+    int kernel, bool has_state, int input_stride = 0) {
+    if (input_stride == 0) input_stride = channels;
+    int history = kernel - 1;
+    size_t count = (size_t)seq * channels;
+    auto _ev = queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(sycl::range<1>(count + channels),
+                             [=](sycl::id<1> id) {
+            size_t i = id[0];
+            if (i < count) {
+                int channel = (int)(i % channels);
+                int token = (int)(i / channels);
+                float sum = 0.0f;
+                for (int tap = 0; tap < kernel; ++tap) {
+                    int source_token = token - history + tap;
+                    float sample = 0.0f;
+                    if (source_token >= 0) {
+                        sample = bf16_to_float(
+                            input[(size_t)source_token * input_stride + channel]);
+                    } else if (has_state) {
+                        int state_index = history + source_token;
+                        sample = bf16_to_float(
+                            old_state[(size_t)state_index * channels + channel]);
+                    }
+                    sum += bf16_to_float(weight[(size_t)channel * kernel + tap]) * sample;
+                }
+                output[i] = float_to_bf16(sum / (1.0f + sycl::exp(-sum)));
+            } else {
+                int channel = (int)(i - count);
+                bf16 next[8];
+                for (int slot = 0; slot < history; ++slot) {
+                    int source_token = seq - history + slot;
+                    if (source_token >= 0) {
+                        next[slot] = input[(size_t)source_token * input_stride + channel];
+                    } else if (has_state) {
+                        next[slot] = state[(size_t)(history + source_token) * channels + channel];
+                    } else {
+                        next[slot] = bf16{0};
+                    }
+                }
+                for (int slot = 0; slot < history; ++slot)
+                    state[(size_t)slot * channels + channel] = next[slot];
+            }
+        });
+    });
+    launchprof::record("qwen35_conv_causal_state", _ev);
+}
+
+// l2norm(q) + l2norm(k) + scale(q) in one launch (O5). Bit-exact: each row's
+// reduction order matches qwen35_l2norm, and q's store adds the scale multiply
+// exactly like scale_inplace (bf16-round the l2norm store first).
+inline void qwen35_l2norm_scale_k(sycl::queue& q, const bf16* xq, const bf16* xk,
+                                  bf16* oq, bf16* ok, int N, int D, float eps,
+                                  float scale) {
+    size_t local_size = static_cast<size_t>(std::min(256, D));
+    while (local_size & (local_size - 1)) local_size--;
+    auto _ev = q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lmem(local_size, h);
+        h.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(N) * local_size, local_size),
+            [=](sycl::nd_item<1> it) {
+                int n   = it.get_group(0);
+                int lid = it.get_local_id(0);
+                int lsz = it.get_local_range(0);
+                // q row: l2norm then scale.
+                const bf16* xqrow = xq + static_cast<size_t>(n) * D;
+                bf16* oqrow = oq + static_cast<size_t>(n) * D;
+                float ss = 0.0f;
+                for (int d = lid; d < D; d += lsz) {
+                    float v = bf16_to_float(xqrow[d]);
+                    ss += v * v;
+                }
+                lmem[lid] = ss;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz >> 1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] += lmem[lid + s];
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float inv_norm = sycl::rsqrt(lmem[0] + eps);
+                for (int d = lid; d < D; d += lsz)
+                    oqrow[d] = float_to_bf16(
+                        bf16_to_float(float_to_bf16(bf16_to_float(xqrow[d]) * inv_norm)) *
+                        scale);
+                it.barrier(sycl::access::fence_space::local_space);
+                // k row: l2norm only.
+                const bf16* xkrow = xk + static_cast<size_t>(n) * D;
+                bf16* okrow = ok + static_cast<size_t>(n) * D;
+                ss = 0.0f;
+                for (int d = lid; d < D; d += lsz) {
+                    float v = bf16_to_float(xkrow[d]);
+                    ss += v * v;
+                }
+                lmem[lid] = ss;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz >> 1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] += lmem[lid + s];
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float inv_norm_k = sycl::rsqrt(lmem[0] + eps);
+                for (int d = lid; d < D; d += lsz)
+                    okrow[d] = float_to_bf16(bf16_to_float(xkrow[d]) * inv_norm_k);
+            });
+    });
+    launchprof::record("qwen35_l2norm_scale_k", _ev);
+}
+
+// sigmoid(beta) + compute_g(g) in one launch (O5). Bit-exact per element.
+inline void qwen35_sigmoid_beta_compute_g(sycl::queue& queue, bf16* beta,
+                                          const bf16* a, const bf16* A_log,
+                                          const bf16* dt_bias, bf16* g,
+                                          int seq, int heads) {
+    size_t count = (size_t)seq * heads;
+    auto _ev = queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(sycl::range<1>(2 * count), [=](sycl::id<1> id) {
+            size_t i = id[0];
+            if (i < count) {
+                float v = bf16_to_float(beta[i]);
+                beta[i] = float_to_bf16(1.0f / (1.0f + sycl::exp(-v)));
+            } else {
+                size_t j = i - count;
+                int head = (int)(j % heads);
+                float x = bf16_to_float(a[j]) + bf16_to_float(dt_bias[head]);
+                float softplus = sycl::fmax(x, 0.0f) +
+                                 sycl::log(1.0f + sycl::exp(-sycl::fabs(x)));
+                g[j] = float_to_bf16(-sycl::exp(bf16_to_float(A_log[head])) * softplus);
+            }
+        });
+    });
+    launchprof::record("qwen35_sigmoid_beta_compute_g", _ev);
 }

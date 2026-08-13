@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <vector>
+#include "runtime/profiling/launch_prof.hpp"
 
 // Per-device GPU context. GpuEngine::get(idx) returns the context for GPU idx.
 // GpuEngine::get() (no arg) defaults to GPU 0 for backward compatibility.
@@ -27,14 +28,22 @@ namespace gpu_detail {
             if (n == 0)
                 throw std::runtime_error("No oneDNN GPU engines found");
             devs.resize(n);
+            bool profiling = launchprof::enabled();
             for (int i = 0; i < n; ++i) {
                 devs[i].index  = i;
                 devs[i].engine = dnnl::engine(dnnl::engine::kind::gpu, i);
                 auto dev = dnnl::sycl_interop::get_device(devs[i].engine);
                 auto ctx = dnnl::sycl_interop::get_context(devs[i].engine);
-                devs[i].queue = sycl::queue(ctx, dev, sycl::property::queue::in_order{});
+                devs[i].queue = profiling
+                    ? sycl::queue(ctx, dev,
+                                  sycl::property_list{
+                                      sycl::property::queue::in_order{},
+                                      sycl::property::queue::enable_profiling{}})
+                    : sycl::queue(ctx, dev,
+                                  sycl::property::queue::in_order{});
                 devs[i].stream = dnnl::sycl_interop::make_stream(devs[i].engine, devs[i].queue);
             }
+            launchprof::mark_queue_profiling(profiling);
         }
     };
 
