@@ -46,6 +46,57 @@ inline void swiglu_strided(sycl::queue& q, const bf16* gate_up, bf16* out,
     launchprof::record("qwen35_swiglu_strided", _ev);
 }
 
+// Fused act-quant SwiGLU: computes the bf16 SwiGLU output in-register, reduces
+// the per-row absmax, then quantizes to s8 (absmax/127). Bit-exact vs
+// swiglu_strided + act_quant_s8_s8.
+inline void swiglu_strided_q(sycl::queue& q, const bf16* gate_up,
+                             int8_t* out_s8, float* out_scale, int seq,
+                             int inter) {
+    size_t local_size = static_cast<size_t>(std::min(256, inter));
+    while (local_size & (local_size - 1)) local_size--;
+
+    auto _ev = q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lmem(local_size, h);
+        h.parallel_for(
+            sycl::nd_range<1>((size_t)seq * local_size, local_size),
+            [=](sycl::nd_item<1> it) {
+                int tok = it.get_group(0);
+                int lid = it.get_local_id(0);
+                int lsz = it.get_local_range(0);
+                const bf16* row = gate_up + (size_t)tok * 2 * inter;
+                int8_t* orow = out_s8 + (size_t)tok * inter;
+
+                float amax = 0.0f;
+                for (int d = lid; d < inter; d += lsz) {
+                    float g = bf16_to_float(row[d]);
+                    float u = bf16_to_float(row[inter + d]);
+                    float out = (g / (1.0f + sycl::exp(-g))) * u;
+                    out = bf16_to_float(float_to_bf16(out));
+                    amax = sycl::fmax(amax, sycl::fabs(out));
+                }
+                lmem[lid] = amax;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz >> 1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] = sycl::fmax(lmem[lid], lmem[lid + s]);
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float scale = lmem[0] > 0.0f ? lmem[0] / 127.0f : 1.0f;
+                if (lid == 0) out_scale[tok] = scale;
+
+                for (int d = lid; d < inter; d += lsz) {
+                    float g = bf16_to_float(row[d]);
+                    float u = bf16_to_float(row[inter + d]);
+                    float out = (g / (1.0f + sycl::exp(-g))) * u;
+                    out = bf16_to_float(float_to_bf16(out));
+                    float qv = sycl::round(out / scale);
+                    qv = sycl::fmin(sycl::fmax(qv, -127.0f), 127.0f);
+                    orow[d] = (int8_t)qv;
+                }
+            });
+    });
+    launchprof::record("qwen35_swiglu_strided_q", _ev);
+}
+
 // Full-attention output gate: a[i] *= sigmoid(gate[i]).  (modeling line 717)
 inline void mul_sigmoid_inplace(sycl::queue& q, bf16* a, const bf16* gate, int n) {
     auto _ev = q.submit([&](sycl::handler& h) {
@@ -56,6 +107,59 @@ inline void mul_sigmoid_inplace(sycl::queue& q, bf16* a, const bf16* gate, int n
         });
     });
     launchprof::record("qwen35_mul_sigmoid_inplace", _ev);
+}
+
+// Fused act-quant attention gate: computes a*sigmoid(gate) in-register, reduces
+// the per-row absmax, and quantizes to s8 (absmax/127) without writing the bf16
+// result. One row per token (D = query_dim). Bit-exact vs mul_sigmoid_inplace +
+// act_quant_s8_s8.
+inline void mul_sigmoid_inplace_q(sycl::queue& q, bf16* a, const bf16* gate,
+                                  int8_t* out_s8, float* out_scale, int seq,
+                                  int D) {
+    size_t local_size = static_cast<size_t>(std::min(256, D));
+    while (local_size & (local_size - 1)) local_size--;
+
+    auto _ev = q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lmem(local_size, h);
+        h.parallel_for(
+            sycl::nd_range<1>((size_t)seq * local_size, local_size),
+            [=](sycl::nd_item<1> it) {
+                int tok = it.get_group(0);
+                int lid = it.get_local_id(0);
+                int lsz = it.get_local_range(0);
+                const bf16* arow = a + (size_t)tok * D;
+                const bf16* grow = gate + (size_t)tok * D;
+                int8_t* orow = out_s8 + (size_t)tok * D;
+
+                float amax = 0.0f;
+                for (int d = lid; d < D; d += lsz) {
+                    float g = bf16_to_float(grow[d]);
+                    float sig = 1.0f / (1.0f + sycl::exp(-g));
+                    float out = bf16_to_float(arow[d]) * sig;
+                    out = bf16_to_float(float_to_bf16(out));
+                    amax = sycl::fmax(amax, sycl::fabs(out));
+                }
+                lmem[lid] = amax;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz >> 1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] = sycl::fmax(lmem[lid], lmem[lid + s]);
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float scale = lmem[0] > 0.0f ? lmem[0] / 127.0f : 1.0f;
+                if (lid == 0) out_scale[tok] = scale;
+
+                for (int d = lid; d < D; d += lsz) {
+                    float g = bf16_to_float(grow[d]);
+                    float sig = 1.0f / (1.0f + sycl::exp(-g));
+                    float out = bf16_to_float(arow[d]) * sig;
+                    out = bf16_to_float(float_to_bf16(out));
+                    float qv = sycl::round(out / scale);
+                    qv = sycl::fmin(sycl::fmax(qv, -127.0f), 127.0f);
+                    orow[d] = (int8_t)qv;
+                }
+            });
+    });
+    launchprof::record("qwen35_mul_sigmoid_inplace_q", _ev);
 }
 
 // Gated RMSNorm (Qwen3_5MoeRMSNormGated, linear-attn output norm).  (lines 192-201)
@@ -96,6 +200,69 @@ inline void gated_rmsnorm(
             });
     });
     launchprof::record("qwen35_gated_rmsnorm", _ev);
+}
+
+// Fused act-quant gated RMSNorm: computes the bf16 gated-RMSNorm output
+// in-register (folding silu(z) before quantization), reduces the per-row absmax,
+// then quantizes to s8 (absmax/127). Bit-exact vs gated_rmsnorm + act_quant_s8_s8.
+inline void gated_rmsnorm_q(
+    sycl::queue& q,
+    const bf16* x, const bf16* z, const bf16* weight,
+    int8_t* out_s8, float* out_scale, int N, int D, float eps
+) {
+    size_t local_size = static_cast<size_t>(std::min(256, D));
+    while (local_size & (local_size - 1)) local_size--;
+    auto _ev = q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lmem(local_size, h);
+        h.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(N) * local_size, local_size),
+            [=](sycl::nd_item<1> it) {
+                int n   = it.get_group(0);
+                int lid = it.get_local_id(0);
+                int lsz = it.get_local_range(0);
+                const bf16* xrow = x + static_cast<size_t>(n) * D;
+                const bf16* zrow = z + static_cast<size_t>(n) * D;
+                int8_t* orow = out_s8 + static_cast<size_t>(n) * D;
+
+                float ss = 0.0f;
+                for (int d = lid; d < D; d += lsz) { float v = bf16_to_float(xrow[d]); ss += v * v; }
+                lmem[lid] = ss;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz >> 1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] += lmem[lid + s];
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float rms_inv = sycl::rsqrt(lmem[0] / static_cast<float>(D) + eps);
+
+                float amax = 0.0f;
+                for (int d = lid; d < D; d += lsz) {
+                    float v = bf16_to_float(xrow[d]) * rms_inv * bf16_to_float(weight[d]);
+                    float g = bf16_to_float(zrow[d]);
+                    float out = v * (g / (1.0f + sycl::exp(-g)));
+                    out = bf16_to_float(float_to_bf16(out));
+                    amax = sycl::fmax(amax, sycl::fabs(out));
+                }
+                lmem[lid] = amax;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz >> 1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] = sycl::fmax(lmem[lid], lmem[lid + s]);
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float scale = lmem[0] > 0.0f ? lmem[0] / 127.0f : 1.0f;
+                if (lid == 0) out_scale[n] = scale;
+
+                for (int d = lid; d < D; d += lsz) {
+                    float v = bf16_to_float(xrow[d]) * rms_inv * bf16_to_float(weight[d]);
+                    float g = bf16_to_float(zrow[d]);
+                    float out = v * (g / (1.0f + sycl::exp(-g)));
+                    out = bf16_to_float(float_to_bf16(out));
+                    float qv = sycl::round(out / scale);
+                    qv = sycl::fmin(sycl::fmax(qv, -127.0f), 127.0f);
+                    orow[d] = (int8_t)qv;
+                }
+            });
+    });
+    launchprof::record("qwen35_gated_rmsnorm_q", _ev);
 }
 
 // L2 normalization (Gated DeltaNet q/k, FLA-style).  (lines 239-242)

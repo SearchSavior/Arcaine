@@ -23,6 +23,15 @@ struct Qwen35Workspace {
     // group_size = 32. Reused by every INT4 projection; keeps matmul_int4 free
     // of per-call device allocations on the decode path.
     GpuBuffer<bf16> int4_rowsum;
+    // W4A8 fused-producer output: the s8 activation (1 byte/elem, replacing the
+    // bf16 intermediate it supersedes) and its per-token f32 act scale. Sized
+    // for the forward's max seq x K with K = the largest projection input
+    // (intermediate_size for down_proj).
+    GpuBuffer<int8_t> w4a8_act_s8;
+    GpuBuffer<float> w4a8_act_scale;
+    // W4A8 zp-correction rowsum scratch: scale[m] * sum(A_s8[m, group]), same
+    // sizing as int4_rowsum (max_seq x max_groups).
+    GpuBuffer<bf16> w4a8_rowsum_scaled;
     // INT4 zp-correction GEMM output scratch for small-M (decode/speculative)
     // calls: 16 x max(out_features) with out_features = 2*intermediate_size
     // (fused gate_up). Prefill calls (M > 16) fall back to a per-call heap
@@ -76,6 +85,11 @@ struct Qwen35Workspace {
         activation_scale = GpuBuffer<uint8_t>(s * c.intermediate_size / 16, queue);
         int max_groups = (c.intermediate_size + 31) / 32;  // down proj K = I, gs 32
         int4_rowsum = GpuBuffer<bf16>(s * max_groups, queue);
+        w4a8_act_s8 = GpuBuffer<int8_t>(
+            s * std::max({c.hidden_size, c.intermediate_size, value_dim,
+                          q_proj / 2}), queue);
+        w4a8_act_scale = GpuBuffer<float>(s, queue);
+        w4a8_rowsum_scaled = GpuBuffer<bf16>(s * max_groups, queue);
         int4_corr_decode = GpuBuffer<bf16>(
             (size_t)int4_corr_rows * 2 * c.intermediate_size, queue);
     size_t out_elems = (size_t)c.num_key_value_heads * decode_max_kv_slices *

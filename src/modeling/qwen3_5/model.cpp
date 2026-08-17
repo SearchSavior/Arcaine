@@ -234,35 +234,66 @@ void Qwen35Model::run_layer(
     bf16* normalized, bf16* sublayer, const int32_t* positions,
     int seq, int past) {
     const auto& c = config_.text;
-    rms_norm(context.queue, hidden, layer.input_layernorm.data(), normalized,
-             seq, c.hidden_size, c.rms_norm_eps);
+    bool w4a8 = int4_w4a8_enabled();
+    bool fuse_norm = w4a8 && int4_w4a8_fuse_norm();
+
+    const int8_t* act_s8 = nullptr;
+    const float* act_scale = nullptr;
+    if (fuse_norm) {
+        // Linear-attention layers still consume the bf16 normalized input via
+        // the bf16 in_proj_a/b/ba projections; full-attention layers go s8-only.
+        bf16* norm_bf16 = layer.full_attention ? nullptr : normalized;
+        rms_norm_q(context.queue, hidden, layer.input_layernorm.data(),
+                   norm_bf16, workspace.w4a8_act_s8.data(),
+                   workspace.w4a8_act_scale.data(), seq, c.hidden_size,
+                   c.rms_norm_eps);
+        act_s8 = workspace.w4a8_act_s8.data();
+        act_scale = workspace.w4a8_act_scale.data();
+    } else {
+        rms_norm(context.queue, hidden, layer.input_layernorm.data(), normalized,
+                 seq, c.hidden_size, c.rms_norm_eps);
+    }
+
     Qwen35CorrOut corr;
     if (layer.full_attention) {
         corr = qwen35_full_attention_forward(
             context, std::get<Qwen35FullAttentionWeights>(layer.mixer), kv,
-            workspace, normalized, positions, sublayer, seq, past, config_);
+            workspace, normalized, act_s8, act_scale, positions, sublayer, seq,
+            past, config_);
     } else {
         corr = qwen35_linear_attention_forward(
             context, std::get<Qwen35LinearAttentionWeights>(layer.mixer), delta,
-            workspace, normalized, sublayer, seq, config_);
+            workspace, normalized, act_s8, act_scale, sublayer, seq, config_);
     }
     if (corr.corr)
         qwen35_add_inplace_corr(context.queue, hidden, sublayer, corr.corr,
                                 (size_t)seq * c.hidden_size);
     else
         add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
+
+    const int8_t* mlp_s8 = nullptr;
+    const float* mlp_scale = nullptr;
     if (qwen35_fuse_add_norm_enabled()) {
-        // One launch: hidden += sublayer (bf16-rounded) then normalized =
-        // rms_norm(hidden). Bit-exact vs add_inplace + rms_norm above.
+        // add_rms_norm is a distinct producer; keep it bf16 so FUSE_NORM does
+        // not need an add_rms_norm_q variant.
         add_rms_norm(context.queue, sublayer, hidden,
                      layer.post_attention_layernorm.data(), normalized,
                      seq, c.hidden_size, c.rms_norm_eps);
+    } else if (fuse_norm) {
+        rms_norm_q(context.queue, hidden, layer.post_attention_layernorm.data(),
+                   nullptr, workspace.w4a8_act_s8.data(),
+                   workspace.w4a8_act_scale.data(), seq, c.hidden_size,
+                   c.rms_norm_eps);
+        mlp_s8 = workspace.w4a8_act_s8.data();
+        mlp_scale = workspace.w4a8_act_scale.data();
     } else {
         rms_norm(context.queue, hidden, layer.post_attention_layernorm.data(), normalized,
                  seq, c.hidden_size, c.rms_norm_eps);
     }
+
     Qwen35CorrOut corr2 = qwen35_mlp_forward(context, layer.mlp, workspace,
-                                             normalized, sublayer, seq, config_);
+                                             normalized, mlp_s8, mlp_scale,
+                                             sublayer, seq, config_);
     if (corr2.corr)
         qwen35_add_inplace_corr(context.queue, hidden, sublayer, corr2.corr,
                                 (size_t)seq * c.hidden_size);

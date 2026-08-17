@@ -4,7 +4,9 @@
 /workspace/ngen_lab/build/CMakeFiles/ngen_dpas_8x8_matmul_w8a2_16x16x32.dir
 /workspace/ngen_lab/build/CMakeFiles/ngen_dpas_8x8_matmul_w4a8_16x16x32.dir
 /workspace/ngen_lab/build/CMakeFiles/ngen_dpas_w4a8_gemm.dir
+/workspace/ngen_lab/build/CMakeFiles/ngen_dpas_w4a8_gemm_m.dir
 /workspace/ngen_lab/build/CMakeFiles/ngen_lab_asmdump.dir
+/workspace/ngen_lab/build/CMakeFiles/ngen_lab_asmdump_m.dir
 /workspace/ngen_lab/build/CMakeFiles/iga_dis.dir
 /workspace/ngen_lab/build/CMakeFiles/l0_min_s0.dir
 /workspace/ngen_lab/build/CMakeFiles/l0_min_s1.dir

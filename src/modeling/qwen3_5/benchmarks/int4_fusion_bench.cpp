@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -404,11 +405,12 @@ void bench_corr_fusion(GpuEngine& ctx, int iterations) {
         std::printf("[corr-fusion] split_q_gate_kv q | max_abs %.7g bit_mismatch %zu/%zu\n",
                     e.max_abs, e.bit_mismatches, ref.size());
         if (e.bit_mismatches > 0) throw std::runtime_error("split corr fusion not bit-exact");
-        k1.download(ref.data(), ref.size());
-        k2.download(test.data(), test.size());
-        e = compare(ref, test);
+        std::vector<bf16> ref_k((size_t)M * kv_dim), test_k((size_t)M * kv_dim);
+        k1.download(ref_k.data(), ref_k.size());
+        k2.download(test_k.data(), test_k.size());
+        e = compare(ref_k, test_k);
         std::printf("[corr-fusion] split_q_gate_kv k | max_abs %.7g bit_mismatch %zu/%zu\n",
-                    e.max_abs, e.bit_mismatches, ref.size());
+                    e.max_abs, e.bit_mismatches, ref_k.size());
         if (e.bit_mismatches > 0) throw std::runtime_error("split corr fusion k not bit-exact");
     }
     // --- conv-state correction: matmul_int4 (corrected) + update_conv_state
@@ -613,6 +615,190 @@ void bench_gdn_fusions(GpuEngine& ctx, int iterations) {
     }
 }
 
+// Bit-exact gates for the W4A8 producer fusion. Each fused producer's
+// (s8, scale) must equal (plain producer -> act_quant_s8_s8); the s8 rowsum must
+// equal scale*sum(A_s8) computed on CPU; and the fused W4A8 GEMM must equal the
+// unfused matmul_int4_w4a8 (which quantizes internally).
+void bench_w4a8_fusion(GpuEngine& ctx, int iterations) {
+    using namespace qwen35_kernels;
+    auto& q = ctx.queue;
+
+    auto check_s8_scale = [&](const GpuBuffer<int8_t>& a, const GpuBuffer<float>& sa,
+                              const GpuBuffer<int8_t>& b, const GpuBuffer<float>& sb,
+                              size_t n, int m, const char* name) {
+        std::vector<int8_t> ra(n), rb(n);
+        std::vector<float> rsa(m), rsb(m);
+        a.download(ra.data(), n);
+        b.download(rb.data(), n);
+        sa.download(rsa.data(), m);
+        sb.download(rsb.data(), m);
+        size_t mm = 0;
+        for (size_t i = 0; i < n; ++i) if (ra[i] != rb[i]) ++mm;
+        int smm = 0;
+        for (int i = 0; i < m; ++i)
+            if (std::memcmp(&rsa[i], &rsb[i], sizeof(float)) != 0) ++smm;
+        std::printf("[w4a8-fusion] %s s8_mismatch %zu/%zu scale_mismatch %d/%d\n",
+                    name, mm, n, smm, m);
+        if (mm || smm)
+            throw std::runtime_error(std::string(name) + " not bit-exact vs act_quant");
+    };
+
+    auto rng = [](size_t i) {
+        return float_to_bf16(0.01f * (float)((int)((i * 17 + 13) % 101) - 50));
+    };
+
+    // ---- rms_norm_q (and its optional bf16 output) ----
+    {
+        const int seq = 16, H = kHidden;
+        std::vector<bf16> x_h((size_t)seq * H), w_h(H);
+        for (size_t i = 0; i < x_h.size(); ++i) x_h[i] = rng(i);
+        for (int i = 0; i < H; ++i) w_h[i] = rng((size_t)i + 7);
+        GpuBuffer<bf16> x(x_h.size(), q), w(w_h.size(), q);
+        x.upload(x_h.data(), x_h.size());
+        w.upload(w_h.data(), w_h.size());
+        GpuBuffer<bf16> bf_ref((size_t)seq * H, q), bf_f((size_t)seq * H, q);
+        GpuBuffer<int8_t> s8_ref((size_t)seq * H, q), s8_f((size_t)seq * H, q);
+        GpuBuffer<float> sc_ref(seq, q), sc_f(seq, q);
+
+        rms_norm(q, x.data(), w.data(), bf_ref.data(), seq, H, kEps);
+        act_quant_s8_s8(bf_ref.data(), s8_ref.data(), sc_ref.data(), seq, H, q);
+        rms_norm_q(q, x.data(), w.data(), bf_f.data(), s8_f.data(), sc_f.data(),
+                   seq, H, kEps);
+        q.wait();
+        check_s8_scale(s8_ref, sc_ref, s8_f, sc_f, (size_t)seq * H, seq, "rms_norm_q");
+
+        std::vector<bf16> rbf((size_t)seq * H), fbf((size_t)seq * H);
+        bf_ref.download(rbf.data(), rbf.size());
+        bf_f.download(fbf.data(), fbf.size());
+        size_t bmm = 0;
+        for (size_t i = 0; i < rbf.size(); ++i) if (rbf[i] != fbf[i]) ++bmm;
+        std::printf("[w4a8-fusion] rms_norm_q bf16_mismatch %zu/%zu\n", bmm, rbf.size());
+        if (bmm) throw std::runtime_error("rms_norm_q bf16 output not bit-exact");
+    }
+
+    // ---- gated_rmsnorm_q ----
+    {
+        const int seq = 16, heads = 16, D = 128;
+        const int N = seq * heads;
+        std::vector<bf16> x_h((size_t)N * D), z_h((size_t)N * D), w_h(D);
+        for (size_t i = 0; i < x_h.size(); ++i) { x_h[i] = rng(i); z_h[i] = rng(i + 3); }
+        for (int i = 0; i < D; ++i) w_h[i] = rng((size_t)i + 11);
+        GpuBuffer<bf16> x(x_h.size(), q), z(z_h.size(), q), w(w_h.size(), q);
+        x.upload(x_h.data(), x_h.size());
+        z.upload(z_h.data(), z_h.size());
+        w.upload(w_h.data(), w_h.size());
+        GpuBuffer<bf16> bf_ref((size_t)N * D, q);
+        GpuBuffer<int8_t> s8_ref((size_t)N * D, q), s8_f((size_t)N * D, q);
+        GpuBuffer<float> sc_ref(N, q), sc_f(N, q);
+
+        gated_rmsnorm(q, x.data(), z.data(), w.data(), bf_ref.data(), N, D, kEps);
+        act_quant_s8_s8(bf_ref.data(), s8_ref.data(), sc_ref.data(), N, D, q);
+        gated_rmsnorm_q(q, x.data(), z.data(), w.data(), s8_f.data(), sc_f.data(),
+                        N, D, kEps);
+        q.wait();
+        check_s8_scale(s8_ref, sc_ref, s8_f, sc_f, (size_t)N * D, N, "gated_rmsnorm_q");
+    }
+
+    // ---- swiglu_strided_q ----
+    {
+        const int seq = 16, inter = 4096;
+        std::vector<bf16> gu_h((size_t)seq * 2 * inter);
+        for (size_t i = 0; i < gu_h.size(); ++i) gu_h[i] = rng(i);
+        GpuBuffer<bf16> gu(gu_h.size(), q);
+        gu.upload(gu_h.data(), gu_h.size());
+        GpuBuffer<bf16> bf_ref((size_t)seq * inter, q);
+        GpuBuffer<int8_t> s8_ref((size_t)seq * inter, q), s8_f((size_t)seq * inter, q);
+        GpuBuffer<float> sc_ref(seq, q), sc_f(seq, q);
+
+        swiglu_strided(q, gu.data(), bf_ref.data(), seq, inter);
+        act_quant_s8_s8(bf_ref.data(), s8_ref.data(), sc_ref.data(), seq, inter, q);
+        swiglu_strided_q(q, gu.data(), s8_f.data(), sc_f.data(), seq, inter);
+        q.wait();
+        check_s8_scale(s8_ref, sc_ref, s8_f, sc_f, (size_t)seq * inter, seq,
+                       "swiglu_strided_q");
+    }
+
+    // ---- mul_sigmoid_inplace_q ----
+    {
+        const int seq = 16, qh = 32, hd = 128;
+        const int D = qh * hd;
+        std::vector<bf16> a_h((size_t)seq * D), g_h((size_t)seq * D);
+        for (size_t i = 0; i < a_h.size(); ++i) { a_h[i] = rng(i); g_h[i] = rng(i + 5); }
+        GpuBuffer<bf16> a_ref(a_h.size(), q), a_f(a_h.size(), q), g(g_h.size(), q);
+        a_ref.upload(a_h.data(), a_h.size());
+        a_f.upload(a_h.data(), a_h.size());
+        g.upload(g_h.data(), g_h.size());
+        GpuBuffer<int8_t> s8_ref((size_t)seq * D, q), s8_f((size_t)seq * D, q);
+        GpuBuffer<float> sc_ref(seq, q), sc_f(seq, q);
+
+        mul_sigmoid_inplace(q, a_ref.data(), g.data(), (int)a_h.size());
+        act_quant_s8_s8(a_ref.data(), s8_ref.data(), sc_ref.data(), seq, D, q);
+        mul_sigmoid_inplace_q(q, a_f.data(), g.data(), s8_f.data(), sc_f.data(), seq, D);
+        q.wait();
+        check_s8_scale(s8_ref, sc_ref, s8_f, sc_f, (size_t)seq * D, seq,
+                       "mul_sigmoid_inplace_q");
+    }
+
+    // ---- int4_rowsum_s8_scaled vs CPU scale*sum(A_s8) ----
+    {
+        const int M = 8, K = kHidden, G = K / kGroup;
+        std::vector<int8_t> a8((size_t)M * K);
+        std::vector<float> sc(M);
+        for (size_t i = 0; i < a8.size(); ++i)
+            a8[i] = (int8_t)((int)((i * 13 + 5) % 255) - 127);
+        for (int i = 0; i < M; ++i) sc[i] = 0.001f + 0.0001f * (float)i;
+        GpuBuffer<int8_t> a8d(a8.size(), q);
+        GpuBuffer<float> scd(M, q);
+        GpuBuffer<bf16> out((size_t)M * G, q);
+        a8d.upload(a8.data(), a8.size());
+        scd.upload(sc.data(), M);
+        int4_rowsum_s8_scaled(a8d.data(), scd.data(), M, K, kGroup, out.data(), q);
+        q.wait();
+        std::vector<bf16> oh((size_t)M * G);
+        out.download(oh.data(), oh.size());
+        size_t mm = 0;
+        for (int m = 0; m < M; ++m) {
+            for (int g = 0; g < G; ++g) {
+                int acc = 0;
+                for (int k = 0; k < kGroup; ++k)
+                    acc += (int)a8[(size_t)m * K + (size_t)g * kGroup + k];
+                bf16 want = float_to_bf16(sc[m] * (float)acc);
+                if (oh[(size_t)m * G + g] != want) ++mm;
+            }
+        }
+        std::printf("[w4a8-fusion] int4_rowsum_s8_scaled mismatch %zu/%zu\n", mm, (size_t)M * G);
+        if (mm) throw std::runtime_error("int4_rowsum_s8_scaled not bit-exact");
+    }
+
+    // ---- fused GEMM == unfused GEMM (bit-exact interchangeability) ----
+    {
+        const int M = 64, K = kHidden, N = kHidden, G = K / kGroup;
+        std::vector<bf16> a_h((size_t)M * K);
+        for (size_t i = 0; i < a_h.size(); ++i) a_h[i] = rng(i);
+        GpuBuffer<bf16> a(a_h.size(), q);
+        a.upload(a_h.data(), a_h.size());
+        Int4Linear W = make_int4_linear(K, N, q);
+        GpuBuffer<bf16> c1((size_t)M * N, q), c2((size_t)M * N, q);
+        GpuBuffer<bf16> rs1((size_t)M * G, q), rs2((size_t)M * G, q);
+        GpuBuffer<bf16> cr1((size_t)M * N, q), cr2((size_t)M * N, q);
+        GpuBuffer<int8_t> a8((size_t)M * K, q);
+        GpuBuffer<float> sc(M, q);
+
+        matmul_int4_w4a8(a.data(), M, K, W, c1.data(), ctx, rs1.data(), cr1.data());
+        act_quant_s8_s8(a.data(), a8.data(), sc.data(), M, K, q);
+        matmul_int4_w4a8_fused(a8.data(), sc.data(), M, K, W, c2.data(), ctx,
+                               rs2.data(), cr2.data());
+        q.wait();
+        std::vector<bf16> r1((size_t)M * N), r2((size_t)M * N);
+        c1.download(r1.data(), r1.size());
+        c2.download(r2.data(), r2.size());
+        size_t mm = 0;
+        for (size_t i = 0; i < r1.size(); ++i) if (r1[i] != r2[i]) ++mm;
+        std::printf("[w4a8-fusion] gemm fused-vs-unfused mismatch %zu/%zu\n", mm, r1.size());
+        if (mm) throw std::runtime_error("W4A8 fused GEMM differs from unfused");
+    }
+}
+
 void bench_vocab_tail(GpuEngine& ctx, int iterations) {
     auto& q = ctx.queue;
     const int H = 5120;
@@ -705,6 +891,7 @@ int run(int argc, char** argv) {
     bench_zp_correction(ctx, iterations);
     bench_dequant_bf16(ctx, iterations);
     bench_corr_fusion(ctx, iterations);
+    bench_w4a8_fusion(ctx, iterations);
     bench_gdn_fusions(ctx, iterations);
     bench_add_norm(ctx, iterations);
     bench_norm_rope(ctx, iterations);

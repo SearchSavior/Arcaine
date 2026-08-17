@@ -162,6 +162,23 @@ inline void matmul_proj(const bf16* A, int M, int K, const Qwen35Proj& W,
                     int4_rowsum_scratch, int4_corr_scratch);
 }
 
+// W4A8 int4 projection. When act_s8 is non-null the producer already quantized
+// the activation (fused); otherwise the bf16 activation is quantized inside
+// matmul_int4_w4a8. Only valid when int4_w4a8_enabled() is on.
+inline void qwen35_w4a8_proj(GpuEngine& context, const bf16* act_bf16,
+                             const int8_t* act_s8, const float* act_scale,
+                             int seq, int K, const Int4Linear& W, bf16* C,
+                             Qwen35Workspace& ws) {
+    if (act_s8)
+        matmul_int4_w4a8_fused(act_s8, act_scale, seq, K, W, C, context,
+                               ws.w4a8_rowsum_scaled.data(),
+                               qwen35_int4_corr_scratch(ws, seq));
+    else
+        matmul_int4_w4a8(act_bf16, seq, K, W, C, context,
+                         ws.w4a8_rowsum_scaled.data(),
+                         qwen35_int4_corr_scratch(ws, seq));
+}
+
 inline bool qwen35_fused_ba_projection_enabled() {
     static bool enabled = [] {
         const char* value =
@@ -221,6 +238,8 @@ inline Qwen35CorrOut qwen35_full_attention_forward(
     Qwen35KvLayerCache& cache,
     Qwen35Workspace& workspace,
     const bf16* hidden,
+    const int8_t* act_s8,
+    const float* act_scale,
     const int32_t* positions,
     bf16* output,
     int seq,
@@ -239,7 +258,17 @@ inline Qwen35CorrOut qwen35_full_attention_forward(
         bool cache_write = qwen35_split_write_cache_enabled();
         bf16* cache_key = cache_write ? cache.key.data() : nullptr;
         bf16* cache_value = cache_write ? cache.value.data() : nullptr;
-        if (qwen35_int4_corr_fused_enabled() &&
+        if (int4_w4a8_enabled() &&
+            std::holds_alternative<Int4Linear>(weights.qkv_proj)) {
+            const auto& w = std::get<Int4Linear>(weights.qkv_proj);
+            qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq,
+                             c.hidden_size, w, workspace.tmp0.data(), workspace);
+            qwen35_split_q_gate_kv(
+                queue, workspace.tmp0.data(), workspace.tmp2.data(),
+                workspace.tmp3.data(), workspace.tmp1.data(), workspace.tmp4.data(),
+                seq, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+                cache_key, cache_value, past, nullptr);
+        } else if (qwen35_int4_corr_fused_enabled() &&
             std::holds_alternative<Int4Linear>(weights.qkv_proj) &&
             std::get<Int4Linear>(weights.qkv_proj).has_zp()) {
             const auto& w = std::get<Int4Linear>(weights.qkv_proj);
@@ -264,6 +293,20 @@ inline Qwen35CorrOut qwen35_full_attention_forward(
                 seq, c.num_attention_heads, c.num_key_value_heads, c.head_dim,
                 cache_key, cache_value, past, nullptr);
         }
+    } else if (int4_w4a8_enabled() &&
+               std::holds_alternative<Int4Linear>(weights.q_proj)) {
+        const auto& q = std::get<Int4Linear>(weights.q_proj);
+        const auto& k = std::get<Int4Linear>(weights.k_proj);
+        const auto& v = std::get<Int4Linear>(weights.v_proj);
+        qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq, c.hidden_size,
+                         q, workspace.tmp0.data(), workspace);
+        qwen35_split_q_gate(queue, workspace.tmp0.data(), workspace.tmp2.data(),
+                            workspace.tmp3.data(), seq, c.num_attention_heads,
+                            c.head_dim);
+        qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq, c.hidden_size,
+                         k, workspace.tmp1.data(), workspace);
+        qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq, c.hidden_size,
+                         v, workspace.tmp4.data(), workspace);
     } else {
         matmul_proj(hidden, seq, c.hidden_size, weights.q_proj,
                     workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
@@ -371,11 +414,26 @@ inline Qwen35CorrOut qwen35_full_attention_forward(
                                 c.num_attention_heads, c.num_key_value_heads,
                                 c.head_dim, 1.0f / std::sqrt((float)c.head_dim));
     }
-    if (!attn_gate_applied)
+    bool w4a8 = int4_w4a8_enabled();
+    bool o_fused = w4a8 && int4_w4a8_fuse_attn_gate() && !attn_gate_applied;
+    const int8_t* o_s8 = nullptr;
+    const float* o_scale = nullptr;
+    if (o_fused) {
+        mul_sigmoid_inplace_q(queue, workspace.tmp2.data(), workspace.tmp3.data(),
+                              workspace.w4a8_act_s8.data(),
+                              workspace.w4a8_act_scale.data(), seq, query_dim);
+        o_s8 = workspace.w4a8_act_s8.data();
+        o_scale = workspace.w4a8_act_scale.data();
+    } else if (!attn_gate_applied) {
         mul_sigmoid_inplace(queue, workspace.tmp2.data(), workspace.tmp3.data(),
                             (size_t)seq * query_dim);
+    }
     Qwen35CorrOut corr_out;
-    if (qwen35_int4_corr_fused_enabled() &&
+    if (w4a8 && std::holds_alternative<Int4Linear>(weights.o_proj)) {
+        const auto& w = std::get<Int4Linear>(weights.o_proj);
+        qwen35_w4a8_proj(context, workspace.tmp2.data(), o_s8, o_scale, seq,
+                         query_dim, w, output, workspace);
+    } else if (qwen35_int4_corr_fused_enabled() &&
         std::holds_alternative<Int4Linear>(weights.o_proj) &&
         std::get<Int4Linear>(weights.o_proj).has_zp()) {
         const auto& w = std::get<Int4Linear>(weights.o_proj);
@@ -399,7 +457,14 @@ template <typename W>
 inline Qwen35CorrOut qwen35_residual_proj(GpuEngine& context, const bf16* core,
                                           int seq, int K, const W& Wt,
                                           bf16* output, Qwen35Workspace& ws,
-                                          int out_n) {
+                                          int out_n,
+                                          const int8_t* core_s8 = nullptr,
+                                          const float* core_scale = nullptr) {
+    if (int4_w4a8_enabled() && std::holds_alternative<Int4Linear>(Wt)) {
+        const auto& w = std::get<Int4Linear>(Wt);
+        qwen35_w4a8_proj(context, core, core_s8, core_scale, seq, K, w, output, ws);
+        return {};
+    }
     if (qwen35_int4_corr_fused_enabled() &&
         std::holds_alternative<Int4Linear>(Wt) &&
         std::get<Int4Linear>(Wt).has_zp()) {
@@ -439,6 +504,8 @@ inline Qwen35CorrOut qwen35_linear_attention_forward(
     Qwen35DeltaLayerCache& cache,
     Qwen35Workspace& workspace,
     const bf16* hidden,
+    const int8_t* act_s8,
+    const float* act_scale,
     bf16* output,
     int seq,
     const Qwen35Config& config) {
@@ -468,9 +535,16 @@ inline Qwen35CorrOut qwen35_linear_attention_forward(
         weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled()) {
         // The esimd core consumes the projection directly, so the zp correction
         // stays materialized (matmul_proj -> matmul_int4 with subtract).
-        matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkvz,
-                    workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
-                    qwen35_int4_corr_scratch(workspace, seq));
+        if (int4_w4a8_enabled() &&
+            std::holds_alternative<Int4Linear>(weights.in_proj_qkvz)) {
+            const auto& w = std::get<Int4Linear>(weights.in_proj_qkvz);
+            qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq,
+                             c.hidden_size, w, workspace.tmp0.data(), workspace);
+        } else {
+            matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkvz,
+                        workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
+                        qwen35_int4_corr_scratch(workspace, seq));
+        }
         for (int token = 0; token < seq; ++token) {
             const bf16* token_hidden = hidden + (size_t)token * c.hidden_size;
             const bf16* projected =
@@ -506,15 +580,26 @@ inline Qwen35CorrOut qwen35_linear_attention_forward(
                                                 cache.conv_state.data(), conv_dim);
         }
         cache.has_state = true;
-        gated_rmsnorm(
-            queue, workspace.tmp4.data(), workspace.tmp2.data(),
-            weights.norm.data(), workspace.tmp4.data(), seq * heads,
-            c.linear_value_head_dim, c.rms_norm_eps);
+        const int8_t* out_s8 = nullptr;
+        const float* out_scale = nullptr;
+        if (int4_w4a8_enabled() && int4_w4a8_fuse_gated_norm()) {
+            gated_rmsnorm_q(queue, workspace.tmp4.data(), workspace.tmp2.data(),
+                            weights.norm.data(), workspace.w4a8_act_s8.data(),
+                            workspace.w4a8_act_scale.data(), seq * heads,
+                            c.linear_value_head_dim, c.rms_norm_eps);
+            out_s8 = workspace.w4a8_act_s8.data();
+            out_scale = workspace.w4a8_act_scale.data();
+        } else {
+            gated_rmsnorm(
+                queue, workspace.tmp4.data(), workspace.tmp2.data(),
+                weights.norm.data(), workspace.tmp4.data(), seq * heads,
+                c.linear_value_head_dim, c.rms_norm_eps);
+        }
         return qwen35_residual_proj(context, workspace.tmp4.data(), seq,
                                     value_dim, weights.out_proj, output,
-                                    workspace, c.hidden_size);
+                                    workspace, c.hidden_size, out_s8, out_scale);
     }
-    if (weights.fused_projections &&
+    if (!int4_w4a8_enabled() && weights.fused_projections &&
         qwen35_int4_corr_fused_enabled() &&
         std::holds_alternative<Int4Linear>(weights.in_proj_qkvz) &&
         std::get<Int4Linear>(weights.in_proj_qkvz).has_zp()) {
@@ -529,16 +614,29 @@ inline Qwen35CorrOut qwen35_linear_attention_forward(
                                 c.linear_conv_kernel_dim, cache.has_state,
                                 projected_stride);
     } else {
-        if (weights.fused_projections)
+        if (int4_w4a8_enabled() &&
+            std::holds_alternative<Int4Linear>(weights.fused_projections
+                ? weights.in_proj_qkvz : weights.in_proj_qkv)) {
+            if (weights.fused_projections) {
+                const auto& w = std::get<Int4Linear>(weights.in_proj_qkvz);
+                qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq,
+                                 c.hidden_size, w, workspace.tmp0.data(), workspace);
+            } else {
+                const auto& w = std::get<Int4Linear>(weights.in_proj_qkv);
+                qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq,
+                                 c.hidden_size, w, workspace.tmp0.data(), workspace);
+            }
+        } else if (weights.fused_projections) {
             matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkvz,
                         workspace.tmp0.data(), context,
                         workspace.int4_rowsum.data(),
                         qwen35_int4_corr_scratch(workspace, seq));
-        else
+        } else {
             matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_qkv,
                         workspace.tmp0.data(), context,
                         workspace.int4_rowsum.data(),
                         qwen35_int4_corr_scratch(workspace, seq));
+        }
         if (qwen35_gdn_fusions_enabled())
             qwen35_conv_causal_state(queue, workspace.tmp0.data(),
                                      weights.conv1d.data(),
@@ -579,10 +677,18 @@ inline Qwen35CorrOut qwen35_linear_attention_forward(
 
     // The unfused path reuses tmp0 for z. The fused path keeps z at the tail
     // of each projected row until the recurrent core has consumed q/k/v.
-    if (!weights.fused_projections)
-        matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_z,
-                    workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
-                    qwen35_int4_corr_scratch(workspace, seq));
+    if (!weights.fused_projections) {
+        if (int4_w4a8_enabled() &&
+            std::holds_alternative<Int4Linear>(weights.in_proj_z)) {
+            const auto& w = std::get<Int4Linear>(weights.in_proj_z);
+            qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq,
+                             c.hidden_size, w, workspace.tmp0.data(), workspace);
+        } else {
+            matmul_proj(hidden, seq, c.hidden_size, weights.in_proj_z,
+                        workspace.tmp0.data(), context, workspace.int4_rowsum.data(),
+                        qwen35_int4_corr_scratch(workspace, seq));
+        }
+    }
     bf16* beta = workspace.tmp1.data();
     bf16* g = workspace.tmp1.data() + head_values;
     if (qwen35_fused_ba_projection_enabled())
@@ -623,12 +729,23 @@ inline Qwen35CorrOut qwen35_linear_attention_forward(
                             conv_dim, workspace.tmp1.data(), seq, value_dim);
         z = workspace.tmp1.data();
     }
-    gated_rmsnorm(queue, workspace.tmp4.data(), z,
-                  weights.norm.data(), workspace.tmp4.data(), seq * heads,
-                  c.linear_value_head_dim, c.rms_norm_eps);
+    const int8_t* out_s8 = nullptr;
+    const float* out_scale = nullptr;
+    if (int4_w4a8_enabled() && int4_w4a8_fuse_gated_norm()) {
+        gated_rmsnorm_q(queue, workspace.tmp4.data(), z,
+                        weights.norm.data(), workspace.w4a8_act_s8.data(),
+                        workspace.w4a8_act_scale.data(), seq * heads,
+                        c.linear_value_head_dim, c.rms_norm_eps);
+        out_s8 = workspace.w4a8_act_s8.data();
+        out_scale = workspace.w4a8_act_scale.data();
+    } else {
+        gated_rmsnorm(queue, workspace.tmp4.data(), z,
+                      weights.norm.data(), workspace.tmp4.data(), seq * heads,
+                      c.linear_value_head_dim, c.rms_norm_eps);
+    }
     return qwen35_residual_proj(context, workspace.tmp4.data(), seq, value_dim,
                                 weights.out_proj, output, workspace,
-                                c.hidden_size);
+                                c.hidden_size, out_s8, out_scale);
 }
 
 inline Qwen35CorrOut qwen35_mlp_forward(
@@ -636,6 +753,8 @@ inline Qwen35CorrOut qwen35_mlp_forward(
     const Qwen35MlpWeights& weights,
     Qwen35Workspace& workspace,
     const bf16* hidden,
+    const int8_t* act_s8,
+    const float* act_scale,
     bf16* output,
     int seq,
     const Qwen35Config& config) {
@@ -645,6 +764,25 @@ inline Qwen35CorrOut qwen35_mlp_forward(
     if (std::holds_alternative<Int4Linear>(weights.gate_up)) {
         const auto& gate_up = std::get<Int4Linear>(weights.gate_up);
         const auto& down = std::get<Int4Linear>(weights.down);
+        if (int4_w4a8_enabled()) {
+            qwen35_w4a8_proj(context, hidden, act_s8, act_scale, seq, H,
+                             gate_up, workspace.tmp0.data(), workspace);
+            const int8_t* dn_s8 = nullptr;
+            const float* dn_scale = nullptr;
+            if (int4_w4a8_fuse_swiglu()) {
+                swiglu_strided_q(queue, workspace.tmp0.data(),
+                                 workspace.w4a8_act_s8.data(),
+                                 workspace.w4a8_act_scale.data(), seq, I);
+                dn_s8 = workspace.w4a8_act_s8.data();
+                dn_scale = workspace.w4a8_act_scale.data();
+            } else {
+                swiglu_strided(queue, workspace.tmp0.data(),
+                               workspace.tmp1.data(), seq, I);
+            }
+            return qwen35_residual_proj(context, workspace.tmp1.data(), seq, I,
+                                        weights.down, output, workspace, H,
+                                        dn_s8, dn_scale);
+        }
         if (qwen35_int4_corr_fused_enabled() && gate_up.has_zp()) {
             bf16* corr = qwen35_int4_corr_work(workspace, seq, queue, 2 * I);
             matmul_int4_zp_corr(hidden, seq, H, gate_up, workspace.tmp0.data(),

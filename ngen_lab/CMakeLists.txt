@@ -25,7 +25,8 @@ set(NGEN_LAB_WORKING_KERNELS
         ngen_dpas_8x8_matmul_s4_16x16x32
         ngen_dpas_8x8_matmul_w8a2_16x16x32
         ngen_dpas_8x8_matmul_w4a8_16x16x32
-        ngen_dpas_w4a8_gemm)
+        ngen_dpas_w4a8_gemm
+        ngen_dpas_w4a8_gemm_m)
 
 foreach(kernel_stem IN LISTS NGEN_LAB_WORKING_KERNELS)
     add_executable(${kernel_stem} ${kernel_stem}.cpp
@@ -35,6 +36,9 @@ endforeach()
 
 add_executable(ngen_lab_asmdump ngen_lab_asm.cpp)
 target_compile_definitions(ngen_lab_asmdump PRIVATE NGEN_ASM)
+
+add_executable(ngen_lab_asmdump_m ngen_lab_asmdump_m.cpp)
+target_compile_definitions(ngen_lab_asmdump_m PRIVATE NGEN_ASM)
 
 # iga_dis: raw Gen-ISA disassembler (IGA from oneAPI debugger). Optional;
 # the core build does not depend on it.

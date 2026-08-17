@@ -282,6 +282,47 @@ build ngen_dpas_w4a8_gemm: CXX_EXECUTABLE_LINKER__ngen_dpas_w4a8_gemm_ CMakeFile
   TARGET_PDB = ngen_dpas_w4a8_gemm.dbg
 
 # =============================================================================
+# Object build statements for EXECUTABLE target ngen_dpas_w4a8_gemm_m
+
+
+#############################################
+# Order-only phony target for ngen_dpas_w4a8_gemm_m
+
+build cmake_object_order_depends_target_ngen_dpas_w4a8_gemm_m: phony || CMakeFiles/ngen_dpas_w4a8_gemm_m.dir
+
+build CMakeFiles/ngen_dpas_w4a8_gemm_m.dir/ngen_dpas_w4a8_gemm_m.cpp.o: CXX_COMPILER__ngen_dpas_w4a8_gemm_m_unscanned_ /workspace/ngen_lab/ngen_dpas_w4a8_gemm_m.cpp || cmake_object_order_depends_target_ngen_dpas_w4a8_gemm_m
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ngen_dpas_w4a8_gemm_m.dir/ngen_dpas_w4a8_gemm_m.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ngen_dpas_w4a8_gemm_m.dir
+  OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_w4a8_gemm_m.dir
+
+build CMakeFiles/ngen_dpas_w4a8_gemm_m.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o: CXX_COMPILER__ngen_dpas_w4a8_gemm_m_unscanned_ /workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp || cmake_object_order_depends_target_ngen_dpas_w4a8_gemm_m
+  DEFINES = -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ngen_dpas_w4a8_gemm_m.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ngen_dpas_w4a8_gemm_m.dir
+  OBJECT_FILE_DIR = CMakeFiles/ngen_dpas_w4a8_gemm_m.dir/workspace/reference/oneDNN/third_party/ngen
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ngen_dpas_w4a8_gemm_m
+
+
+#############################################
+# Link the executable ngen_dpas_w4a8_gemm_m
+
+build ngen_dpas_w4a8_gemm_m: CXX_EXECUTABLE_LINKER__ngen_dpas_w4a8_gemm_m_ CMakeFiles/ngen_dpas_w4a8_gemm_m.dir/ngen_dpas_w4a8_gemm_m.cpp.o CMakeFiles/ngen_dpas_w4a8_gemm_m.dir/workspace/reference/oneDNN/third_party/ngen/ngen_register_allocator.cpp.o
+  LINK_LIBRARIES = -lze_loader  -ldl
+  OBJECT_DIR = CMakeFiles/ngen_dpas_w4a8_gemm_m.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ngen_dpas_w4a8_gemm_m
+  TARGET_PDB = ngen_dpas_w4a8_gemm_m.dbg
+
+# =============================================================================
 # Object build statements for EXECUTABLE target ngen_lab_asmdump
 
 
@@ -312,6 +353,38 @@ build ngen_lab_asmdump: CXX_EXECUTABLE_LINKER__ngen_lab_asmdump_ CMakeFiles/ngen
   PRE_LINK = :
   TARGET_FILE = ngen_lab_asmdump
   TARGET_PDB = ngen_lab_asmdump.dbg
+
+# =============================================================================
+# Object build statements for EXECUTABLE target ngen_lab_asmdump_m
+
+
+#############################################
+# Order-only phony target for ngen_lab_asmdump_m
+
+build cmake_object_order_depends_target_ngen_lab_asmdump_m: phony || CMakeFiles/ngen_lab_asmdump_m.dir
+
+build CMakeFiles/ngen_lab_asmdump_m.dir/ngen_lab_asmdump_m.cpp.o: CXX_COMPILER__ngen_lab_asmdump_m_unscanned_ /workspace/ngen_lab/ngen_lab_asmdump_m.cpp || cmake_object_order_depends_target_ngen_lab_asmdump_m
+  DEFINES = -DNGEN_ASM -DNGEN_SAFE
+  DEP_FILE = CMakeFiles/ngen_lab_asmdump_m.dir/ngen_lab_asmdump_m.cpp.o.d
+  FLAGS = -std=gnu++17 -fno-operator-names
+  INCLUDES = -I/workspace/ngen_lab/../reference/oneDNN/third_party/ngen
+  OBJECT_DIR = CMakeFiles/ngen_lab_asmdump_m.dir
+  OBJECT_FILE_DIR = CMakeFiles/ngen_lab_asmdump_m.dir
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target ngen_lab_asmdump_m
+
+
+#############################################
+# Link the executable ngen_lab_asmdump_m
+
+build ngen_lab_asmdump_m: CXX_EXECUTABLE_LINKER__ngen_lab_asmdump_m_ CMakeFiles/ngen_lab_asmdump_m.dir/ngen_lab_asmdump_m.cpp.o
+  OBJECT_DIR = CMakeFiles/ngen_lab_asmdump_m.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = ngen_lab_asmdump_m
+  TARGET_PDB = ngen_lab_asmdump_m.dbg
 
 # =============================================================================
 # Object build statements for EXECUTABLE target iga_dis
@@ -1500,7 +1573,7 @@ build rebuild_cache: phony CMakeFiles/rebuild_cache.util
 #############################################
 # Folder: /workspace/ngen_lab/build
 
-build all: phony ngen_lab ngen_dpas_8x8_matmul_s8_16x16x32 ngen_dpas_8x8_matmul_s4_16x16x32 ngen_dpas_8x8_matmul_w8a2_16x16x32 ngen_dpas_8x8_matmul_w4a8_16x16x32 ngen_dpas_w4a8_gemm ngen_lab_asmdump iga_dis l0_min_s0 l0_min_s1 l0_min_s2 l0_min_s3 l0_min_s4 l0_min_s5 l0_min_s6 l0_min_s7 ovino_gdn_spv ovino_subgroup_probe ovino_probe2 ovino_diag ovino_diag2 ovino_diag3 ovino_diag3_small ovino_diag3_512 ovino_gdn_spv_x ovino_diag4 ovino_diag5 ovino_diagB ovino_diagC ovino_state_pass ovino_red_test ovino_diag2_big ovino_decay_test ovino_scalar ovino_slm_probe ovino_vec ovino_barrier_probe ovino_native ovino_native_ocl gdn_onednn_gemm
+build all: phony ngen_lab ngen_dpas_8x8_matmul_s8_16x16x32 ngen_dpas_8x8_matmul_s4_16x16x32 ngen_dpas_8x8_matmul_w8a2_16x16x32 ngen_dpas_8x8_matmul_w4a8_16x16x32 ngen_dpas_w4a8_gemm ngen_dpas_w4a8_gemm_m ngen_lab_asmdump ngen_lab_asmdump_m iga_dis l0_min_s0 l0_min_s1 l0_min_s2 l0_min_s3 l0_min_s4 l0_min_s5 l0_min_s6 l0_min_s7 ovino_gdn_spv ovino_subgroup_probe ovino_probe2 ovino_diag ovino_diag2 ovino_diag3 ovino_diag3_small ovino_diag3_512 ovino_gdn_spv_x ovino_diag4 ovino_diag5 ovino_diagB ovino_diagC ovino_state_pass ovino_red_test ovino_diag2_big ovino_decay_test ovino_scalar ovino_slm_probe ovino_vec ovino_barrier_probe ovino_native ovino_native_ocl gdn_onednn_gemm
 
 # =============================================================================
 # Built-in targets

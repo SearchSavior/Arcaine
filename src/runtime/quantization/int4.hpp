@@ -446,6 +446,28 @@ inline void int4_rowsum(const bf16* A, int M, int K, int gs, bf16* out,
     launchprof::record("int4_rowsum", _ev);
 }
 
+// rowsum_scaled[m,g] = bf16(scale[m] * sum_{k in group g} A_s8[m,k]), group
+// size gs. The sum is an exact integer sum of the quantized activation; the
+// per-token act scale folds in f32 before the single bf16 cast. This is the
+// W4A8 replacement for int4_rowsum: the corr must cancel the zp term of the
+// *quantized* A, not the original bf16 A.
+inline void int4_rowsum_s8_scaled(const int8_t* A_s8, const float* scale, int M,
+                                  int K, int gs, bf16* out,
+                                  sycl::queue& queue) {
+    int G = K / gs;
+    auto _ev = queue.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t)M, (size_t)G),
+                       [=](sycl::id<2> id) {
+            size_t m = id[0], g = id[1];
+            int acc = 0;
+            const int8_t* row = A_s8 + m * (size_t)K + g * (size_t)gs;
+            for (int k = 0; k < gs; ++k) acc += (int)row[k];
+            out[m * (size_t)G + g] = float_to_bf16(scale[m] * (float)acc);
+        });
+    });
+    launchprof::record("w4a8_rowsum_s8_scaled", _ev);
+}
+
 // ---------------------------------------------------------------------------
 // W4A8 path (ARCAINE_QWEN35_W4A8): per-token s8 activations x s4 weights via the
 // oneDNN s8x s4 fast path (~2x the bf16-activation s4 GEMM). oneDNN 3.13 rejects
@@ -465,9 +487,58 @@ inline bool int4_w4a8_enabled() {
     return enabled;
 }
 
+// Per-fusion-point gates (each effective only when the master W4A8 switch is
+// on). Each fuses the act-quant into a distinct producer kernel so the W4A8
+// path can be A/B'd per projection while the rest of the pipeline stays
+// consistent (unfused producers still emit bf16 and act_quant_s8_s8 runs).
+inline bool int4_w4a8_fuse_norm() {
+    static bool enabled = [] {
+        const char* env = std::getenv("ARCAINE_QWEN35_W4A8_FUSE_NORM");
+        if (!env) return false;
+        std::string v(env);
+        return v != "0" && v != "off" && v != "false" && v != "no";
+    }();
+    return enabled;
+}
+
+inline bool int4_w4a8_fuse_gated_norm() {
+    static bool enabled = [] {
+        const char* env = std::getenv("ARCAINE_QWEN35_W4A8_FUSE_GATED_NORM");
+        if (!env) return false;
+        std::string v(env);
+        return v != "0" && v != "off" && v != "false" && v != "no";
+    }();
+    return enabled;
+}
+
+inline bool int4_w4a8_fuse_swiglu() {
+    static bool enabled = [] {
+        const char* env = std::getenv("ARCAINE_QWEN35_W4A8_FUSE_SWIGLU");
+        if (!env) return false;
+        std::string v(env);
+        return v != "0" && v != "off" && v != "false" && v != "no";
+    }();
+    return enabled;
+}
+
+inline bool int4_w4a8_fuse_attn_gate() {
+    static bool enabled = [] {
+        const char* env = std::getenv("ARCAINE_QWEN35_W4A8_FUSE_ATTN_GATE");
+        if (!env) return false;
+        std::string v(env);
+        return v != "0" && v != "off" && v != "false" && v != "no";
+    }();
+    return enabled;
+}
+
 // A (bf16, M x K) -> A_s8 (s8, per-token symmetric), scale[m] = absmax(A[m])/127.
 // Two-pass and fully parallel (chunked per-row absmax reduction + M*K quantize)
 // so it does not collapse to a single thread at M=1 (decode).
+//
+// The per-row f32 scale is absmax/127 (the dequant multiplier), so the GEMM's
+// per-token post-scale (scale_rows) and the asymmetric-zp correction
+// (int4_rowsum_s8_scaled) both consume the same value and the W4A8 path is
+// interchangeable with the fused producer kernels below.
 inline void act_quant_s8_s8(const bf16* A, int8_t* Q, float* scale, int M, int K,
                             sycl::queue& queue) {
     const int CHUNK = 128;
@@ -496,13 +567,20 @@ inline void act_quant_s8_s8(const bf16* A, int8_t* Q, float* scale, int M, int K
         });
     }
 
+    // Pass 1.5: fold absmax -> absmax/127 so scale[] holds the dequant scale.
+    queue.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>((size_t)M), [=](sycl::id<1> id) {
+            int m = (int)id[0];
+            scale[m] = scale[m] > 0.0f ? scale[m] / 127.0f : 1.0f;
+        });
+    });
+
     // Pass 2: quantize (fully parallel over M*K).
     queue.submit([&](sycl::handler& h) {
         h.parallel_for(sycl::range<1>((size_t)M * K), [=](sycl::id<1> id) {
             size_t i = id[0];
             int m = (int)(i / (size_t)K);
-            float s = scale[m] > 0.0f ? scale[m] / 127.0f : 1.0f;
-            float v = sycl::round(bf16_to_float(A[i]) / s);
+            float v = sycl::round(bf16_to_float(A[i]) / scale[m]);
             v = sycl::fmin(sycl::fmax(v, -127.0f), 127.0f);
             Q[i] = (int8_t)v;
         });
@@ -521,6 +599,24 @@ inline void scale_rows(bf16* C, const float* scale, int M, int N,
         });
     });
     launchprof::record("w4a8_post_scale");
+}
+
+// C[m,n] = bf16(bf16_to_float(C[m,n]) * scale[m] - bf16_to_float(corr[m,n])).
+// Fuses the per-token act post-scale with the asymmetric-zp subtraction into a
+// single M*N pass. Both the fused and unfused W4A8 paths share this core, so
+// they stay bit-identical to each other (the rounding differs from the separate
+// scale_rows + subtract sequence by at most one bf16 ulp).
+inline void scale_rows_sub(bf16* C, const float* scale, const bf16* corr, int M,
+                           int N, sycl::queue& queue) {
+    queue.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t)M, (size_t)N), [=](sycl::id<2> id) {
+            int m = (int)id[0], n = (int)id[1];
+            size_t i = (size_t)m * N + n;
+            C[i] = float_to_bf16(bf16_to_float(C[i]) * scale[m] -
+                                 bf16_to_float(corr[i]));
+        });
+    });
+    launchprof::record("w4a8_scale_sub");
 }
 
 // oneDNN s8 x s4 -> bf16 GEMM, per-tensor src scale (1.0) + per-group weight
@@ -581,17 +677,62 @@ inline void matmul_int4_s8x4_gemm(const int8_t* A, int M, int K,
     launchprof::record("w4a8_s8x4_gemm");
 }
 
-// Full W4A8 GEMM: quantize A per-token -> s8, run s8 x s4, post-scale rows.
-// Drop-in replacement for matmul_int4_gemm (same (A, W, C) contract).
+// Shared W4A8 core: A_s8 (M,K) x W s4 -> C, per-token act scale applied, then
+// the asymmetric-zp correction subtracted. The correction uses the quantized A
+// (scale * sum(A_s8)) so it cancels the same zp term the s8 GEMM produced.
+inline void matmul_int4_w4a8_core(const int8_t* A_s8, const float* scale, int M,
+                                  int K, const Int4Linear& W, bf16* C,
+                                  GpuEngine& ctx, bf16* rowsum_scaled_scratch,
+                                  bf16* corr_scratch) {
+    int N = W.out_features;
+    matmul_int4_s8x4_gemm(A_s8, M, K, W, C, ctx);
+    if (W.has_zp()) {
+        int G = K / W.group_size;
+        GpuBuffer<bf16> rowsum_heap, corr_heap;
+        bf16* rs = int4_zp_scratch() ? rowsum_scaled_scratch : nullptr;
+        if (!rs) {
+            rowsum_heap = GpuBuffer<bf16>((size_t)M * G, ctx.queue);
+            rs = rowsum_heap.data();
+        }
+        int4_rowsum_s8_scaled(A_s8, scale, M, K, W.group_size, rs, ctx.queue);
+        bf16* cr = int4_zp_scratch() ? corr_scratch : nullptr;
+        if (!cr) {
+            corr_heap = GpuBuffer<bf16>((size_t)M * N, ctx.queue);
+            cr = corr_heap.data();
+        }
+        matmul_bf16_nn(rs, M, G, W.zp_offset.data(), N, cr, ctx);
+        scale_rows_sub(C, scale, cr, M, N, ctx.queue);
+    } else {
+        scale_rows(C, scale, M, N, ctx.queue);
+    }
+}
+
+// Full W4A8 GEMM (unfused producer): quantize A per-token -> s8, run s8 x s4,
+// post-scale rows, subtract the zp correction. Drop-in replacement for
+// matmul_int4_gemm (same (A, W, C) contract).
 inline void matmul_int4_w4a8(const bf16* A, int M, int K, const Int4Linear& W,
-                             bf16* C, GpuEngine& ctx = GpuEngine::get(0)) {
+                             bf16* C, GpuEngine& ctx = GpuEngine::get(0),
+                             bf16* rowsum_scaled_scratch = nullptr,
+                             bf16* corr_scratch = nullptr) {
     static GpuBuffer<int8_t> a_s8;
     static GpuBuffer<float> a_scale;
     if (a_s8.count() < (size_t)M * K) a_s8 = GpuBuffer<int8_t>((size_t)M * K, ctx.queue);
     if (a_scale.count() < (size_t)M) a_scale = GpuBuffer<float>((size_t)M, ctx.queue);
     act_quant_s8_s8(A, a_s8.data(), a_scale.data(), M, K, ctx.queue);
-    matmul_int4_s8x4_gemm(a_s8.data(), M, K, W, C, ctx);
-    scale_rows(C, a_scale.data(), M, W.out_features, ctx.queue);
+    matmul_int4_w4a8_core(a_s8.data(), a_scale.data(), M, K, W, C, ctx,
+                          rowsum_scaled_scratch, corr_scratch);
+}
+
+// Full W4A8 GEMM (fused producer): consumes a pre-quantized s8 activation and
+// its per-token scale directly — no act-quant pass. Same post-GEMM contract as
+// matmul_int4_w4a8 (gemm + scale_rows + zp corr).
+inline void matmul_int4_w4a8_fused(const int8_t* A_s8, const float* scale, int M,
+                                   int K, const Int4Linear& W, bf16* C,
+                                   GpuEngine& ctx = GpuEngine::get(0),
+                                   bf16* rowsum_scaled_scratch = nullptr,
+                                   bf16* corr_scratch = nullptr) {
+    matmul_int4_w4a8_core(A_s8, scale, M, K, W, C, ctx,
+                          rowsum_scaled_scratch, corr_scratch);
 }
 
 // s4 GEMM + rowsum + corr GEMM into corr_out (caller-owned M*N). The caller
@@ -643,32 +784,36 @@ inline void matmul_int4(
 
     auto run = [&](const bf16* A_in, bf16* C_out) {
         if (int4_w4a8_enabled()) {
-            matmul_int4_w4a8(A_in, M, K, W, C_out, ctx);
-        } else {
-            using dt = dnnl::memory::data_type;
-            using tag = dnnl::memory::format_tag;
-            auto src_md = dnnl::memory::desc({M, K}, dt::bf16, tag::ab);
-            auto dst_md = dnnl::memory::desc({M, N}, dt::bf16, tag::ab);
-            auto wscale_md = dnnl::memory::desc({G, N}, dt::bf16, tag::ab);
-
-            auto& entry = int4_matmul_entry(ctx, M, K, N, W.group_size);
-            const uint8_t* weight_data = int4_weight_data(W, entry.weights_md, K, N, ctx);
-
-            entry.primitive.execute(ctx.stream, {
-                {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
-                    src_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
-                    const_cast<bf16*>(A_in))},
-                {DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
-                    entry.weights_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
-                    const_cast<uint8_t*>(weight_data))},
-                {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
-                    wscale_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
-                    const_cast<bf16*>(W.weight_scale.data()))},
-                {DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
-                    dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C_out)}
-            });
-            launchprof::record("int4_gemm");
+            // The W4A8 path owns its own corr (quantized-A rowsum), so the bf16
+            // corr block below must not run for it.
+            matmul_int4_w4a8(A_in, M, K, W, C_out, ctx, rowsum_scratch,
+                             corr_scratch);
+            return;
         }
+
+        using dt = dnnl::memory::data_type;
+        using tag = dnnl::memory::format_tag;
+        auto src_md = dnnl::memory::desc({M, K}, dt::bf16, tag::ab);
+        auto dst_md = dnnl::memory::desc({M, N}, dt::bf16, tag::ab);
+        auto wscale_md = dnnl::memory::desc({G, N}, dt::bf16, tag::ab);
+
+        auto& entry = int4_matmul_entry(ctx, M, K, N, W.group_size);
+        const uint8_t* weight_data = int4_weight_data(W, entry.weights_md, K, N, ctx);
+
+        entry.primitive.execute(ctx.stream, {
+            {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
+                src_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+                const_cast<bf16*>(A_in))},
+            {DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+                entry.weights_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+                const_cast<uint8_t*>(weight_data))},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+                wscale_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+                const_cast<bf16*>(W.weight_scale.data()))},
+            {DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
+                dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C_out)}
+        });
+        launchprof::record("int4_gemm");
 
         if (W.has_zp()) {
             // True dequant is w = scale * (q_u - zp_u); the s4 GEMM above computed

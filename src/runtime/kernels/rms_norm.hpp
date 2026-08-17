@@ -56,6 +56,80 @@ inline void rms_norm_no_scale(
 }
 
 // ---------------------------------------------------------------------------
+// Fused act-quant RMSNorm: computes the bf16 RMSNorm output in-register, then
+// quantizes it per-token to s8 (absmax/127) instead of writing bf16. Bit-exact
+// vs rms_norm + act_quant_s8_s8: the absmax is taken over the bf16-rounded
+// v_norm exactly as the standalone quantizer would observe it.
+// ---------------------------------------------------------------------------
+inline void rms_norm_q(
+    sycl::queue& q,
+    const bf16* x,
+    const bf16* weight,   // (H,) — may be nullptr
+    bf16* out_bf16,       // (seq_len, H) — may be nullptr (skip the bf16 write)
+    int8_t* out_s8,       // (seq_len, H) quantized output
+    float* out_scale,     // (seq_len,) per-token f32 scale (absmax/127)
+    int seq_len, int H, float eps
+) {
+    size_t local_size = std::min(256, H);
+    while (local_size & (local_size - 1)) local_size--;
+
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lmem(local_size, h);
+        bool has_weight = (weight != nullptr);
+
+        h.parallel_for(
+            sycl::nd_range<1>((size_t)seq_len * local_size, local_size),
+            [=](sycl::nd_item<1> it) {
+                int tok = it.get_group(0);
+                int lid = it.get_local_id(0);
+                int lsz = it.get_local_range(0);
+                const bf16* xrow = x + (size_t)tok * H;
+                int8_t*       orow = out_s8 + (size_t)tok * H;
+                bf16*         brow = out_bf16 ? out_bf16 + (size_t)tok * H : nullptr;
+
+                float ss = 0.0f;
+                for (int d = lid; d < H; d += lsz) {
+                    float v = bf16_to_float(xrow[d]);
+                    ss += v * v;
+                }
+                lmem[lid] = ss;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz >> 1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] += lmem[lid + s];
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float rms_inv = sycl::rsqrt(lmem[0] / float(H) + eps);
+
+                float amax = 0.0f;
+                for (int d = lid; d < H; d += lsz) {
+                    float v = bf16_to_float(xrow[d]) * rms_inv;
+                    if (has_weight) v *= bf16_to_float(weight[d]);
+                    v = bf16_to_float(float_to_bf16(v));
+                    amax = sycl::fmax(amax, sycl::fabs(v));
+                }
+                lmem[lid] = amax;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int s = lsz >> 1; s > 0; s >>= 1) {
+                    if (lid < s) lmem[lid] = sycl::fmax(lmem[lid], lmem[lid + s]);
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                float scale = lmem[0] > 0.0f ? lmem[0] / 127.0f : 1.0f;
+                if (lid == 0) out_scale[tok] = scale;
+
+                for (int d = lid; d < H; d += lsz) {
+                    float v = bf16_to_float(xrow[d]) * rms_inv;
+                    if (has_weight) v *= bf16_to_float(weight[d]);
+                    bf16 vbf = float_to_bf16(v);
+                    if (brow) brow[d] = vbf;
+                    float qv = sycl::round(bf16_to_float(vbf) / scale);
+                    qv = sycl::fmin(sycl::fmax(qv, -127.0f), 127.0f);
+                    orow[d] = (int8_t)qv;
+                }
+            });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Fused: residual[row] += rms_norm(x[row], w1)
 //        out[row]       = rms_norm(residual[row], w2)
 //
