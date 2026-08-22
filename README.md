@@ -110,6 +110,11 @@ curl http://127.0.0.1:7461/v1/chat/completions \
   -d '{"model":"diffusiongemma-26B-A4B-it-NVFP4","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":1000,"stream":true,"arcaine_stream_drafts":true}'
 ```
 
+```
+ZE_AFFINITY_MASK=0 ./build/arcaine_server --model models/cyankiwi_Qwen-AgentWorld-35B-A3B-AWQ-INT4 --served-model-name agent-world --host 0.0.
+0.0 --port 7461 --max-seq 64000 --max-tokens 16384
+```
+
 Streaming uses OpenAI-style append-only content deltas. Add
 `"arcaine_stream_drafts":true` to receive custom `arcaine.diffusion_step` SSE
 events with the mutable denoising canvas text.
