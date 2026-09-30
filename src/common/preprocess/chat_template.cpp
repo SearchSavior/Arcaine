@@ -6,8 +6,11 @@
 
 #include <fstream>
 #include <iterator>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace {
@@ -69,6 +72,30 @@ TokenizerMetadata load_tokenizer_metadata(const std::string& model_dir) {
     return meta;
 }
 
+// Parse the chat template once per model directory. The minja constructor
+// parses the Jinja source and probes template capabilities (~200 ms); apply()
+// is ~0.1 ms. The parsed template is immutable and apply() is const, so one
+// instance is cached per model_dir and shared across renders and threads (the
+// structured-read compiler renders twice per question, so this cost was paid
+// 2N times per request before).
+struct CachedChatTemplate {
+    std::shared_ptr<const minja::chat_template> tmpl;
+    TokenizerMetadata meta;
+};
+
+const CachedChatTemplate& cached_chat_template(const std::string& model_dir) {
+    static std::mutex mu;
+    static std::unordered_map<std::string, CachedChatTemplate> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(model_dir);
+    if (it != cache.end()) return it->second;
+    TokenizerMetadata meta = load_tokenizer_metadata(model_dir);
+    std::string source = read_file(model_dir + "/chat_template.jinja");
+    auto tmpl = std::make_shared<minja::chat_template>(source, meta.bos_token, meta.eos_token);
+    auto res = cache.emplace(model_dir, CachedChatTemplate{std::move(tmpl), std::move(meta)});
+    return res.first->second;
+}
+
 void replace_one(std::string& text, const std::string& needle, const std::string& replacement) {
     size_t pos = text.find(needle);
     if (pos == std::string::npos)
@@ -93,10 +120,8 @@ PromptBuildResult render_chat_prompt(
     bool enable_thinking,
     json chat_template_kwargs = json::object()
 ) {
-    const TokenizerMetadata meta = load_tokenizer_metadata(model_dir);
-    const std::string source = read_file(model_dir + "/chat_template.jinja");
-
-    minja::chat_template tmpl(source, meta.bos_token, meta.eos_token);
+    const CachedChatTemplate& cached = cached_chat_template(model_dir);
+    const TokenizerMetadata& meta = cached.meta;
     minja::chat_template_inputs inputs;
     inputs.messages = std::move(messages);
     inputs.tools = std::move(tools);
@@ -109,7 +134,7 @@ PromptBuildResult render_chat_prompt(
             extra_context[key] = value;
     inputs.extra_context = std::move(extra_context);
 
-    std::string rendered = tmpl.apply(inputs);
+    std::string rendered = cached.tmpl->apply(inputs);
 
     if (!meta.image_token.empty()) {
         for (int count : image_token_counts) {
@@ -209,15 +234,13 @@ std::string build_chat_prompt_text(
         rendered_messages.push_back({{"role", message.role},
                                      {"content", message.content}});
     }
-    const TokenizerMetadata meta = load_tokenizer_metadata(model_dir);
-    const std::string source = read_file(model_dir + "/chat_template.jinja");
-    minja::chat_template tmpl(source, meta.bos_token, meta.eos_token);
+    const CachedChatTemplate& cached = cached_chat_template(model_dir);
     minja::chat_template_inputs inputs;
     inputs.messages = std::move(rendered_messages);
     inputs.tools = json::array();
     inputs.add_generation_prompt = add_generation_prompt;
     inputs.extra_context = {{"enable_thinking", enable_thinking}};
-    return tmpl.apply(inputs);
+    return cached.tmpl->apply(inputs);
 }
 
 PromptBuildResult build_chat_prompt_json(
