@@ -17,9 +17,11 @@ live.  This script verifies that:
      eager policy bypasses capture (meaningful with DIFF_NVFP4_SYCL_GRAPH=1);
   4. an ordinary chat request still works afterwards.
 
-Pass --graph-mode when the server runs with DIFF_NVFP4_SYCL_GRAPH=1.  The chat
-check is then skipped: chat under that experimental graph mode fails in the
-current tree independently of this feature (verified on the base commit).
+Pass --fault to match the server's ARCAINE_SYSTEMONE_FAULT setting (default:
+in_decode_layer). The first response must identify that exact injection point.
+Pass --graph-mode when the server runs with DIFF_NVFP4_SYCL_GRAPH=1. The chat
+check is then skipped. A chat failure was reported on the original feature's
+base tree; this skip does not establish chat behavior on the current port.
 
 Usage: python3 scripts/test_systemone_recovery.py --base http://127.0.0.1:7461 --key local
 """
@@ -58,6 +60,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:7461")
     ap.add_argument("--key", default="local")
+    fault_messages = {
+        "after_prefill": "read_decisions: injected fault after prefill (test hook)",
+        "in_decode_layer": "read_decisions: injected fault inside decode (test hook)",
+        "after_first_decode_submit": "read_decisions: injected fault after decode submission (test hook)",
+    }
+    ap.add_argument("--fault", choices=tuple(fault_messages), default="in_decode_layer",
+                    help="must match the fresh server's ARCAINE_SYSTEMONE_FAULT setting")
     ap.add_argument("--graph-mode", action="store_true",
                     help="server runs with DIFF_NVFP4_SYCL_GRAPH=1; skip the chat check")
     args = ap.parse_args()
@@ -76,7 +85,12 @@ def main():
     }
 
     st1, b1 = request(args.base, "/v1/systemone", body, args.key)
-    check("fault injection: first structured request fails cleanly (500)", st1 == 500,
+    error = b1.get("error", {}) if isinstance(b1, dict) else {}
+    check("fault injection: first structured request reports the expected fault (500)",
+          st1 == 500 and isinstance(error, dict)
+          and error.get("message") == fault_messages[args.fault]
+          and error.get("type") == "server_error"
+          and error.get("code") == "internal_error",
           f"got {st1}: {str(b1)[:200]}")
 
     st2, b2 = request(args.base, "/v1/systemone", body, args.key)
@@ -89,8 +103,7 @@ def main():
               json.dumps(ext))
 
     if args.graph_mode:
-        print("[SKIP] chat under DIFF_NVFP4_SYCL_GRAPH=1 fails independently of "
-              "this feature (verified on the base commit)")
+        print("[SKIP] graph-mode chat; current-port behavior is not checked by this leg")
     else:
         st3, b3 = request(args.base, "/v1/chat/completions",
                           {"model": model,

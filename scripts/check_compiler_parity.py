@@ -11,10 +11,10 @@ Build the exporter in the container (once):
 
   docker exec arcaine-dev-1 sh -c 'cd /workspace && icpx -fsycl -O2 \\
       -fsycl-targets=intel_gpu_bmg_g31 \\
-      src/modeling/diffusion_gemma/benchmarks/decision_compile_export.cpp \\
+      src/bench/decision_compile_export.cpp \\
       src/utils/decision_schema.cpp src/utils/chat.cpp \\
-      src/preprocessing/tokenizer.cpp src/preprocessing/unicode.cpp \\
-      src/preprocessing/unicode-data.cpp src/preprocessing/chat_template.cpp \\
+      src/common/preprocess/tokenizer.cpp src/common/preprocess/unicode.cpp \\
+      src/common/preprocess/unicode-data.cpp src/common/preprocess/chat_template.cpp \\
       -I src -I third_party -I third_party/minja/include -I/opt/onednn/include \\
       -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate \\
       -o /tmp/decision_compile_export'

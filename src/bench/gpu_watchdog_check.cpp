@@ -5,9 +5,9 @@
 //
 // Build and run the test in the arcaine-dev-1 container:
 //   docker exec arcaine-dev-1 sh -c 'cd /workspace && icpx -O2 -pthread \
-//     src/modeling/diffusion_gemma/benchmarks/gpu_watchdog_check.cpp \
+//     src/bench/gpu_watchdog_check.cpp \
 //     -o /tmp/gpu_watchdog_check && /tmp/gpu_watchdog_check'
-#include "../../../common/gpu/gpu_watchdog.hpp"
+#include "../common/gpu/gpu_watchdog.hpp"
 
 #include <chrono>
 #include <cstdio>

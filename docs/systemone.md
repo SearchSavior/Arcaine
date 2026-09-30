@@ -198,7 +198,7 @@ the response's `model` always reports the actual local model.
   driver), `src/modeling/diffusion_gemma/fusions/logits.hpp`
   (`slot_score_rows`), `src/modeling/diffusion_gemma/model.{hpp,cpp}`
   (`read_decisions`, structured `decode_forward` mode),
-  `src/apps/server/routes/systemone.cpp` (route).
+  `src/arcaine_server.cpp` (route and decision-lab web mount).
 - The decoder processes all canvas positions bidirectionally; only the final
   scoring reads the slot row. There is no autoregressive position shift and
   no EOS truncation of scored positions.

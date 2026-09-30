@@ -6,6 +6,7 @@ observable over HTTP: response shapes, validation errors (422), model-name
 handling (404), auth (401), determinism, and question isolation.
 
 Usage: python3 scripts/test_systemone.py [--base http://127.0.0.1:7461] [--key local]
+For a server loaded with a non-diffusion model, add --expect-unsupported-backend.
 """
 import argparse
 import concurrent.futures
@@ -100,6 +101,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:7461")
     ap.add_argument("--key", default="local")
+    ap.add_argument("--expect-unsupported-backend", action="store_true",
+                    help="check backend rejection on a server loaded with a non-diffusion model")
     args = ap.parse_args()
     base, key = args.base, args.key
 
@@ -111,6 +114,28 @@ def main():
     model = models["data"][0]["id"]
     print("served model:", model)
     GOLDEN["model"] = model
+
+    if args.expect_unsupported_backend:
+        st, hdr, body = post(base, "/v1/systemone", GOLDEN, key)
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        check("non-diffusion backend -> 422 unsupported_backend",
+              st == 422 and isinstance(error, dict)
+              and error.get("code") == "unsupported_backend"
+              and error.get("type") == "invalid_request_error",
+              f"got {st}: {body}")
+        check("unsupported backend: confidence and compatibility headers",
+              hdr.get("X-Arcaine-Confidence-Method") == "normalized-entropy-v1"
+              and hdr.get("X-Arcaine-Compatibility") == "jev-format-approximate-confidence")
+        st, _, body = post(base, "/v1/systemone", GOLDEN, key="wrong")
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        check("unsupported backend: auth precedes backend rejection",
+              st == 401 and isinstance(error, dict)
+              and error.get("code") == "invalid_api_key", f"got {st}: {body}")
+        if FAILURES:
+            print(f"{len(FAILURES)} FAILURES:", *FAILURES, sep="\n  - ")
+            sys.exit(1)
+        print("unsupported-backend checks passed")
+        return
 
     # --- golden request -----------------------------------------------------
     st, hdr, body = post(base, "/v1/systemone", GOLDEN, key)

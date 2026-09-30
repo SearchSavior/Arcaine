@@ -4,7 +4,59 @@ Requirement-to-evidence record for `/v1/systemone`. It separates implemented,
 executed, and incomplete checks, and gives reproduction commands. The endpoint
 reference is [systemone.md](systemone.md).
 
-## Environment
+## Current main port
+
+Live verification of the port on `main` (`c5cf2b4`, port commit `82a6f09`),
+executed 2026-09-30. The historical sections below were produced on the former
+`arch-refactor` branch (feature head `54ef4e9`) and are retained as provenance.
+
+| Item | Value |
+|---|---|
+| Checkpoint | `diffusiongemma-26B-A4B-it-AWQ-INT4`; non-diffusion leg `gemma-4-12B-it` (`gemma4_unified`) |
+| GPU | Intel Battlemage G31, one device (`ONEAPI_DEVICE_SELECTOR=level_zero:0`) |
+| Toolchain | oneAPI DPC++/C++ 2026.1.0 (`icpx`) |
+| Build | `cmake -B build/systemone-review -G Ninja -DCMAKE_CXX_COMPILER=icpx -DARCAINE_SYCL_TARGETS=` |
+| Server | `ARCAINE_API_KEY=local ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/systemone-review/arcaine_server --model models/diffusiongemma-26B-A4B-it-AWQ-INT4 --served-model-name arcaine-diffusiongemma --host 127.0.0.1 --port 7461 --max-seq 8192` |
+| Host Python | 3.14.7, `transformers` 5.5.0, `tokenizers` 0.22.2 |
+
+Build is JIT: this image has no `ocloc`, so an AOT device link
+(`-fsycl-targets=intel_gpu_bmg_g31`) is unavailable. All eight default targets
+link: `arcaine_server`, `gemma4`, `diffusion_gemma`, `diffusion_bench`,
+`arcaine_mbench`, `arcaine_kbench`, `test_chat_template_kwargs`,
+`get_device_props`.
+
+Executed on the current port:
+
+- HTTP acceptance: `test_systemone.py` 37/37 pass — shapes, confidence and
+  compatibility headers, usage, determinism, question isolation, validation
+  (duplicate key/control field/unknown model/bad auth/missing state/unknown
+  type), Choice 26/27/128/255 and 256 rejection, Score 10/11, Unicode,
+  diagnostics, lifecycle 1 prefill + N decode, graph bypass 0/0, concurrency,
+  chat still works.
+- Web assets: `GET /`, `/app.js`, `/style.css` return 200 with `text/html`,
+  `text/javascript`, `text/css`. Interactive browser use was not exercised.
+- Error contracts: 401 (`invalid_api_key`), 404 (`model_not_found`), and 422
+  (`validation_error`) return JSON error bodies and both SystemOne headers.
+- Recovery: `test_systemone_recovery.py` with `--fault` at `in_decode_layer`,
+  `after_prefill`, and `after_first_decode_submit` — 4/4 each (exact injected
+  fault as HTTP 500, next read 200, graph bypass 0/0, chat 200). Graph-mode leg
+  (`DIFF_NVFP4_SYCL_GRAPH=1`, `--graph-mode`) 4/4 with 0 captures / 0 replays
+  after recovery; its chat check is skipped by design, so current-port
+  graph-mode chat is not asserted.
+- Unsupported backend: against `gemma-4-12B-it` on port 7462,
+  `test_systemone.py --expect-unsupported-backend` 3/3 — 422
+  `unsupported_backend` with both headers, and 401 precedes backend rejection.
+- GPU watchdog harness (`src/bench/gpu_watchdog_check.cpp`): 3/3 — disabled
+  watchdog and healthy beats do not exit; a stalled heartbeat exits 70.
+- Compiler parity (`check_compiler_parity.py`): 30/30 artifact comparisons
+  matched, exit 0.
+
+Not executed on the current port (historical evidence only, or gated): SDK,
+behavior, performance, and the scaffold/hash/validation/slot-score native
+checks; canvas widths 17/32/64; graph-mode chat; cross-engine and confidence
+parity. These remain as noted in the historical sections.
+
+## Historical environment
 
 | Item | Value |
 |---|---|
@@ -19,11 +71,12 @@ reference is [systemone.md](systemone.md).
 | Build | `cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx -DARCAINE_SYCL_TARGETS=intel_gpu_bmg_g31 && cmake --build build --target arcaine_server -j4` |
 | Server | `ARCAINE_API_KEY=local ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/arcaine_server --model <ckpt> --served-model-name arcaine-diffusiongemma --host 0.0.0.0 --port 7461 --max-seq 8192` |
 
-## Requirement-to-evidence table
+## Historical requirement-to-evidence table
 
 | Spec area | Implementation | Fixture / harness | Executed evidence | Status |
 |---|---|---|---|---|
-| §2 public endpoint, auth, unsupported backend | `systemone.cpp` | `test_systemone.py` | 401/404/422/200 cases pass | Executed |
+| §2 public endpoint, auth | `src/arcaine_server.cpp` (ported route) | `test_systemone.py` | 401/404/422/200 cases reported on original feature tree | Historical execution |
+| §2 unsupported backend | `src/arcaine_server.cpp` | `test_systemone.py --expect-unsupported-backend` | original harness did not cover this case; new mode awaits live verification | Not executed |
 | §2 response shape, confidence headers, usage | `decision_schema.cpp` | `test_systemone.py`, `check_sdk_compat.py` | shape/header/usage checks pass; SDK parses | Executed |
 | §2 SDK request construction | `check_sdk_compat.py` | official `TypeSafeClient` | SDK 0.7.0 request + response pass, structured legend values preserved | Executed |
 | §3 compile, label codebook 2–255 | `decision_schema.cpp` | `systemone_compile_cases.json`, `decision_compile_export.cpp`, `check_compiler_parity.py` | 30 exact prompt/canvas/slot/label comparisons; Choice 2/26/27/128/255, Score 2/10, Noul, Unicode, structured | Executed |
@@ -39,7 +92,7 @@ reference is [systemone.md](systemone.md).
 | §7.5 behavior | `decision_schema.cpp` | `eval_systemone_behavior.py` | accuracy/Brier/coverage/repeatability, 1 and 4 reads | Executed (small labeled set) |
 | §7.7 performance | benchmark harness | `benchmark_systemone.py` | prompt sweep, reads 1 and 4, measured tokens | Executed |
 
-## Measured results
+## Historical measured results
 
 ### Compiler/tokenizer parity (`check_compiler_parity.py`)
 
@@ -163,8 +216,11 @@ ARCAINE_API_KEY=local ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/arcaine_server
 
 # HTTP acceptance
 python3 scripts/test_systemone.py --base http://127.0.0.1:7461 --key local
-# Recovery (start the server with one ARCAINE_SYSTEMONE_FAULT=<point> per leg)
-python3 scripts/test_systemone_recovery.py --base http://127.0.0.1:7461 --key local
+# Recovery (fresh server with ARCAINE_SYSTEMONE_FAULT=in_decode_layer)
+python3 scripts/test_systemone_recovery.py --base http://127.0.0.1:7461 --key local --fault in_decode_layer
+# For each other fault point, restart with that setting and pass matching --fault.
+# Non-diffusion backend (separate server loaded with a non-diffusion model)
+python3 scripts/test_systemone.py --base http://127.0.0.1:7462 --key local --expect-unsupported-backend
 # Behavior (server read policy 1, then ARCAINE_SYSTEMONE_READS=4)
 python3 scripts/eval_systemone_behavior.py --base http://127.0.0.1:7461 --key local --ordinary
 # Performance
@@ -172,7 +228,7 @@ python3 scripts/benchmark_systemone.py -p 512,1024,2048,4096 --iters 5 --warmup 
 
 # Native harnesses (build in the container)
 docker exec arcaine-dev-1 sh -c 'cd /workspace && icpx -fsycl -O2 -fsycl-targets=intel_gpu_bmg_g31 \
-  src/modeling/diffusion_gemma/benchmarks/<harness>.cpp <sources> -I src -I third_party \
+  src/bench/<harness>.cpp <sources> -I src -I third_party \
   -I third_party/minja/include -I/opt/onednn/include \
   -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate -o /tmp/<harness>'
 
@@ -188,7 +244,7 @@ python3 scripts/check_scaffold_cases.py --model /home/dwmcqueen/models/diffusion
 /tmp/opencode/sdkvenv/bin/python3 scripts/check_sdk_compat.py --base http://127.0.0.1:7461 --key local
 ```
 
-## Incomplete gates
+## Historical incomplete gates
 
 - **Canvas-width execution 17/32/64.** The compiled canvas width is fixed by
   the answer template (16 here), not by a request field. Executing arbitrary
@@ -204,8 +260,9 @@ python3 scripts/check_scaffold_cases.py --model /home/dwmcqueen/models/diffusion
   capturing on-device canvas inputs per read and showing only the registered
   slot changes was not instrumented.
 - **Mixed graph-mode chat.** Chat under the experimental
-  `DIFF_NVFP4_SYCL_GRAPH=1` fails in this tree independently of this feature
-  (reproduced on the base commit); structured reads bypass capture (0/0).
+  `DIFF_NVFP4_SYCL_GRAPH=1` was reported to fail on the original feature's base
+  commit independently of the feature; this has not been reproduced on the
+  current main port. Historical structured reads bypassed capture (0/0).
 - **Cross-engine parity.** No pinned-vLLM comparison; equivalent
   hardware/checkpoint unavailable. Unverified.
 - **Confidence parity.** `normalized-entropy-v1` approximation, not exact Jev.
