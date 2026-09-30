@@ -183,12 +183,41 @@ PromptBuildResult build_chat_prompt(
     for (const ChatTemplateMessage& message : messages) {
         if (message.role.empty())
             throw std::runtime_error("chat message role cannot be empty");
-        json content = json::array({{{"type", "text"}, {"text", message.content}}});
-        rendered_messages.push_back({{"role", message.role}, {"content", content}});
+        // Pass plain text as a string. A single-element content-parts array
+        // takes the template's sequence branch, which appends a trailing space
+        // after the system content and diverges from the checkpoint renderer.
+        rendered_messages.push_back({{"role", message.role},
+                                     {"content", message.content}});
     }
 
     return render_chat_prompt(model_dir, std::move(rendered_messages), json::array(),
                               {}, {}, add_generation_prompt, enable_thinking);
+}
+
+std::string build_chat_prompt_text(
+    const std::string& model_dir,
+    const std::vector<ChatTemplateMessage>& messages,
+    bool add_generation_prompt,
+    bool enable_thinking
+) {
+    if (messages.empty())
+        throw std::runtime_error("chat prompt needs at least one message");
+    json rendered_messages = json::array();
+    for (const ChatTemplateMessage& message : messages) {
+        if (message.role.empty())
+            throw std::runtime_error("chat message role cannot be empty");
+        rendered_messages.push_back({{"role", message.role},
+                                     {"content", message.content}});
+    }
+    const TokenizerMetadata meta = load_tokenizer_metadata(model_dir);
+    const std::string source = read_file(model_dir + "/chat_template.jinja");
+    minja::chat_template tmpl(source, meta.bos_token, meta.eos_token);
+    minja::chat_template_inputs inputs;
+    inputs.messages = std::move(rendered_messages);
+    inputs.tools = json::array();
+    inputs.add_generation_prompt = add_generation_prompt;
+    inputs.extra_context = {{"enable_thinking", enable_thinking}};
+    return tmpl.apply(inputs);
 }
 
 PromptBuildResult build_chat_prompt_json(

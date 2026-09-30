@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="description" content="Typed decision readouts from the DiffusionGemma backend on this server. No WebGPU, no model download." />
+    <title>Arcaine SemIf — server decisions, no WebGPU</title>
+    <link rel="stylesheet" href="style.css?v=2" />
+  </head>
+  <body>
+    <main class="page">
+      <aside class="research-notice" role="note"><strong>Server-backed lab.</strong> Modeled on SemIf/OpenJev's browser lab, but every decision is computed by this server's DiffusionGemma backend — no WebGPU, no model download, nothing runs in your browser. Not affiliated with or endorsed by TypeSafe.</aside>
+      <header class="mast">
+        <a class="brand" href="./">SemIf</a>
+        <div class="mast-actions">
+          <span class="tagline">Semantic ifs, read from a server-side diffusion model.</span>
+          <span id="host-note"></span>
+        </div>
+      </header>
+
+      <section class="hero">
+        <p class="eyebrow">A live, local experiment</p>
+        <h1>Decision model <mark>on your server.</mark></h1>
+        <p class="lede">A server-side DiffusionGemma reads a probability for each of your allowed options in a single denoising pass, and returns the distribution — no token-by-token decoding, no WebGPU, no weights leaving the machine it runs on. Type a decision and measure the read.</p>
+        <div class="truth-strip">
+          <span>server backend</span><span>no WebGPU</span><span>no model download</span><span>your timings</span><span id="model-size">model on this machine</span>
+        </div>
+        <p id="device-note" class="device-note">Any device on your network can use this page — the browser only edits text and renders bars.</p>
+      </section>
+
+      <section class="machine" aria-labelledby="setup-title">
+        <div class="section-head">
+          <div><p class="eyebrow">00 / setup</p><h2 id="setup-title">Connect to the server</h2></div>
+          <div class="setup-actions">
+            <label for="key">API key (enter <code>local</code> for the sample server)
+              <input id="key" type="password" autocomplete="off" placeholder="local" />
+            </label>
+            <button id="load" type="button"><span class="icon" aria-hidden="true">&#8635;</span> connect</button>
+          </div>
+        </div>
+        <div id="support"><p class="support" role="status"><span class="icon" aria-hidden="true">&#9679;</span><span id="support-text">Checking the server…</span></p></div>
+        <div class="phases" aria-label="Connection phases">
+          <div class="phase"><small>server / model</small><strong id="model-value">—</strong><span id="model-detail">GET /v1/models</span></div>
+          <div class="phase"><small>read policy</small><strong id="policy-value">—</strong><span>reads per question, from deployment settings</span></div>
+          <div class="phase"><small>last run</small><strong id="last-value">—</strong><span>most recent decision round-trip</span></div>
+        </div>
+        <p class="fine">Weights live on the server; nothing is downloaded to this page. The read policy is set by the server operator (ARCAINE_SYSTEMONE_*), not by this page.</p>
+      </section>
+
+      <section class="workbench" aria-labelledby="workbench-title">
+        <div class="section-head">
+          <div><p class="eyebrow">01 / decision</p><h2 id="workbench-title">Give it a real choice</h2></div>
+          <button id="run" type="button" disabled><span class="icon" aria-hidden="true">&#9654;</span> run decision</button>
+        </div>
+
+        <div class="presets" aria-label="Prefill an example">
+          <span>Try an example</span>
+          <button type="button" data-preset="account">Account support</button>
+          <button type="button" data-preset="email">Email triage</button>
+          <button type="button" data-preset="incident">Incident triage</button>
+        </div>
+
+        <div class="inputs">
+          <label>State<textarea id="state" rows="5">A customer says a password reset succeeded, but every login attempt still returns “account locked”. Two unlock emails were requested and neither arrived.</textarea></label>
+          <label>Question<input id="question" value="Which queue should handle this request?" /></label>
+          <fieldset><legend>Allowed options</legend>
+            <div id="option-list">
+              <label class="option-row"><b>A</b><input class="option" value="Account access support" /></label>
+              <label class="option-row"><b>B</b><input class="option" value="Billing support" /></label>
+              <label class="option-row"><b>C</b><input class="option" value="Close as resolved" /></label>
+            </div>
+            <div class="option-actions">
+              <button id="remove-option" type="button"><span class="icon" aria-hidden="true">&minus;</span> remove</button>
+              <span id="option-count">3 / 255</span>
+              <button id="add-option" type="button"><span class="icon" aria-hidden="true">+</span> add</button>
+            </div>
+          </fieldset>
+        </div>
+
+        <div class="qtypes" aria-label="Question type">
+          <span>question type</span>
+          <button type="button" data-qtype="choice" class="selected">choice (pick one)</button>
+          <button type="button" data-qtype="noul">noul (yes/no)</button>
+          <button type="button" data-qtype="score">score (rate 0…N)</button>
+        </div>
+        <p class="fine" id="type-note">Every option becomes one answer slot the model scores against the full vocabulary; probabilities are normalized only across the options you supplied.</p>
+      </section>
+
+      <section class="method-map" aria-label="The decision path">
+        <div class="method-input"><small>your decision</small><strong>state + question + options</strong></div>
+        <div class="arrow" aria-hidden="true">&#8594;</div>
+        <div class="method-model"><small>server model</small><strong id="selected-model">—</strong></div>
+        <div class="arrow" aria-hidden="true">&#8594;</div>
+        <div class="method-outputs">
+          <div><small>one denoising pass</small><strong>answer slot scored</strong></div>
+          <div><small>returned</small><strong>label probabilities + confidence</strong></div>
+        </div>
+      </section>
+
+      <section class="race" aria-label="Decision results">
+        <article class="lane readout">
+          <div class="lane-head"><div><p class="eyebrow">02 / server readout</p><h2 id="lane-title">Choice probabilities</h2></div><span class="badge">no decoding</span></div>
+          <p class="explain" id="lane-explain">The server scores your options in one pass and normalizes only across them. No text is generated.</p>
+          <div id="direct-output" class="output empty">waiting for a run</div>
+          <dl class="metrics">
+            <div><dt>total</dt><dd id="direct-total">—</dd></div>
+            <div><dt>input</dt><dd id="direct-input">—</dd></div>
+            <div><dt>reads</dt><dd id="direct-readouts">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="lane gen">
+          <div class="lane-head"><div><p class="eyebrow">03 / server timing</p><h2>Where the time goes</h2></div><span class="badge pink">synchronized</span></div>
+          <p class="explain">Prefill and decode are measured on the server with synchronized timers, then reported per question. This lane is honest accounting, not a second method.</p>
+          <div id="timing-output" class="output empty">waiting for a run</div>
+          <dl class="metrics">
+            <div><dt>prefill</dt><dd id="t-prefill">—</dd></div>
+            <div><dt>decode</dt><dd id="t-decode">—</dd></div>
+            <div><dt>confidence</dt><dd id="t-conf">—</dd></div>
+          </dl>
+        </article>
+      </section>
+
+      <section class="verdict" aria-live="polite">
+        <span>measured wall time, whole request</span><strong id="ratio">connect first</strong>
+        <p id="run-note">Timings are measured with performance.now() around the HTTP round-trip on this page. Server-side prefill/decode are reported separately above. Sequential questions; no parallel execution is claimed.</p>
+      </section>
+
+      <details>
+        <summary>What these numbers do—and do not—mean</summary>
+        <div class="details-grid">
+          <p><b>Conditional probabilities.</b> The returned distribution is normalized across your options only. It is not calibrated confidence and does not cover every answer the model might prefer.</p>
+          <p><b>Confidence is a local approximation.</b> The header <code>X-Arcaine-Confidence-Method: normalized-entropy-v1</code> marks it: <code>1 &minus; H(p)/log K</code> on the averaged distribution. It is not Jev's confidence formula.</p>
+          <p><b>One pass per read.</b> Each read is a single denoising pass over a compiled answer canvas; repeated reads average fresh-noise samples. Question IDs never enter inference.</p>
+          <p><b>Not Jev.</b> The format is Jev-compatible; the weights and internal scoring are Arcaine's DiffusionGemma backend. Hosted Jev quality and latency are not claimed.</p>
+        </div>
+      </details>
+
+      <footer><span>Arcaine / server lab</span><span><a href="https://openjev.com/" rel="noopener noreferrer">original lab (WebGPU)</a> · <span id="compat-note">jev-format · approximate confidence</span></span></footer>
+    </main>
+    <script src="app.js?v=2"></script>
+  </body>
+</html>

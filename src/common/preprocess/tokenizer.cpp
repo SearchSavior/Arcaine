@@ -74,7 +74,8 @@ Tokenizer Tokenizer::from_json(const std::string& path) {
 }
 
 // BPE encode
-std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const {
+std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos,
+                                   bool add_prefix_space) const {
     std::vector<int> ids;
     if (add_bos) {
         if (bos_id_ < 0) throw std::runtime_error("Tokenizer BOS token not found");
@@ -83,7 +84,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
 
     if (text.empty()) return ids;
 
-    bool at_text_start = true;
+    bool at_text_start = add_prefix_space;
     auto encode_span = [&](const std::string& span, std::vector<int>& out) {
         if (span.empty()) return;
 

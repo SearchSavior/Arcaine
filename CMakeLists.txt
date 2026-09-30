@@ -153,8 +153,10 @@ set(DIFFUSION_SRCS
     src/modeling/diffusion_gemma/attention.cpp
     src/modeling/diffusion_gemma/generate.cpp
     src/modeling/diffusion_gemma/model.cpp
+    src/modeling/diffusion_gemma/structured_read.cpp
     src/common/gpu/mem_planner.cpp
     src/utils/chat.cpp
+    src/utils/decision_schema.cpp
     src/utils/viz.cpp
     src/utils/profile.cpp
 )

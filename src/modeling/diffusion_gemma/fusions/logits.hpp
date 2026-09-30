@@ -2,8 +2,139 @@
 // Fused logits/sampling kernels for the DiffusionGemma hot path.
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
 #include <sycl/sycl.hpp>
 #include "../../../common/gpu/buffer.hpp"
+
+// ---------------------------------------------------------------------------
+// Structured-read scoring head (/v1/systemone).  For each requested canvas
+// row: full-vocabulary softcap softmax statistics at temperature 1 plus the
+// exact logprob of every allowed label, even labels outside the top-k.
+//   z_v   = cap * tanh(x_v / cap)        (identity when cap <= 0)
+//   L     = logsumexp_v(z_v)             (FP32 reductions)
+//   logp_v = z_v - L
+// Per row this writes: every label's logp, log-sum of the label mass, the
+// full-vocabulary entropy (nats), the global argmax id + logprob, and a
+// per-row flag set when any raw logit is NaN/infinity (checked before softcap,
+// which would otherwise map +/-inf to finite tanh values).  Only these compact
+// results leave the device; the (seq, V) logits stay in the arena.  A
+// label-only projection could not provide the vocabulary entropy or the label
+// mass, so this reads the full projection.
+// ---------------------------------------------------------------------------
+inline void slot_score_rows(
+    sycl::queue& q,
+    const bf16* logits,        // (seq, V)
+    float softcap,
+    const int32_t* rows,       // (num_rows) canvas rows to score
+    const int32_t* label_ids,  // (num_labels) allowed label token ids
+    int num_rows, int num_labels,
+    float*  label_logprobs,    // (num_rows, num_labels) out
+    float*  log_label_mass,    // (num_rows) out
+    float*  vocab_entropy,     // (num_rows) out
+    int32_t* argmax_id,        // (num_rows) out
+    float*  argmax_logprob,    // (num_rows) out
+    int32_t* nonfinite,        // (num_rows) out: 1 if any raw logit is NaN/inf
+    int V)
+{
+    constexpr int WG = 256;
+    constexpr int MAX_LABELS = 256;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sf(sycl::range<1>(WG), h);
+        sycl::local_accessor<int, 1>   si(sycl::range<1>(WG), h);
+        sycl::local_accessor<float, 1> lbl(sycl::range<1>(MAX_LABELS), h);
+        h.parallel_for(
+            sycl::nd_range<1>((size_t)num_rows * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                int i = it.get_group(0);
+                int row = rows[i];
+                int lid = it.get_local_id(0);
+                const bf16* x = logits + (size_t)row * V;
+                if (lid == 0) nonfinite[i] = 0;
+                it.barrier(sycl::access::fence_space::local_space);
+
+                auto proc = [=](int c) {
+                    float v = bf16_to_float(x[c]);
+                    return softcap > 0.0f ? sycl::tanh(v / softcap) * softcap : v;
+                };
+
+                // Pass 1: max + argmax (tie-break to the lower index).  Raw
+                // nonfinite logits are flagged here, before softcap: tanh maps
+                // +/-inf to finite values, which would otherwise hide a
+                // numerical failure from the host statistics checks.
+                float m = -3.4028235e38f; int am = 0;
+                for (int c = lid; c < V; c += WG) {
+                    float raw = bf16_to_float(x[c]);
+                    if (!sycl::isfinite(raw)) {
+                        sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                                         sycl::memory_scope::device>
+                            nf(nonfinite[i]);
+                        nf.store(1);
+                    }
+                    float p = proc(c);
+                    if (p > m) { m = p; am = c; }
+                }
+                sf[lid] = m; si[lid] = am;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int o = WG / 2; o > 0; o >>= 1) {
+                    if (lid < o) {
+                        if (sf[lid + o] > sf[lid] ||
+                            (sf[lid + o] == sf[lid] && si[lid + o] < si[lid])) {
+                            sf[lid] = sf[lid + o]; si[lid] = si[lid + o];
+                        }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                m = sf[0];
+                it.barrier(sycl::access::fence_space::local_space);
+
+                // Pass 2: Z = sum e^t, S1 = sum t*e^t  (t = proc - max).
+                float z = 0.0f, s1 = 0.0f;
+                for (int c = lid; c < V; c += WG) {
+                    float t = proc(c) - m;
+                    float e = sycl::exp(t);
+                    z += e; s1 += t * e;
+                }
+                sf[lid] = z;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int o = WG / 2; o > 0; o >>= 1) {
+                    if (lid < o) sf[lid] += sf[lid + o];
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                z = sf[0];
+                it.barrier(sycl::access::fence_space::local_space);
+                sf[lid] = s1;
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int o = WG / 2; o > 0; o >>= 1) {
+                    if (lid < o) sf[lid] += sf[lid + o];
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+                s1 = sf[0];
+
+                // Labels: each thread evaluates the labels it owns.
+                for (int j = lid; j < num_labels; j += WG)
+                    lbl[j] = proc(label_ids[j]);
+                it.barrier(sycl::access::fence_space::local_space);
+
+                if (lid == 0) {
+                    float L = m + sycl::log(z);           // full-vocab logsumexp
+                    float lmass = -3.4028235e38f;         // running logsumexp
+                    for (int j = 0; j < num_labels; ++j) {
+                        float lp = lbl[j] - L;
+                        label_logprobs[(size_t)i * num_labels + j] = lp;
+                        if (lp > lmass) lmass = lmass == -3.4028235e38f
+                            ? lp : lp + sycl::log1p(sycl::exp(lmass - lp));
+                        else            lmass = lmass + sycl::log1p(sycl::exp(lp - lmass));
+                    }
+                    log_label_mass[i] = lmass;
+                    vocab_entropy[i]  = sycl::log(z) - s1 / z;
+                    argmax_id[i]      = si[0];
+                    argmax_logprob[i] = m - L;
+                }
+            });
+    });
+}
+
+
 
 // Counter-based device RNG — must match diffsamp::rng_u32 in device_sampler.hpp.
 // Duplicated here (rather than #include'ing device_sampler.hpp) to keep the

@@ -114,6 +114,41 @@ Streaming uses OpenAI-style append-only content deltas. Add
 `"arcaine_stream_drafts":true` to receive custom `arcaine.diffusion_step` SSE
 events with the mutable denoising canvas text.
 
+## Structured decisions: POST /v1/systemone
+
+`arcaine_server` also serves Jev-format structured decision reads
+(`POST /v1/systemone`) on the DiffusionGemma backend: each question is
+answered from one single-step denoiser pass over a compiled answer canvas,
+with per-label probabilities exact against the full vocabulary. Choice
+supports 2–255 options, Score 2–10 levels, Noul returns a probability of yes.
+Questions are isolated (separate prompt + canvas each) and run sequentially
+under the model lock. The `confidence` field is a local normalized-entropy
+approximation, not Jev's confidence; see the response headers and
+[docs/systemone.md](docs/systemone.md) for the compatibility table, local
+limits, read-policy settings, and validation status.
+
+## Server-backed decision lab
+
+`arcaine_server` serves an openjev/SemIf-style web UI at `/`. The page is a
+thin client: it sends typed decisions to `/v1/systemone`, renders returned
+probability bars and server timings, and does not use WebGPU or download model
+weights. Static assets live under `third_party/web`.
+
+Run it for an internal network:
+
+```bash
+ARCAINE_API_KEY=local ./build/arcaine_server \
+  --model /path/to/diffusiongemma-checkpoint \
+  --served-model-name arcaine-diffusiongemma \
+  --host 0.0.0.0 --port 7461
+```
+
+Open `http://<server-lan-ip>:7461/` from another device. With the sample
+command above, enter `local` in the API-key field. This value matches
+`ARCAINE_API_KEY=local`. If the process is started
+outside the repository, set `ARCAINE_WEB_DIR=/path/to/Arcaine/third_party/web`.
+The API and UI share the same origin, so no CORS configuration is required.
+
 
 ## Notes
 

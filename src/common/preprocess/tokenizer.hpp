@@ -10,13 +10,24 @@ class Tokenizer {
 public:
     static Tokenizer from_json(const std::string& path);
 
-    std::vector<int> encode(const std::string& text, bool add_bos = true) const;
+    // `add_prefix_space` controls the SentencePiece text-start sentinel (▁).
+    // It must stay true for normal text that begins a prompt, and false when
+    // encoding a continuation segment that is appended after an existing
+    // special token (e.g. the structured-read `answer: <label>` canvas), so
+    // the first token is not given a spurious leading space.
+    std::vector<int> encode(const std::string& text, bool add_bos = true,
+                            bool add_prefix_space = true) const;
     std::string      decode(const std::vector<int>& ids, bool skip_special = false,
                             bool strip_leading_space = true) const;
 
     int  token_id(const std::string& token) const;
     bool has_token(const std::string& token) const;
     int  vocab_size() const { return (int)id_to_piece_.size(); }
+
+    // True for tokenizer.json added tokens flagged "special": true.  Used by
+    // structured-read compilation to reject control/channel tokens as answer
+    // labels and to validate resolved padding/closing ids.
+    bool is_special_token(int id) const { return special_token_ids_.count(id) != 0; }
 
 private:
     std::unordered_map<std::string, int> vocab_;

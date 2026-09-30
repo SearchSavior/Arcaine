@@ -9,11 +9,13 @@
 #include "../../common/gpu/nvfp4.hpp"
 #include "../../common/kernels/embedding.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <random>
 #include <string>
 #include <vector>
@@ -28,6 +30,16 @@ static bool persist_xfer_stage_enabled() {
                std::strcmp(e, "false") && std::strcmp(e, "no");
     }();
     return enabled;
+}
+
+// ARCAINE_SYSTEMONE_FAULT names a structured-read fault-injection point. The
+// recovery tests use it to throw while intermediate buffers are still live.
+static bool structured_fault(const char* stage) {
+    static const std::string mode = [] {
+        const char* e = std::getenv("ARCAINE_SYSTEMONE_FAULT");
+        return e ? std::string(e) : std::string();
+    }();
+    return mode == stage;
 }
 
 // Cross-GPU copy via host staging (devices have no P2P here).
@@ -159,31 +171,39 @@ void DiffusionGemmaModel::encode_block(const std::vector<int>& ids, int past_len
     auto& q0 = ctx0.queue;
 
     GpuBuffer<int32_t> ids_dev(seq, q0);
-    { std::vector<int32_t> tmp(ids.begin(), ids.end()); ids_dev.upload(tmp.data(), seq); }
+    // Keep ids_dev alive until error cleanup completes.
+    try {
+        { std::vector<int32_t> tmp(ids.begin(), ids.end()); ids_dev.upload(tmp.data(), seq); }
 
-    auto hidden = diffarena::arena(ctx0.index).alloc<bf16>((size_t)seq * H);
-    if (!w_.embed_tokens_q8.empty())
-        embedding_lookup_q8_0(q0, w_.embed_tokens_q8, ids_dev.data(), hidden.data(),
-                              seq, H, embed_scale_);
-    else
-        embedding_lookup(q0, w_.embed_tokens.data(), ids_dev.data(), hidden.data(),
-                         seq, H, embed_scale_);
+        auto hidden = diffarena::arena(ctx0.index).alloc<bf16>((size_t)seq * H);
+        if (!w_.embed_tokens_q8.empty())
+            embedding_lookup_q8_0(q0, w_.embed_tokens_q8, ids_dev.data(), hidden.data(),
+                                  seq, H, embed_scale_);
+        else
+            embedding_lookup(q0, w_.embed_tokens.data(), ids_dev.data(), hidden.data(),
+                             seq, H, embed_scale_);
 
-    for (int l = 0; l < split_layer_; ++l)
-        diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
-                           seq, past_len, cfg_.text, /*is_encoder=*/true);
-
-    if (split_layer_ < L) {
-        auto& ctx1 = GpuEngine::get(1);
-        auto& q1 = ctx1.queue;
-        auto hidden1 = diffarena::arena(ctx1.index).alloc<bf16>((size_t)seq * H);
-        transfer(q0, hidden.data(), q1, hidden1.data(), (size_t)seq * H);
-        for (int l = split_layer_; l < L; ++l)
-            diff_layer_forward(ctx1, w_.layers[l], hidden1.data(), enc_kv_.layer(l),
+        for (int l = 0; l < split_layer_; ++l)
+            diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
                                seq, past_len, cfg_.text, /*is_encoder=*/true);
-        q1.wait();
+
+        if (split_layer_ < L) {
+            auto& ctx1 = GpuEngine::get(1);
+            auto& q1 = ctx1.queue;
+            auto hidden1 = diffarena::arena(ctx1.index).alloc<bf16>((size_t)seq * H);
+            transfer(q0, hidden.data(), q1, hidden1.data(), (size_t)seq * H);
+            for (int l = split_layer_; l < L; ++l)
+                diff_layer_forward(ctx1, w_.layers[l], hidden1.data(), enc_kv_.layer(l),
+                                   seq, past_len, cfg_.text, /*is_encoder=*/true);
+            q1.wait();
+        }
+        q0.wait();
+    } catch (...) {
+        // Drain queues before buffer reuse. Keep the original error.
+        try { q0.wait(); } catch (...) {}
+        if (split_layer_ < L) { try { GpuEngine::get(1).queue.wait(); } catch (...) {} }
+        throw;
     }
-    q0.wait();
 }
 
 // ---------------------------------------------------------------------------
@@ -215,13 +235,26 @@ void DiffusionGemmaModel::decode_forward(
     float temp, const float* u_dev,
     int32_t* argmax_dev, float* entropy_dev, int32_t* denoiser_dev,
     GpuBuffer<bf16>& soft_next, bool want_soft_next,
-    uint64_t rng_seed, uint32_t rng_block, uint32_t rng_step)
+    uint64_t rng_seed, uint32_t rng_block, uint32_t rng_step,
+    const DecisionScoreTarget* score_target)
 {
     int H = cfg_.text.hidden_size;
     int L = cfg_.text.num_hidden_layers;
     int V = cfg_.text.vocab_size;
     auto& ctx0 = GpuEngine::get(0);
     auto& q0 = ctx0.queue;
+
+    // Drain queues only when decode fails.
+    struct DrainOnError {
+        sycl::queue& q;
+        bool split;
+        ~DrainOnError() {
+            if (std::uncaught_exceptions() > 0) {
+                try { q.wait(); } catch (...) {}
+                if (split) { try { GpuEngine::get(1).queue.wait(); } catch (...) {} }
+            }
+        }
+    } drain_on_error{q0, split_layer_ < L};
 
     // Embed canvas + self-conditioning.
     auto& ar0 = diffarena::arena(ctx0.index);
@@ -251,6 +284,20 @@ void DiffusionGemmaModel::decode_forward(
     // the multi-GPU ctx1 loop below is untouched (stays on existing per-kernel
     // capture). Workspace address stability across steps is verified in Phase 4.
     for (int l = 0; l < split_layer_; ++l) {
+        // Run structured reads without a graph session.
+        if (score_target) {
+            diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
+                               seq, enc_len, cfg_.text, /*is_encoder=*/false);
+            // Fault-injection point inside decode: fail once after the first
+            // layer while hidden and the layer intermediates are still live.
+            if (l == 0 && structured_fault("in_decode_layer")) {
+                static std::atomic<bool> fired{false};
+                if (!fired.exchange(true))
+                    throw std::runtime_error(
+                        "read_decisions: injected fault inside decode (test hook)");
+            }
+            continue;
+        }
         Nvfp4GraphSession session;
         Nvfp4SyclGraphKey key = nvfp4_step_key(q0, l, /*is_sliding=*/!w_.layers[l].is_full,
                                                /*denoise_step=*/0);
@@ -284,6 +331,23 @@ void DiffusionGemmaModel::decode_forward(
       else
           matmul_bf16(hidden.data(), seq, H, w_.embed_tokens.data(), V, logits_bf16.data(), ctx0); }
     hidden.reset();
+
+    // Structured-read mode: score the requested rows and stop.  No sampler,
+    // no acceptance/renoise outputs, no stability history, no next-step soft
+    // embedding.  The slot scores must be produced before the logits arena
+    // allocation is released.
+    if (score_target) {
+        DIFF_PROF(q0, "lm.slot_score");
+        slot_score_rows(q0, logits_bf16.data(), cfg_.text.final_logit_softcapping,
+                        score_target->rows, score_target->label_ids,
+                        score_target->num_rows, score_target->num_labels,
+                        score_target->label_logprobs, score_target->log_label_mass,
+                        score_target->vocab_entropy, score_target->argmax_id,
+                        score_target->argmax_logprob, score_target->nonfinite, V);
+        logits_bf16.reset();
+        soft_next = GpuBuffer<bf16>();
+        return;
+    }
 
     // F1: softcap + temperature + softmax + argmax + entropy + multinomial
     // sample in one kernel.  BF16 probabilities are only materialized when the
