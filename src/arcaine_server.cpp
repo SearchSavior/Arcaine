@@ -108,6 +108,39 @@ static std::string read_model_type(const std::string& model_dir) {
     return j.at("model_type").get<std::string>();
 }
 
+// Compile the structured-read kernels during model load. This image ships no
+// ocloc, so the server is built without AOT and the first structured read would
+// otherwise pay online SYCL JIT (tens of seconds). One tiny read here moves
+// that cost into startup, where the operator already waits for the model.
+// ARCAINE_WARMUP=0 disables it.
+void warm_up_structured_read(DiffusionGemmaModel& model, TokenizerBridge& tok) {
+    if (const char* e = std::getenv("ARCAINE_WARMUP")) {
+        const std::string v(e);
+        if (v == "0" || v == "off" || v == "false" || v == "no") return;
+    }
+    try {
+        const int V = model.config().text.vocab_size;
+        if (V <= 2 || model.canvas_capacity() < 2) return;
+        std::vector<int> prompt = tok.encode_raw("warmup", /*add_bos=*/false);
+        if (prompt.empty()) prompt.push_back(0);
+        CompiledDecisionTemplate t;
+        t.canvas.assign((size_t)std::min(16, model.canvas_capacity()), 0);
+        t.slot_position = 1;
+        t.label_ids = {1, 2};
+        DecisionReadOptions o;
+        o.reads = 1;
+        o.stream_seed = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        DecisionReadResult r = model.read_decisions(prompt, t, o);
+        const double s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "[warmup] structured-read kernels ready in %.1fs (%d read)\n",
+                     s, (int)r.reads.size());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[warmup] skipped: %s\n", e.what());
+    }
+}
+
 struct AppState {
     ServerOptions opts;
     std::time_t created = std::time_t(std::time(nullptr));
@@ -133,6 +166,7 @@ struct AppState {
             token_boundaries = std::make_unique<Gemma4TokenBoundaryParser>(opts.model_dir);
             diff_model = std::make_unique<DiffusionGemmaModel>(
                 opts.model_dir, opts.max_seq, opts.placement, opts.print_placement);
+            warm_up_structured_read(*diff_model, tokenizer);
         } else {
             is_diffusion = false;
             register_builtin_architectures();
