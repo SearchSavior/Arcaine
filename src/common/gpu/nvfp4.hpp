@@ -88,6 +88,19 @@ inline bool nvfp4_sycl_graph_enabled() {
     }();
     return enabled;
 }
+
+// This scope disables graph capture for one request.
+inline int& nvfp4_capture_disable_depth() {
+    static thread_local int depth = 0;
+    return depth;
+}
+inline bool nvfp4_capture_disabled() { return nvfp4_capture_disable_depth() > 0; }
+struct Nvfp4EagerScope {
+    Nvfp4EagerScope() { ++nvfp4_capture_disable_depth(); }
+    ~Nvfp4EagerScope() { --nvfp4_capture_disable_depth(); }
+    Nvfp4EagerScope(const Nvfp4EagerScope&) = delete;
+    Nvfp4EagerScope& operator=(const Nvfp4EagerScope&) = delete;
+};
 inline size_t nvfp4_sycl_graph_cache_limit() {
     static size_t limit = [] {
         const char* env = std::getenv("DIFF_NVFP4_SYCL_GRAPH_CACHE_LIMIT");
@@ -238,6 +251,11 @@ struct Nvfp4GraphSession {
     // false if a cached graph was found and already replayed (cache hit).
     bool begin(sycl::queue& q, const Nvfp4SyclGraphKey& step_key) {
         queue_ = &q;
+        if (nvfp4_capture_disabled()) {
+            needs_recording_ = false;
+            recording_ = false;
+            return true;  // per-call eager policy: caller runs kernels eagerly
+        }
         if (!nvfp4_sycl_graph_enabled()) {
             needs_recording_ = false;
             recording_ = false;
@@ -365,6 +383,11 @@ inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
                                     std::initializer_list<uintptr_t> args,
                                     Submit&& submit,
                                     Nvfp4GraphSession* session = nullptr) {
+    if (nvfp4_capture_disabled()) {
+        // Per-call eager policy (structured reads): bypass every micro-capture.
+        submit();
+        return;
+    }
     if (session && session->active()) {
         // An outer Nvfp4GraphSession is already recording this step's graph;
         // just enqueue -- it gets captured as part of that larger graph

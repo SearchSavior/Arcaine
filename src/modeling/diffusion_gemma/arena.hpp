@@ -128,7 +128,15 @@ public:
 
     // Called by Alloc::reset(); ptr only used for the standalone (disabled) path.
     void free_block(int chunk, size_t off, size_t bytes, void* ptr) {
-        if (chunk < 0) { if (ptr) sycl::free(ptr, queue()); return; }
+        if (chunk < 0) {
+            if (ptr) {
+                // Standalone allocations have no pool to protect them. Wait for
+                // queued work that can still read this memory, then release it.
+                try { queue().wait(); } catch (...) {}
+                sycl::free(ptr, queue());
+            }
+            return;
+        }
         insert_free(chunk, off, bytes);
         live_ -= bytes;
     }

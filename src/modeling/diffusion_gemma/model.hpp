@@ -44,6 +44,65 @@ bool diff_use_online_softmax();  // DIFF_ONLINE_SOFTMAX
 bool diff_use_gumbel_sample();   // DIFF_GUMBEL_MAX (implies online softmax)
 bool diff_use_stop_fix();        // DIFF_STOP_FIX
 
+// ---------------------------------------------------------------------------
+// Structured decision reads (the /v1/systemone backend).  One read = one
+// denoiser pass over a compiled answer canvas whose single answer slot is
+// filled with fresh uniform noise; the slot row is scored at temperature 1
+// against the full vocabulary and the allowed label set.  These structs are
+// pure token/position data — no HTTP or JSON types cross this boundary.
+struct CompiledDecisionTemplate {
+    std::vector<int32_t> canvas;      // full canvas incl. closing token + padding
+    int                  slot_position = -1;   // canvas row holding the answer label
+    std::vector<int32_t> label_ids;    // allowed label token ids at the slot (2..256)
+};
+
+struct DecisionReadOptions {
+    int      reads = 1;                 // fixed read count (1..32)
+    bool     auto_mode = false;         // escalate to auto_max while uncertain
+    int      auto_max = 4;              // 1..32
+    float    auto_entropy_threshold = 0.5f;  // normalized label entropy in [0,1]
+    float    auto_min_label_mass = 0.0f;     // full-vocab label mass floor in [0,1]
+    uint64_t stream_seed = 0;           // per-question noise stream (content-derived)
+    // GPU work watchdog timeout in seconds. The value 0 turns the watchdog off.
+    // If a read makes no GPU progress during the timeout, the process exits.
+    // In this way, the model lock is released.
+    float    watchdog_s = 0.0f;
+};
+
+// One independent read of one answer slot.  logprobs are full-vocabulary
+// normalized at temperature 1 (final softcap applied exactly once, FP32).
+struct DecisionSlotSample {
+    std::vector<float> label_logprobs;  // log p(label_j), one per label_ids entry
+    float   log_label_mass = 0.0f;      // logsumexp over the label set
+    float   vocab_entropy = 0.0f;       // full-vocabulary entropy (nats)
+    int32_t argmax_id = -1;             // global argmax token at the slot row
+    float   argmax_logprob = 0.0f;      // its full-vocabulary logprob
+};
+
+struct DecisionReadResult {
+    std::vector<DecisionSlotSample> reads;
+    int    prompt_tokens = 0;           // encoded prompt length (prefilled once)
+    int    prefill_calls = 0;           // encoder passes issued (1 per question)
+    int    decode_calls  = 0;           // denoiser passes issued (= reads.size())
+    double prefill_s = 0.0;
+    double decode_s  = 0.0;
+};
+
+// Device-side scoring outputs for the structured decode mode (see
+// DiffusionGemmaModel::decode_forward).  All pointers are device memory.
+struct DecisionScoreTarget {
+    const int32_t* rows = nullptr;            // (num_rows) canvas rows to score
+    const int32_t* label_ids = nullptr;       // (num_labels)
+    int     num_rows = 0;
+    int     num_labels = 0;
+    float*  label_logprobs = nullptr;         // (num_rows, num_labels) out
+    float*  log_label_mass = nullptr;         // (num_rows) out
+    float*  vocab_entropy = nullptr;          // (num_rows) out
+    int32_t* argmax_id = nullptr;             // (num_rows) out
+    float*  argmax_logprob = nullptr;         // (num_rows) out
+    int32_t* nonfinite = nullptr;             // (num_rows) out: 1 if raw logit NaN/inf
+};
+
 class DiffusionGemmaModel {
 public:
     DiffusionGemmaModel(const std::string& model_dir, int max_seq_len, DiffPlacementOptions placement = {}, bool print_placement = true);
@@ -58,10 +117,25 @@ public:
     const DiffConfig& config() const { return cfg_; }
     const DiffPerfStats& stats() const { return stats_; }   // from the last generate()
 
+    // Structured decision read: prefill `prompt_ids` once, then run
+    // `options.reads` (or auto-escalated) independent single-step denoiser
+    // passes over `compiled.canvas`, replacing only the answer slot with a
+    // fresh rejection-sampled uniform vocab id per read.  Returns the per-read
+    // slot scores.  The prompt KV is reset on entry and on exit (including
+    // error paths), so no state crosses questions or requests.
+    DecisionReadResult read_decisions(const std::vector<int>& prompt_ids,
+                                      const CompiledDecisionTemplate& compiled,
+                                      const DecisionReadOptions& options);
+
     // KV cache footprint (allocated for max_seq_len at construction).
     size_t kv_cache_bytes()           const { return enc_kv_.total_bytes(); }
     size_t kv_cache_bytes_per_token() const { return enc_kv_.bytes_per_token(); }
     int    kv_cache_max_seq()         const { return enc_kv_.max_seq(); }
+
+    // Largest canvas width the execution/allocation paths are planned for
+    // (the activation arena's decode graph is sized from cfg_.canvas_length).
+    // Structured reads must not exceed this without re-planning the arena.
+    int    canvas_capacity()          const { return cfg_.canvas_length; }
 
     // Activation arena capacity retained across all GPUs for liveness-scoped scratch.
     // Each arena is pre-sized from the planner peak-live estimate and grows only on overflow.
@@ -99,12 +173,20 @@ private:
     // On the device-resident denoising loop (default) this is called every
     // step without a host sync; the in-order queue serializes it against the
     // device sampler/stopping kernels that follow.
+    //
+    // When `score_target` is non-null the forward runs in structured-read
+    // mode: the whole-layer NVFP4 graph capture is bypassed (its key lacks
+    // request dimensions and buffer identities), no sampler/entropy/soft_next
+    // work runs, and after the LM head only the rows in `score_target` are
+    // scored (full-vocabulary softcap softmax statistics + per-label logprobs
+    // at temperature 1).  `temp` and the sampling outputs are ignored.
     void decode_forward(const int32_t* ids, const bf16* soft_or_null,
                         int enc_len, int seq, float temp, const float* u_dev,
                         int32_t* argmax_dev, float* entropy_dev,
                         int32_t* denoiser_dev, GpuBuffer<bf16>& soft_next,
                         bool want_soft_next,
-                        uint64_t rng_seed = 0, uint32_t rng_block = 0, uint32_t rng_step = 0);
+                        uint64_t rng_seed = 0, uint32_t rng_block = 0, uint32_t rng_step = 0,
+                        const DecisionScoreTarget* score_target = nullptr);
 
     // Allocate (or grow) the persistent device buffers backing the
     // device-resident denoising loop, sized for one canvas of `seq` tokens.

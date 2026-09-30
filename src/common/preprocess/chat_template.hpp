@@ -34,6 +34,16 @@ PromptBuildResult build_chat_prompt(
     bool enable_thinking = false
 );
 
+// Render the chat text with minja, but do not tokenize it. Callers that need
+// both the text and the tokens can render once and encode the string, instead
+// of paying the (slow) tokenizer cost twice.
+std::string build_chat_prompt_text(
+    const std::string& model_dir,
+    const std::vector<ChatTemplateMessage>& messages,
+    bool add_generation_prompt = true,
+    bool enable_thinking = false
+);
+
 PromptBuildResult build_chat_prompt_json(
     const std::string& model_dir,
     nlohmann::ordered_json messages,

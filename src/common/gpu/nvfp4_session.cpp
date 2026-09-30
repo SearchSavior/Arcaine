@@ -19,7 +19,19 @@
 // so it needs no -Xspirv-translator spirv-ext option of its own; the device
 // link of any target it joins already requires that option for other TUs.
 #include "nvfp4.hpp"
+#include "nvfp4_session_stats.hpp"
 
 bool nvfp4_session_recording(const sycl::queue& q) {
     return nvfp4_active_session(q) != nullptr;
+}
+
+Nvfp4GraphCounts nvfp4_graph_capture_counts() {
+    auto& cache = nvfp4_sycl_graph_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    Nvfp4GraphCounts out;
+    out.captures = cache.captures;
+    out.replays = cache.replays;
+    out.fallbacks = cache.fallbacks;
+    out.capacity_bypasses = cache.capacity_bypasses;
+    return out;
 }
