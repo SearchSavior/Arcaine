@@ -45,56 +45,54 @@ These are cobbled together but define the codepath taken at inference time; Arca
 - Qwen AgentWorld-35B-A3B [NVFP4](https://huggingface.co/Frosty40/Qwen-AgentWorld-35B-A3B-NVFP4)
 
 
-## Container setup
+## Docker Container setup
+
+Pop into the dockerfile to see and modify the build arguments for `oneDNN`. These can be complex and adding new ones should not change application behavior.
+
+You can check the `docker-compose.yaml` and `.devops/Dockerfile` to see Arcaine's setup and dependencies.
+
+
+```
+# Set the path to mount your models
+export ARCAINE_MODELS=path/to/your/clankers/digital/flesh
+
+```
 
 ```bash
-export RENDER_GID=$(getent group render | cut -d: -f3)
-docker compose build
-docker compose run --rm --service-ports \
-  -v /mnt/Ironwolf-4TB/Models/Arcaine/:/workspace/models \
-  dev   # interactive shell in /workspace
+# On the host
+./docker.sh
 ```
 
 ### Build
 
 ```bash
-# Inside the dev container (see .devops/ for setup)
-cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx
-cmake --build build -j"$(nproc)"
+# Inside the container
+./build.sh
 ```
 
-The CMake targets add the NVFP4/DPAS SPIR-V translator extension at link time.
-Do not pass `-Xspirv-translator` as a global compile flag; DPC++ will warn that
-it is unused during normal host compilation.
-
-For an B70 and maybe B50/B60 Battlemage build, add the SYCL target explicitly:
-
-B60 and B50 might be intel_gpu_bmg_g21
-```bash
-cmake -B build -G Ninja \
-  -DCMAKE_CXX_COMPILER=icpx \
-  -DARCAINE_SYCL_TARGETS=intel_gpu_bmg_g31
-cmake --build build -j"$(nproc)"
-```
+`build.sh` has a few comments which let you change the AOT sycl target. Arcaine implements some models which can work on both Alchemist and Battlemage, including device interop ie, mixing unmatched hardware, so choose what's appropriate for your device.  
 
 
 
 Doing the build makes a few binaries which all accept `--help`.
 
 
-Host requirements: Linux, Intel GPU, `i915`/`xe` driver, `/dev/dri` present,
-user in `render` group.
+### Host Requirements
 
-## OpenAI-compatible API server
 
-`diffusion_server` loads one DiffusionGemma model and serves `GET /v1/models`
-and `POST /v1/chat/completions`. Authentication is disabled by default; set
-`ARCAINE_API_KEY` to require `Authorization: Bearer <key>`.
+Arcaine has not been tested on or developed for Windows OS. A few souls have had no issues getting Arcaine running in WSL. My goal is to use bleeding edge features in drivers, forks, patches etc, so latest `xe` is probably required.
+
+Your host has the same requirements 
+
+
+## arcaine-server
+
+For now `arcaine_server` works like 
 
 ```bash
-ARCAINE_API_KEY=local ./build/diffusion_server \
+ARCAINE_API_KEY=local ./build/arcaine_server \
   --model models/diffusiongemma-26B-A4B-it-AWQ-INT4 \
-  --served-model-name diffusiongemma-26B-A4B-it-NVFP4 \
+  --served-model-name diffusiongemma-26B-A4B-it-INT4 \
   --host 0.0.0.0 \
   --port 7461
 ```
@@ -107,12 +105,26 @@ curl http://127.0.0.1:7461/v1/models \
 ```bash
 curl http://127.0.0.1:7461/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"diffusiongemma-26B-A4B-it-NVFP4","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":1000,"stream":true,"arcaine_stream_drafts":true}'
+  -d '{"model":"diffusiongemma-26B-A4B-it-INT4","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":1000,"stream":true,"arcaine_stream_drafts":true}'
 ```
 
-Streaming uses OpenAI-style append-only content deltas. Add
-`"arcaine_stream_drafts":true` to receive custom `arcaine.diffusion_step` SSE
-events with the mutable denoising canvas text.
+
+
+>NOTE: DiffusionGemma currently does not support streaming to preserve compatability with other software. 
+
+
+## arcaine-mbench
+
+WIP. Goal is to provide a llama-bench style cli surface for kicking off benchmarks for all models Arcaine supports.
+
+
+## arcaine-kbench
+
+Arcaine is built by humans and agents. In GPU kernel development we need to keep things organized so a long running agent produces code a human can follow. Since I like to focus on data-flow and algorithms first, `arcaine-kbench` is intended to be a place where we can set a target kernel and send it shapes, initilize random weights, run iterations, profile gpus, A/B test env gates over approaches. This is very much under-construction and ideas are welcome for how to improve.
+
+
+
+
 
 ## Structured decisions: POST /v1/systemone
 
