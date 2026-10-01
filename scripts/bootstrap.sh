@@ -26,7 +26,7 @@ cat > .devops/Dockerfile << 'DOCKERFILE_EOF'
 # The base still carries what we DO need: the DPC++/SYCL compiler (icx/icpx)
 # and oneMKL.
 
-ARG ONEAPI_VERSION=2025.3.3-0-devel-ubuntu24.04
+ARG ONEAPI_VERSION=2026.1.4-devel-ubuntu26.04
 
 # ==========================================================================
 # Stage 1: build oneDNN from source with SYCL CPU + GPU runtimes
@@ -39,7 +39,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 #   https://github.com/uxlfoundation/oneDNN/releases
 # (releases land roughly quarterly; v3.5 confirmed, 2026 releases scheduled
 # Feb/May/Aug). Bump this arg to the version you want.
-ARG ONEDNN_VERSION=v3.12
+ARG ONEDNN_VERSION=v3.13.3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build git ca-certificates \
@@ -156,8 +156,8 @@ services:
       context: .
       dockerfile: .devops/Dockerfile
       args:
-        ONEAPI_VERSION: 2025.3.3-0-devel-ubuntu24.04
-        ONEDNN_VERSION: v3.12
+        ONEAPI_VERSION: 2026.1.4-devel-ubuntu26.04
+        ONEDNN_VERSION: v3.13.3
         INSTALL_RUST: "1"
     image: myproject-dev:latest
 
