@@ -43,7 +43,7 @@
 
 /tags
 /.build/
-/build*
+
 /release
 /debug
 /out/
@@ -53,3 +53,4 @@
 
 /.venv
 __pycache__/
+.pytest_cache/

@@ -1,5 +1,5 @@
 ---
-name: use-reference
+name: reference-use
 description: >
   explore repositories under /reference/{repository_name}
 ---
