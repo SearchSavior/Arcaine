@@ -78,12 +78,26 @@ ENV CMAKE_PREFIX_PATH=/opt/onednn:${CMAKE_PREFIX_PATH} \
 #    runtime stack. Install only the small tools/headers we need here; pulling an
 #    extra Intel GPU repo can mix incompatible libigc/libigdfcl package families.
 # --------------------------------------------------------------------------
+# ocloc is the Intel GPU offline compiler used by `-fsycl-targets=...` (AOT).
+# Without it, an AOT device link fails ("ocloc tool could not be found") and
+# every target silently falls back to JIT, which pays a costly first-compile
+# per process. The DPC++ toolkit install in the base image does not ship it,
+# but the Intel graphics PPA does.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         libze-dev \
         clinfo \
+        intel-ocloc \
+    && ocloc --version \
     && rm -rf /var/lib/apt/lists/*
+
+# Persist the SYCL and Intel GPU compiler caches across container recreation.
+# The first kernel compile on a cold cache takes tens of seconds; without a
+# persistent cache every recreated container pays it again.
+ENV SYCL_CACHE_PERSISTENT=1 \
+    SYCL_CACHE_DIR=/root/.cache/sycl
+RUN mkdir -p /root/.cache/sycl
 
 # --------------------------------------------------------------------------
 # 4. Rust toolchain (LOW priority -- the Rust layer will bind a C `extern "C"`
