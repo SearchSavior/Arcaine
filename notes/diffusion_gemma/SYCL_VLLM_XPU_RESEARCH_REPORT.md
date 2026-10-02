@@ -321,7 +321,7 @@ and full MoE default tile choices:
   tile configs across batch sizes (`benchmark_moe_defaults.py:1-15`,
   `benchmark_moe_defaults.py:195-220`).
 
-Do the same locally. End-to-end `diffusion_bench` is required, but small
+Do the same locally. End-to-end `arcaine_mbench` is required, but small
 microbenchmarks or profiler sections should isolate router, remap, activation
 pack, down-gather, and final combine, otherwise a win in one stage can be
 hidden by a regression in another.
@@ -617,7 +617,7 @@ performance work, use env-gated A/B runs and the required prompt sweep:
 ```bash
 DIFF_ROUTER_GPU_TOPK=0 \
 DIFF_MOE_GPU_REMAP=0 \
-./build/diffusion_bench \
+./build/arcaine_mbench \
   --model models/diffusiongemma-26B-A4B-it-NVFP4 \
   -p 512,1024,2048,8192 \
   -n 256 \
@@ -635,7 +635,7 @@ Example A/B command for the first combined GPU-router/remap experiment:
 DIFF_ROUTER_GPU_TOPK=1 \
 DIFF_MOE_GPU_REMAP=1 \
 DIFF_MOE_GPU_REMAP_LAYOUT=compact \
-./build/diffusion_bench \
+./build/arcaine_mbench \
   --model models/diffusiongemma-26B-A4B-it-NVFP4 \
   -p 512,1024,2048,8192 \
   -n 256 \

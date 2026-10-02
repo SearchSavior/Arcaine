@@ -31,7 +31,7 @@ DIFF_INT4_FUSE_EXPERT_POSTNORM=1 \
 DIFF_INT4_FUSE_SELFCOND_ADD_NORM=1 \
 DIFF_BENCH_FORCE_FULL_CANVAS=1 \
 DIFF_FORCE_DENOISE_STEPS=1 \
-./build/diffusion_bench \
+./build/arcaine_mbench \
   --model models/diffusiongemma-26B-A4B-it-AWQ-INT4 \
   --device 0 --layers single --experts layer-owner \
   -p 512 -n 256 -ds 48 -w 0 -r 0
@@ -64,7 +64,7 @@ cd /workspace
 DIFF_INT4_FUSE_DENSE_GATE_UP=1 \
 DIFF_INT4_FUSE_EXPERT_POSTNORM=1 \
 DIFF_INT4_FUSE_SELFCOND_ADD_NORM=1 \
-./build/diffusion_bench \
+./build/arcaine_mbench \
   --model models/diffusiongemma-26B-A4B-it-AWQ-INT4 \
   --device 0 --layers single --experts layer-owner \
   -p 512,1024,2048,4096 -n 256 -ds 48 -w 1 -r 5 --md
