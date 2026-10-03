@@ -46,14 +46,17 @@ inline std::atomic<long long>& diff_int4_attn_validate_mismatched() {
     return v;
 }
 
-// Bitwise audit of two element ranges. Reports both the exact-bit mismatch
-// count (informational: oneDNN's jit gemm for the full-layer o_proj shape
-// K=8192,N=2816 is inherently run-to-run nondeterministic at the 1-4 ULP
-// level, verified at operator level, so eager double-runs are not bitwise
-// reproducible there either) and a beyond-tolerance count that gates the
-// audit: elements differing by more than ~1.5% relative (a stale-address or
-// missing-kernel replay produces O(1) errors, so the tolerance cleanly
-// separates inherent jitter from capture defects). Syncs the queue.
+// Bitwise audit of two element ranges. Reports two quantities:
+//   * count: the exact-bit mismatch count -- statistical and informational,
+//     dominated by the model's inherent run-to-run nondeterminism (oneDNN's
+//     jit gemm for the full-layer o_proj shape K=8192,N=2816 varies 1-4
+//     mantissa steps run-over-run for identical operands, verified at
+//     operator level; eager double-runs are not bitwise reproducible there
+//     either), consumed by the self-calibrating envelope gate below.
+//   * beyond-sane count: elements differing by more than 0.25 absolute
+//     (vs hidden-scale activations of O(1)). ULP-level jitter never
+//     approaches this; a stale-address or wrong-sequence replay lights up
+//     thousands of elements here and fails the audit. Syncs the queue.
 struct DiffValidateDump {
     static constexpr int kMax = 8;
     long long count = 0;      // exact-bit mismatches (informational)
