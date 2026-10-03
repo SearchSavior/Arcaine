@@ -85,7 +85,7 @@ DecisionReadResult DiffusionGemmaModel::read_decisions(
     auto& q0 = ctx0.queue;
 
     // Disable graph capture for this read.
-    Nvfp4EagerScope eager_scope;
+    DiffGraphEagerScope eager_scope;
 
     // Limit the time this read can hold the model lock. If the GPU stops, the
     // watchdog stops the process and writes a message.

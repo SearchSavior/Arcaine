@@ -272,17 +272,31 @@ void DiffusionGemmaModel::decode_forward(
 
     // Decoder layers (bidirectional, read-only encoder KV).
     //
-    // Whole-step SYCL graph capture: each decoder layer's attention→MoE kernel
-    // sequence is captured as one command_graph keyed by (layer, is_sliding), then
-    // replayed on every subsequent denoising step. The Nvfp4GraphSession
-    // registers itself in the global active-session map on begin(), so every
-    // downstream guard (session-conditional waits in profile/expert_parallel/
-    // matmul_nvfp4, and run_shard's forced gpu_layout dispatch) activates
-    // automatically via nvfp4_session_recording(q) — no pointer threading needed.
-    // Gate: DIFF_NVFP4_SYCL_GRAPH (unset = eager, no capture). AB knob for perf.
-    // Single-GPU scope: split_layer_==L so this loop runs every layer on ctx0;
-    // the multi-GPU ctx1 loop below is untouched (stays on existing per-kernel
-    // capture). Workspace address stability across steps is verified in Phase 4.
+    // SYCL graph capture, quant-conditional:
+    //  * INT4 (this codepath's target): each decoder layer's attention
+    //    sub-layer is captured as one command_graph keyed
+    //    (layer kind, enc_len, seq), then replayed on every subsequent
+    //    denoising step. The shared DiffGraphSession registers itself in the
+    //    global active-session map on begin(), so downstream guards
+    //    (session-conditional waits in profile/expert_parallel/matmul_nvfp4)
+    //    activate automatically via diff_graph_recording(q) — no pointer
+    //    threading needed. See layer.hpp for the full design notes.
+    //    Gate: DIFF_INT4_SYCL_GRAPH (unset = eager, no capture). AB knob.
+    //    Single-GPU scope: split_layer_==L so this loop runs every layer on
+    //    ctx0; the multi-GPU ctx1 loop below never captures. Arena-only:
+    //    DIFF_ARENA=off mallocs per step, so captured pointers would dangle.
+    //    The first invocation per key runs eager (warm pass) so lazily-built
+    //    oneDNN artifacts (weight-layout reorders that stream.wait, primitive
+    //    caches, scratch growth) settle before any recording. Replay-address
+    //    stability of the `hidden` pipeline buffer is asserted on every
+    //    replay under DIFF_INT4_SYCL_GRAPH_CHECK.
+    //  * NVFP4 (legacy, unchanged): whole-layer session keyed
+    //    (layer, is_sliding), gate DIFF_NVFP4_SYCL_GRAPH, non-int4 models
+    //    only; INT4 models never take it (their run_shard host round-trip
+    //    cannot be captured whole-layer).
+    bool int4_attn_graphs = cfg_.is_int4_quantized() &&
+                           diff_int4_sycl_graph_enabled() &&
+                           split_layer_ == L && !diffarena::disabled();
     for (int l = 0; l < split_layer_; ++l) {
         // Run structured reads without a graph session.
         if (score_target) {
@@ -298,14 +312,36 @@ void DiffusionGemmaModel::decode_forward(
             }
             continue;
         }
-        Nvfp4GraphSession session;
-        Nvfp4SyclGraphKey key = nvfp4_step_key(q0, l, /*is_sliding=*/!w_.layers[l].is_full,
-                                               /*denoise_step=*/0);
-        if (session.begin(q0, key)) {
+        if (int4_attn_graphs) {
+            DiffGraphKey attn_key = diff_int4_attn_step_key(
+                q0, l, w_.layers[l].is_full, enc_len, seq);
             diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
-                               seq, enc_len, cfg_.text, /*is_encoder=*/false);
-            session.end_and_replay();
+                               seq, enc_len, cfg_.text, /*is_encoder=*/false,
+                               &attn_key);
+            continue;
         }
+        // Legacy whole-layer NVFP4 session wrap (gate DIFF_NVFP4_SYCL_GRAPH,
+        // non-int4 models only). The session registers itself in the global
+        // active-session map on begin(), so downstream guards
+        // (session-conditional waits in profile/expert_parallel/matmul_nvfp4,
+        // run_shard's forced gpu_layout dispatch) activate automatically via
+        // diff_graph_recording(q) — no pointer threading needed. INT4 models
+        // take the attention-sub-layer path above instead: their run_shard
+        // host round-trip cannot be captured whole-layer.
+        if (nvfp4_sycl_graph_enabled() && !cfg_.is_int4_quantized()) {
+            DiffGraphSession session;
+            DiffGraphKey key = nvfp4_step_key(q0, l,
+                                               /*is_sliding=*/!w_.layers[l].is_full,
+                                               /*denoise_step=*/0);
+            if (session.begin(q0, key, nvfp4_sycl_graph_enabled())) {
+                diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
+                                   seq, enc_len, cfg_.text, /*is_encoder=*/false);
+                session.end_and_replay();
+            }
+            continue;
+        }
+        diff_layer_forward(ctx0, w_.layers[l], hidden.data(), enc_kv_.layer(l),
+                           seq, enc_len, cfg_.text, /*is_encoder=*/false);
     }
 
     if (split_layer_ < L) {

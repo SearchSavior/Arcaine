@@ -17,7 +17,7 @@ void encoder_attention_forward(
     const bf16* hidden, bf16* out,
     DiffLayerKv& kv, int seq, int past_len,
     const DiffTextConfig& cfg,
-    Nvfp4GraphSession* session = nullptr);
+    DiffGraphSession* session = nullptr);
 
 // Decoder attention: bidirectional over [encoder KV ; canvas], read-only cache.
 // Canvas positions start at absolute `enc_len`. See encoder_attention_forward
@@ -27,4 +27,4 @@ void decoder_attention_forward(
     const bf16* hidden, bf16* out,
     DiffLayerKv& enc_kv, int seq, int enc_len,
     const DiffTextConfig& cfg,
-    Nvfp4GraphSession* session = nullptr);
+    DiffGraphSession* session = nullptr);

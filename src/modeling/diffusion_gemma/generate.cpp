@@ -1,8 +1,10 @@
 #include "model.hpp"
 #include "sampler.hpp"
 #include "device_sampler.hpp"
+#include "layer.hpp"
 #include "../../utils/profile.hpp"
 #include "../../common/gpu/engine.hpp"
+#include "../../common/gpu/sycl_graph_session.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -215,6 +217,7 @@ std::vector<int> DiffusionGemmaModel::generate(
     }
     stats_.output_tokens = (int)output.size();
     diffprof::report();
-    nvfp4_sycl_graph_report();
+    diff_graph_report();
+    diff_int4_attn_validate_report();
     return output;
 }

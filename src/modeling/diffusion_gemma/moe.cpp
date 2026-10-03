@@ -100,7 +100,7 @@ static void dense_mlp(GpuEngine& ctx, const DiffDenseMLP& w,
         // arena-backed pack workspaces so matmul_nvfp4 does NOT allocate a
         // transient sycl::malloc_device buffer (which would be freed at scope
         // exit and dangle at SYCL-graph-replay time) and does NOT wait. This
-        // keeps the dense-MLP down_proj capture-safe inside a Nvfp4GraphSession.
+        // keeps the dense-MLP down_proj capture-safe inside a DiffGraphSession.
         int dG = inter / 16;
         auto dp_packed_a = ar.alloc<uint8_t>((size_t)seq * inter / 2);
         auto dp_scale_a  = ar.alloc<uint8_t>((size_t)seq * dG);

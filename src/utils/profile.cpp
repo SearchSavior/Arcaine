@@ -6,11 +6,12 @@
 #include <string>
 #include <vector>
 
-// Forward declaration only -- defined in common/gpu/nvfp4.hpp. Avoids pulling
-// the DPAS/SPIRV intrinsics into this lightweight header. A SYCL queue that is
-// recording a command_graph cannot be waited on (throws), so the profile timers
-// skip their q.wait() while a Nvfp4GraphSession is capturing a step.
-bool nvfp4_session_recording(const sycl::queue& q);
+// Forward declaration only -- defined in common/gpu/sycl_graph_session.cpp
+// (declared in common/gpu/sycl_graph_session.hpp). Avoids pulling the SYCL
+// graph internals into this lightweight TU. A SYCL queue that is recording a
+// command_graph cannot be waited on (throws), so the profile timers skip
+// their q.wait() while a DiffGraphSession is capturing a step.
+bool diff_graph_recording(const sycl::queue& q);
 
 namespace diffprof {
 
@@ -33,14 +34,14 @@ void reset() {
 }
 
 std::chrono::steady_clock::time_point tic(sycl::queue& q) {
-    if (enabled() && !nvfp4_session_recording(q)) q.wait();
+    if (enabled() && !diff_graph_recording(q)) q.wait();
     return std::chrono::steady_clock::now();
 }
 
 void toc(sycl::queue& q, const char* name,
           std::chrono::steady_clock::time_point t0) {
     if (!enabled()) return;
-    if (!nvfp4_session_recording(q)) q.wait();
+    if (!diff_graph_recording(q)) q.wait();
     add(name, std::chrono::duration<double>(
                   std::chrono::steady_clock::now() - t0).count());
 }
@@ -48,14 +49,14 @@ void toc(sycl::queue& q, const char* name,
 ScopedGpu::ScopedGpu(sycl::queue& queue, const char* nm)
     : q(&queue), name(nm), on(enabled()) {
     if (on) {
-        if (!nvfp4_session_recording(*q)) q->wait();
+        if (!diff_graph_recording(*q)) q->wait();
         t0 = std::chrono::steady_clock::now();
     }
 }
 
 ScopedGpu::~ScopedGpu() {
     if (on) {
-        if (!nvfp4_session_recording(*q)) q->wait();
+        if (!diff_graph_recording(*q)) q->wait();
         double s = std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t0)
                        .count();

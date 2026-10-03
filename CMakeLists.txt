@@ -56,7 +56,7 @@ set(COMMON_SRCS
     src/register_builtins.cpp
     src/common/registry.cpp
     src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp
+    src/common/gpu/sycl_graph_session.cpp
     src/common/preprocess/tokenizer.cpp
     src/common/preprocess/chat_template.cpp
     src/common/preprocess/image_proc.cpp
@@ -98,7 +98,7 @@ set(DIFFUSION_SRCS
     src/common/preprocess/chat_template.cpp
     src/common/io/quant_loader.cpp
     ${UNICODE_SRCS}
-    src/common/gpu/nvfp4_session.cpp
+    src/common/gpu/sycl_graph_session.cpp
     src/modeling/diffusion_gemma/loader.cpp
     src/modeling/diffusion_gemma/moe.cpp
     src/common/gpu/expert_parallel.cpp
@@ -227,7 +227,7 @@ set(KBENCH_SRCS
     src/bench/diffusion_int4_grouped_s8s4_bench.cpp
     # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp)
+    src/common/gpu/sycl_graph_session.cpp)
 add_executable(arcaine_kbench ${KBENCH_SRCS})
 target_compile_options(arcaine_kbench PRIVATE
     -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})

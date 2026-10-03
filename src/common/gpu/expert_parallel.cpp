@@ -259,7 +259,7 @@ static void upload_alloc(sycl::queue& q, diffarena::Alloc<T>& dst,
 // The grouped-GEMM kernels read, per expert: packed-weight ptr, scale ptr,
 // dst-scale ptr, and input_global_scale. These are stable across steps, so we
 // upload them to persistent GpuBuffers in the shard at load time (outside any
-// Nvfp4GraphSession) and reuse them -- replacing the per-step upload_alloc the
+// DiffGraphSession) and reuse them -- replacing the per-step upload_alloc the
 // gpu-layout path used to do, which could not be captured by a command_graph
 // (host source vector dangles at replay). Coalesced (xe2) tables are NOT built
 // here (they depend on the lazily-created coalesced weight buffers); the xe2
@@ -499,7 +499,7 @@ static bool run_shard_nvfp4_gpu_layout(
     // lazy nvfp4_coalesced_weight wait). AB knob: DIFF_NVFP4_GROUPED_GEMM (xe2).
     bool use_xe2_gemm = nvfp4_grouped_gemm_xe2_enabled();
     bool need_coal = use_xe2_gemm;
-    bool session_active = nvfp4_session_recording(q);
+    bool session_active = diff_graph_recording(q);
 
     // Persistent raw pointer tables (built once at load) for the default
     // non-coalesced path -- avoids a per-step host->device upload that cannot
@@ -647,7 +647,7 @@ static bool run_shard_nvfp4_gpu_layout(
             });
         });
     }
-    if (!nvfp4_session_recording(q)) q.wait();
+    if (!diff_graph_recording(q)) q.wait();
     diffprof::toc(q, prof.combine, t_combine);
     return true;
 }
@@ -672,7 +672,7 @@ static void run_shard(
 	    int A_all = seq * top_k;
 	    bool device_routes = idx_dev != nullptr && weight_dev != nullptr;
 
-        // Under a recording Nvfp4GraphSession the standard run_shard path is
+        // Under a recording DiffGraphSession the standard run_shard path is
         // unusable: it does a host round-trip (q.memcpy(count).wait + host
         // hot/cold bucketing with data-dependent total_rows) that neither
         // captures nor re-runs on replay. The run_shard_nvfp4_gpu_layout path is
@@ -682,7 +682,7 @@ static void run_shard(
         // only opens a session at a seq it intends to capture, so the cap is
         // moot). Single-GPU scope: this is the only shard on owner's queue, so
         // no cross-device coordination is involved. AB knob: DIFF_NVFP4_GPU_LAYOUT.
-        bool force_gpu_layout_for_session = nvfp4_session_recording(q);
+        bool force_gpu_layout_for_session = diff_graph_recording(q);
         if (device_routes && shard.nvfp4 &&
             (force_gpu_layout_for_session ||
              (nvfp4_gpu_layout_enabled() && seq <= nvfp4_gpu_layout_max_seq()))) {
@@ -1477,12 +1477,12 @@ void expert_parallel_forward(
 
         if (local) {
             add_inplace(owner_q, out, shard_out, (int)N);
-            if (!nvfp4_session_recording(owner_q)) owner_q.wait();
+            if (!diff_graph_recording(owner_q)) owner_q.wait();
         } else {
             auto tmp = diffarena::arena(owner.index).alloc<bf16>(N);
             transfer(q, shard_out, owner_q, tmp.data(), N);
             add_inplace(owner_q, out, tmp.data(), (int)N);
-            if (!nvfp4_session_recording(owner_q)) owner_q.wait();
+            if (!diff_graph_recording(owner_q)) owner_q.wait();
         }
     }
 }
@@ -1570,12 +1570,12 @@ void expert_parallel_forward(
 
         if (local) {
             add_inplace(owner_q, out, shard_out, (int)N);
-            if (!nvfp4_session_recording(owner_q)) owner_q.wait();
+            if (!diff_graph_recording(owner_q)) owner_q.wait();
         } else {
             auto tmp = diffarena::arena(owner.index).alloc<bf16>(N);
             transfer(q, shard_out, owner_q, tmp.data(), N);
             add_inplace(owner_q, out, tmp.data(), (int)N);
-            if (!nvfp4_session_recording(owner_q)) owner_q.wait();
+            if (!diff_graph_recording(owner_q)) owner_q.wait();
         }
     }
 }
