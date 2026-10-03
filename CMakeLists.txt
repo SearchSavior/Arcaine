@@ -224,6 +224,7 @@ set(KBENCH_SRCS
     src/bench/nvfp4_roofline_bench.cpp
     src/bench/diffusion_int4_fusion_bench.cpp
     src/bench/diffusion_int4_w4a8_bench.cpp
+    src/bench/diffusion_int4_grouped_s8s4_bench.cpp
     # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
     src/common/gpu/nvfp4_session.cpp)
