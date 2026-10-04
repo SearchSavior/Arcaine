@@ -9,6 +9,7 @@
 #include <unordered_set>
 
 #include "../../common/gpu/engine.hpp"
+#include "../../common/io/tensor_reader.hpp"
 
 namespace {
 
@@ -17,58 +18,6 @@ bool fused_fp8_projections_enabled() {
     if (!value) return true;
     return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
            std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
-}
-
-class TrackingTensorSource final : public TensorSource {
-public:
-    explicit TrackingTensorSource(const ShardedSafetensors& source) : source_(source) {}
-
-    const TensorView& get(const std::string& name) const override {
-        const TensorView& view = source_.get(name);
-        consumed_.insert(name);
-        return view;
-    }
-
-    bool has(const std::string& name) const override { return source_.has(name); }
-    bool consumed(const std::string& name) const { return consumed_.count(name) != 0; }
-
-private:
-    const ShardedSafetensors& source_;
-    mutable std::unordered_set<std::string> consumed_;
-};
-
-void expect_tensor(const TensorSource& source, const std::string& name,
-                   const char* dtype, std::vector<int64_t> shape) {
-    const TensorView& view = source.get(name);
-    if (view.dtype != dtype || view.shape != shape) {
-        std::ostringstream message;
-        message << "Unexpected tensor metadata for " << name << ": dtype="
-                << view.dtype << " shape=(";
-        for (size_t i = 0; i < view.shape.size(); ++i) {
-            if (i) message << ',';
-            message << view.shape[i];
-        }
-        message << ')';
-        throw std::runtime_error(message.str());
-    }
-}
-
-GpuBuffer<bf16> load_bf16(const TensorSource& source, const std::string& name,
-                          std::vector<int64_t> shape, sycl::queue& queue,
-                          bool add_one = false) {
-    expect_tensor(source, name, "BF16", std::move(shape));
-    return add_one ? upload_plus_one(source.get(name), queue, name.c_str())
-                   : upload(source.get(name), queue, name.c_str());
-}
-
-void expect_fp8(const Fp8Linear& linear, int in, int out, const std::string& name) {
-    if (linear.in_features != in || linear.out_features != out)
-        throw std::runtime_error("Unexpected FP8 linear shape: " + name);
-}
-
-void expect_nvfp4(const Nvfp4Linear& linear, int in, int out, const std::string& name) {
-    if (linear.in_features != in || linear.out_features != out)
-        throw std::runtime_error("Unexpected NVFP4 linear shape: " + name);
 }
 
 Qwen35VisionWeights load_vision(const TensorSource& source,
