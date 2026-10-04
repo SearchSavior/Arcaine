@@ -56,7 +56,7 @@ set(COMMON_SRCS
     src/register_builtins.cpp
     src/common/registry.cpp
     src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp
+    src/common/gpu/sycl_graph_session.cpp
     src/common/preprocess/tokenizer.cpp
     src/common/preprocess/chat_template.cpp
     src/common/preprocess/image_proc.cpp
@@ -89,6 +89,31 @@ set(QWEN35_SRCS
 
 # All built-in architectures linked into the inference/bench binaries.
 set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS} ${QWEN35_SRCS})
+
+# DiffusionGemma 26B-A4B (block-diffusion MoE) decoder sources. Defined here so
+# arcaine_mbench (below) can link the diffusion bench driver as well as the AR
+# registry path. Text-only path: needs no soxr / onnxruntime preprocessing.
+set(DIFFUSION_SRCS
+    src/common/preprocess/tokenizer.cpp
+    src/common/preprocess/chat_template.cpp
+    src/common/io/quant_loader.cpp
+    ${UNICODE_SRCS}
+    src/common/gpu/sycl_graph_session.cpp
+    src/modeling/diffusion_gemma/loader.cpp
+    src/modeling/diffusion_gemma/moe.cpp
+    src/common/gpu/expert_parallel.cpp
+    src/common/gpu/placement.cpp
+    src/modeling/diffusion_gemma/activation_plan.cpp
+    src/modeling/diffusion_gemma/attention.cpp
+    src/modeling/diffusion_gemma/generate.cpp
+    src/modeling/diffusion_gemma/model.cpp
+    src/modeling/diffusion_gemma/structured_read.cpp
+    src/common/gpu/mem_planner.cpp
+    src/utils/chat.cpp
+    src/utils/decision_schema.cpp
+    src/utils/viz.cpp
+    src/utils/profile.cpp
+)
 
 # ---------------------------------------------------------------------------
 add_executable(get_device_props src/utils/gpu_check.cpp)
@@ -126,7 +151,17 @@ target_link_libraries(test_chat_template_kwargs  PRIVATE DNNL::dnnl)
 # ---------------------------------------------------------------------------
 # Inference benchmark. Goes through the model registry, so it links the same
 # architecture + common sources as the main binary.
-add_executable(arcaine_mbench src/arcaine_mbench.cpp ${COMMON_SRCS} ${ARCH_SRCS})
+# Unified bench: registry/Model AR path + the diffusion block-diffusion driver
+# (selected at runtime from config.json::model_type). The two source sets share
+# common TUs, so dedup after concatenation.
+set(MBENCH_SRCS
+    src/arcaine_mbench.cpp
+    src/bench/diffusion_model_bench.hpp
+    ${COMMON_SRCS}
+    ${ARCH_SRCS}
+    ${DIFFUSION_SRCS})
+list(REMOVE_DUPLICATES MBENCH_SRCS)
+add_executable(arcaine_mbench ${MBENCH_SRCS})
 target_compile_options(arcaine_mbench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_mbench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # See gemma4: ARCH_SRCS / COMMON_SRCS include nvfp4.hpp-bearing loader TUs.
@@ -138,28 +173,6 @@ set_target_properties(arcaine_mbench PROPERTIES
 
 # ---------------------------------------------------------------------------
 # DiffusionGemma 26B-A4B (block-diffusion MoE) — hello-world driver.
-# Text-only path: needs no soxr / onnxruntime preprocessing.
-set(DIFFUSION_SRCS
-    src/common/preprocess/tokenizer.cpp
-    src/common/preprocess/chat_template.cpp
-    src/common/io/quant_loader.cpp
-    ${UNICODE_SRCS}
-    src/common/gpu/nvfp4_session.cpp
-    src/modeling/diffusion_gemma/loader.cpp
-    src/modeling/diffusion_gemma/moe.cpp
-    src/common/gpu/expert_parallel.cpp
-    src/common/gpu/placement.cpp
-    src/modeling/diffusion_gemma/activation_plan.cpp
-    src/modeling/diffusion_gemma/attention.cpp
-    src/modeling/diffusion_gemma/generate.cpp
-    src/modeling/diffusion_gemma/model.cpp
-    src/modeling/diffusion_gemma/structured_read.cpp
-    src/common/gpu/mem_planner.cpp
-    src/utils/chat.cpp
-    src/utils/decision_schema.cpp
-    src/utils/viz.cpp
-    src/utils/profile.cpp
-)
 add_executable(diffusion_gemma src/diffusion_main.cpp ${DIFFUSION_SRCS})
 target_compile_options(diffusion_gemma PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_gemma   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
@@ -186,12 +199,8 @@ target_compile_options(arcaine_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in
 target_link_options(arcaine_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 
-# llama-bench style throughput benchmark (loads once, sweeps expert kernels).
-add_executable(diffusion_bench src/diffusion_bench.cpp ${DIFFUSION_SRCS})
-target_compile_options(diffusion_bench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_bench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_bench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-target_link_libraries(diffusion_bench PRIVATE DNNL::dnnl)
+# DiffusionGemma throughput benchmark is folded into arcaine_mbench (the driver
+# is bench/diffusion_model_bench.hpp, dispatched on config.json::model_type).
 target_link_libraries(diffusion_gemma PRIVATE DNNL::dnnl)
 target_link_libraries(arcaine_server PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(arcaine_server PROPERTIES
@@ -214,9 +223,11 @@ set(KBENCH_SRCS
     src/bench/qwen35_delta_decode_fusion_bench.cpp
     src/bench/nvfp4_roofline_bench.cpp
     src/bench/diffusion_int4_fusion_bench.cpp
+    src/bench/diffusion_int4_w4a8_bench.cpp
+    src/bench/diffusion_int4_grouped_s8s4_bench.cpp
     # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
-    src/common/gpu/nvfp4_session.cpp)
+    src/common/gpu/sycl_graph_session.cpp)
 add_executable(arcaine_kbench ${KBENCH_SRCS})
 target_compile_options(arcaine_kbench PRIVATE
     -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})

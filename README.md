@@ -167,7 +167,7 @@ The API and UI share the same origin, so no CORS configuration is required.
 - oneDNN is built from source with `-DDNNL_CPU_RUNTIME=SYCL
   -DDNNL_GPU_RUNTIME=SYCL`. Mixing the binary distribution causes symbol
   conflicts — source build is required.
-- If `diffusion_bench` reports an undefined oneDNN symbol such as
+- If `arcaine_mbench` reports an undefined oneDNN symbol such as
   `dnnl_primitive_attr_set_scales_v3`, re-run the CMake configure/build step so
   the binary embeds the `/opt/onednn/lib` runtime path ahead of oneAPI/OpenVINO
   library paths.

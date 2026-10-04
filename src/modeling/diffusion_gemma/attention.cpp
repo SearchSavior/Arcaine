@@ -209,7 +209,7 @@ static void fused_sliding_decoder_kv_cache_postprocess(
     int seq, int nkv, int hd, int offset,
     float theta, float partial, float eps,
     const float* rope_cos, const float* rope_sin,
-    Nvfp4GraphSession* /*session*/ = nullptr) {
+    DiffGraphSession* /*session*/ = nullptr) {
     int pair_offset = hd / 2;
     int n_active_pairs = static_cast<int>(partial * hd / 2.0f);
     float freq_denom = static_cast<float>(hd);
@@ -273,7 +273,7 @@ static void fused_full_decoder_kv_cache_postprocess(
     int seq, int nkv, int hd, int offset,
     float theta, float partial, float eps,
     const float* rope_cos, const float* rope_sin,
-    Nvfp4GraphSession* /*session*/ = nullptr) {
+    DiffGraphSession* /*session*/ = nullptr) {
     int pair_offset = hd / 2;
     int n_active_pairs = static_cast<int>(partial * hd / 2.0f);
     float freq_denom = static_cast<float>(hd);
@@ -336,7 +336,7 @@ static void fused_sliding_qkv_postprocess(
     int seq, int nq, int nkv, int hd, int offset,
     float theta, float partial, float eps,
     const float* rope_cos, const float* rope_sin,
-    Nvfp4GraphSession* /*session*/ = nullptr) {
+    DiffGraphSession* /*session*/ = nullptr) {
     int rows = nq + 2 * nkv;
     int q_dim = nq * hd;
     int kv_dim = nkv * hd;
@@ -414,7 +414,7 @@ static void fused_full_qk_postprocess(
     int seq, int nq, int nkv, int hd, int offset,
     float theta, float partial, float eps,
     const float* rope_cos, const float* rope_sin,
-    Nvfp4GraphSession* /*session*/ = nullptr) {
+    DiffGraphSession* /*session*/ = nullptr) {
     int rows = nq + nkv;
     int q_dim = nq * hd;
     int kv_dim = nkv * hd;
@@ -495,7 +495,7 @@ struct QKV {
 QKV project_qkv(GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
                 int seq, const DiffTextConfig& cfg, int offset,
                 AttnProfileKind prof,
-                Nvfp4GraphSession* session = nullptr) {
+                DiffGraphSession* session = nullptr) {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
     int nq = cfg.num_attn_heads;
@@ -611,7 +611,7 @@ QKV project_qkv_decoder_direct_cache(
     GpuEngine& ctx, const DiffLayer& lw, const bf16* hidden,
     int seq, const DiffTextConfig& cfg, int offset,
     bf16* K_cache, bf16* V_cache, AttnProfileKind prof,
-    Nvfp4GraphSession* session = nullptr) {
+    DiffGraphSession* session = nullptr) {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
     int nq = cfg.num_attn_heads;
@@ -709,7 +709,7 @@ diffarena::Alloc<bf16> gqa_attention(
     const bf16* Kc, const bf16* Vc, int kv_len, int nkv,
     int past_offset, int sliding_window, bool causal,
     AttnProfileKind prof,
-    Nvfp4GraphSession* /*session*/ = nullptr)
+    DiffGraphSession* /*session*/ = nullptr)
 {
     auto& q = ctx.queue;
     int g = nq / nkv;
@@ -933,7 +933,7 @@ diffarena::Alloc<bf16> gqa_attention_sdpa(
     const bf16* Kc, const bf16* Vc, int kv_len, int nkv,
     const float* mask, int mask_type,
     AttnProfileKind prof,
-    Nvfp4GraphSession* /*session*/ = nullptr)
+    DiffGraphSession* /*session*/ = nullptr)
 {
     static std::unordered_map<SdpaKey, dnnl::primitive, SdpaKeyHash> cache;
 
@@ -1001,7 +1001,7 @@ void encoder_attention_forward(
     const bf16* hidden, bf16* out,
     DiffLayerKv& kv, int seq, int past_len,
     const DiffTextConfig& cfg,
-    Nvfp4GraphSession* session)
+    DiffGraphSession* session)
 {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;
@@ -1058,7 +1058,7 @@ void decoder_attention_forward(
     const bf16* hidden, bf16* out,
     DiffLayerKv& enc_kv, int seq, int enc_len,
     const DiffTextConfig& cfg,
-    Nvfp4GraphSession* session)
+    DiffGraphSession* session)
 {
     auto& q = ctx.queue;
     int H = cfg.hidden_size;

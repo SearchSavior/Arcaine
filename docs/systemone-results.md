@@ -20,10 +20,11 @@ executed 2026-09-30. The historical sections below were produced on the former
 | Host Python | 3.14.7, `transformers` 5.5.0, `tokenizers` 0.22.2 |
 
 Build is JIT: this image has no `ocloc`, so an AOT device link
-(`-fsycl-targets=intel_gpu_bmg_g31`) is unavailable. All eight default targets
-link: `arcaine_server`, `gemma4`, `diffusion_gemma`, `diffusion_bench`,
+(`-fsycl-targets=intel_gpu_bmg_g31`) is unavailable. All seven default targets
+link: `arcaine_server`, `gemma4`, `diffusion_gemma`,
 `arcaine_mbench`, `arcaine_kbench`, `test_chat_template_kwargs`,
-`get_device_props`.
+`get_device_props`. (`arcaine_mbench` carries the DiffusionGemma block-diffusion
+driver, so the former standalone `diffusion_bench` binary is gone.)
 
 Executed on the current port:
 

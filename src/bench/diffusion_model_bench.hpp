@@ -1,14 +1,16 @@
-// diffusion_bench — llama-bench style throughput benchmark for DiffusionGemma.
+// DiffusionGemma throughput benchmark driver.
 //
-// Loads the model ONCE and sweeps a matrix of {kernel} x {-p prompt tokens} x
-// {-n new tokens}, running warmup + timed runs per cell. In-process kernel
-// switching (set_nvfp4_kernel) avoids the ~9 s model reload per config.
-// Prompts are synthetic (deterministic pseudo-random token ids of the requested
-// length), like llama-bench's -p tests — content-independent prefill timing.
+// Runs inside arcaine_mbench: the AR registry path hands off to this driver
+// when config.json::model_type is "diffusion_gemma".  Loads the model ONCE and
+// sweeps a matrix of
+// {kernel} x {-p encoder tokens} x {-n new tokens}, running warmup + timed runs
+// per cell.  In-process kernel switching (set_nvfp4_kernel) avoids the model
+// reload per config.  Prompts are synthetic (deterministic pseudo-random token
+// ids), like llama-bench's -p tests — content-independent prefill timing.
 //
-//   ./build/diffusion_bench --model <dir> [options]
-//     -p 128,512        prompt token counts to sweep   (default 512)
-//     -n 128,256        new-token counts to sweep      (default 128)
+//   --model <dir> [options]
+//     -p 128,512        encoder token counts to sweep   (default 512)
+//     -n 128,256        new-token counts to sweep       (default 128)
 //     -ds 48            denoising steps                 (default 48)
 //     -w 1              warmup runs per cell            (default 1)
 //     -r 5              timed runs per cell             (default 5)
@@ -17,11 +19,13 @@
 //     --experts shard    expert placement override      (default auto)
 //     --gpus all         GPU selection validation       (default all)
 //     --device 0        visible GPU via ZE_AFFINITY_MASK (default env)
-//     --seed 42 --md
+//     --seed 42 --md --print-result --mem-plan
 //
 // Per run it reports prefill throughput, actual output throughput, canvas
 // positions/s, and the diffusion metrics (forward passes/s, tokens/forward,
 // denoising passes).
+#pragma once
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,17 +42,17 @@
 #include "common/gpu/placement.hpp"
 #include "common/gpu/device_select.hpp"
 
-namespace {
+namespace arcaine::bench {
 
-Nvfp4Kernel parse_kernel(const std::string& s) {
+inline Nvfp4Kernel diffusion_parse_kernel(const std::string& s) {
     if (s == "default") return Nvfp4Kernel::Default;
     if (s == "hybrid")  return Nvfp4Kernel::Hybrid;
-    if (s == "custom") return Nvfp4Kernel::Custom;
+    if (s == "custom")  return Nvfp4Kernel::Custom;
     if (s == "grouped-dpas" || s == "dpas" || s == "geglu-pack") return Nvfp4Kernel::GroupedDpas;
     throw std::runtime_error("unknown kernel '" + s + "' (use: default, hybrid, custom, grouped-dpas)");
 }
 
-std::vector<std::string> split_csv(const std::string& s) {
+inline std::vector<std::string> diffusion_split_csv(const std::string& s) {
     std::vector<std::string> out; size_t i = 0;
     while (i <= s.size()) { size_t j = s.find(',', i);
         if (j == std::string::npos) j = s.size();
@@ -56,15 +60,16 @@ std::vector<std::string> split_csv(const std::string& s) {
         i = j + 1; }
     return out;
 }
-std::vector<int> parse_int_csv(const std::string& s) {
-    std::vector<int> out; for (auto& t : split_csv(s)) out.push_back(std::stoi(t)); return out;
+
+inline std::vector<int> diffusion_parse_int_csv(const std::string& s) {
+    std::vector<int> out; for (auto& t : diffusion_split_csv(s)) out.push_back(std::stoi(t)); return out;
 }
 
-void unsupported_placement_value(const std::string& flag, const std::string& value) {
+inline void diffusion_unsupported_placement_value(const std::string& flag, const std::string& value) {
     throw std::runtime_error(flag + " value '" + value + "' is not implemented by this runtime yet");
 }
 
-void apply_layers_spec(const std::string& value, DiffPlacementOptions& placement) {
+inline void diffusion_apply_layers_spec(const std::string& value, DiffPlacementOptions& placement) {
     if (value == "auto") {
         placement.layer_mode = DiffLayerPlacementMode::Auto;
         placement.layer_split = -1;
@@ -75,13 +80,13 @@ void apply_layers_spec(const std::string& value, DiffPlacementOptions& placement
         placement.layer_mode = DiffLayerPlacementMode::Split;
         placement.layer_split = std::stoi(value.substr(6));
     } else if (value.rfind("ranges:", 0) == 0 || value.rfind("gpus:", 0) == 0) {
-        unsupported_placement_value("--layers", value);
+        diffusion_unsupported_placement_value("--layers", value);
     } else {
         throw std::runtime_error("--layers must be one of: auto, single, split:N, ranges:N,N,..., gpus:N");
     }
 }
 
-void apply_experts_spec(const std::string& value, DiffPlacementOptions& placement) {
+inline void diffusion_apply_experts_spec(const std::string& value, DiffPlacementOptions& placement) {
     if (value == "auto") {
         placement.expert_mode = DiffExpertPlacementMode::Auto;
     } else if (value == "layer-owner") {
@@ -91,50 +96,51 @@ void apply_experts_spec(const std::string& value, DiffPlacementOptions& placemen
     } else if (value == "local") {
         throw std::runtime_error("--experts local was renamed; use --experts layer-owner");
     } else if (value == "replicate" || value.rfind("ranges:", 0) == 0 || value.rfind("gpus:", 0) == 0) {
-        unsupported_placement_value("--experts", value);
+        diffusion_unsupported_placement_value("--experts", value);
     } else {
         throw std::runtime_error("--experts must be one of: auto, layer-owner, replicate, shard, ranges:N,N,..., gpus:N");
     }
 }
 
-void apply_gpus_spec(const std::string& value) {
+inline void diffusion_apply_gpus_spec(const std::string& value) {
     if (value != "all")
-        unsupported_placement_value("--gpus", value);
+        diffusion_unsupported_placement_value("--gpus", value);
 }
 
 // Deterministic synthetic prompt of `p` valid token ids (content-independent
 // prefill workload). Spread across a safe low vocab range.
-std::vector<int> synth_prompt(int p) {
+inline std::vector<int> diffusion_synth_prompt(int p) {
     std::vector<int> ids((size_t)p);
     uint32_t s = 0x9e3779b9u;
     for (int i = 0; i < p; ++i) { s = s * 1664525u + 1013904223u; ids[i] = 16 + (int)(s % 48000u); }
     return ids;
 }
 
-struct Stat { double mean = 0, sd = 0; };
-Stat aggregate(const std::vector<double>& v) {
-    Stat s; if (v.empty()) return s;
+struct DiffusionStat { double mean = 0, sd = 0; };
+
+inline DiffusionStat diffusion_aggregate(const std::vector<double>& v) {
+    DiffusionStat s; if (v.empty()) return s;
     for (double x : v) s.mean += x; s.mean /= v.size();
     if (v.size() > 1) { double a = 0; for (double x : v) a += (x - s.mean) * (x - s.mean);
         s.sd = std::sqrt(a / (v.size() - 1)); }
     return s;
 }
 
-struct Row {
+struct DiffusionRow {
     std::string kernel; int n_prompt, n_gen, ds, runs;
-    Stat prefill, decode, canvas, fwd; // throughputs (output t/s, canvas positions/s, passes/s)
-    double tok_per_fwd, passes;        // diffusion metrics (means)
+    DiffusionStat prefill, decode, canvas, fwd; // throughputs
+    double tok_per_fwd, passes;                 // diffusion metrics (means)
 };
 
-double output_tps_for(const DiffPerfStats& s) {
+inline double diffusion_output_tps_for(const DiffPerfStats& s) {
     return s.decode_s > 0 ? s.output_tokens / s.decode_s : 0.0;
 }
 
-double tokens_per_forward_for(const DiffPerfStats& s) {
+inline double diffusion_tokens_per_forward_for(const DiffPerfStats& s) {
     return s.decode_passes > 0 ? (double)s.output_tokens / s.decode_passes : 0.0;
 }
 
-std::string escaped_result(const std::string& s) {
+inline std::string diffusion_escaped_result(const std::string& s) {
     std::string out;
     out.reserve(s.size());
     static constexpr char hex[] = "0123456789abcdef";
@@ -152,12 +158,13 @@ std::string escaped_result(const std::string& s) {
     return out;
 }
 
-void print_bench_result(TokenizerBridge& tokenizer,
-                        const std::vector<int>& ids,
-                        const std::string& kernel,
-                        int prompt_tokens, int gen_tokens, int run, int runs) {
+inline void diffusion_print_bench_result(TokenizerBridge& tokenizer,
+                                         const std::vector<int>& ids,
+                                         const std::string& kernel,
+                                         int prompt_tokens, int gen_tokens,
+                                         int run, int runs) {
     std::string decoded = tokenizer.decode(ids);
-    std::string text = escaped_result(decoded);
+    std::string text = diffusion_escaped_result(decoded);
     std::printf("[bench-result] %-8s p%-5d n%-5d run %d/%d: "
                 "output_tokens=%zu decoded_bytes=%zu escaped_bytes=%zu\n",
                 kernel.c_str(), prompt_tokens, gen_tokens, run, runs,
@@ -165,10 +172,10 @@ void print_bench_result(TokenizerBridge& tokenizer,
     std::printf("[bench-result] text=\"%s\"\n", text.c_str());
 }
 
-void usage(const char* p) {
+inline void diffusion_usage(const char* p) {
     std::fprintf(stderr,
         "Usage: %s --model <dir> [options]\n"
-        "  -p, --p <csv>     prompt token counts to sweep   (default: 512)\n"
+        "  -p, --p <csv>     encoder token counts to sweep   (default: 512)\n"
         "  -n, --n <csv>     new-token counts to sweep       (default: 128)\n"
         "                    NOTE: block diffusion generates whole 256-token canvases,\n"
         "                    so -n sets the block count ceil(n/256); n<=256 = 1 block.\n"
@@ -186,9 +193,7 @@ void usage(const char* p) {
         "  --mem-plan        report arena planner peak vs retained capacity\n", p);
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
+inline int run_diffusion_bench(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);   // line-buffered: progress survives a kill/pipe
     std::string model_dir, kernels = "hybrid", p_csv = "512", n_csv = "128";
     std::string device_index;
@@ -211,7 +216,7 @@ int main(int argc, char** argv) {
             auto next = [&]() -> std::string {
                 if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
                 return argv[++i]; };
-            if      (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
+            if      (a == "--help" || a == "-h") { diffusion_usage(argv[0]); return 0; }
             else if (a == "--model")   model_dir = next();
             else if (a == "-p" || a == "--p") p_csv = next();
             else if (a == "-n" || a == "--n") n_csv = next();
@@ -219,21 +224,21 @@ int main(int argc, char** argv) {
             else if (a == "-w" || a == "--w") warmup = std::stoi(next());
             else if (a == "-r" || a == "--r") runs = std::stoi(next());
             else if (a == "--kernels") kernels = next();
-            else if (a == "--layers")  apply_layers_spec(next(), placement);
-            else if (a == "--experts") apply_experts_spec(next(), placement);
-            else if (a == "--gpus")    apply_gpus_spec(next());
+            else if (a == "--layers")  diffusion_apply_layers_spec(next(), placement);
+            else if (a == "--experts") diffusion_apply_experts_spec(next(), placement);
+            else if (a == "--gpus")    diffusion_apply_gpus_spec(next());
             else if (a == "--device")  { device_index = next(); device_index_set = true; }
             else if (a == "--seed")    seed = (unsigned)std::stoul(next());
             else if (a == "--md")      md = true;
             else if (a == "--print-result" || a == "--print-output") print_result = true;
             else if (a == "--mem-plan") mem_plan = true;
-            else { std::fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
+            else { std::fprintf(stderr, "unknown arg: %s\n", argv[i]); diffusion_usage(argv[0]); return 1; }
         }
-        if (model_dir.empty()) { usage(argv[0]); return 1; }
+        if (model_dir.empty()) { diffusion_usage(argv[0]); return 1; }
         if (device_index_set) gpu_device_control::apply_device_index(device_index);
 
-        std::vector<std::string> kernel_list = split_csv(kernels);
-        std::vector<int> p_list = parse_int_csv(p_csv), n_list = parse_int_csv(n_csv);
+        std::vector<std::string> kernel_list = diffusion_split_csv(kernels);
+        std::vector<int> p_list = diffusion_parse_int_csv(p_csv), n_list = diffusion_parse_int_csv(n_csv);
 
         // Size the KV cache for the largest prompt+generation in the matrix.
         int max_p = 0, max_n = 0;
@@ -270,11 +275,11 @@ int main(int argc, char** argv) {
                          scratch_env_on(std::getenv("DISABLE_SCRATCH"));
         std::printf("[bench] activation arena: %s\n",
                     arena_off ? "DISABLED (fresh alloc per op)" : "enabled (planner-sized)");
-        std::vector<Row> rows;
+        std::vector<DiffusionRow> rows;
         for (auto& kname : kernel_list) {
-            set_nvfp4_kernel(parse_kernel(kname));
+            set_nvfp4_kernel(diffusion_parse_kernel(kname));
             for (int p : p_list) {
-                std::vector<int> prompt = synth_prompt(p);
+                std::vector<int> prompt = diffusion_synth_prompt(p);
                 for (int n : n_list) {
                     // Fixed seed + fixed prompt: every run does identical work,
                     // so the reported stddev is pure timing jitter (not content
@@ -288,10 +293,10 @@ int main(int argc, char** argv) {
                         std::vector<int> out = model.generate(
                             prompt, n, ds, seed, false, nullptr, force_full_canvas);
                         const DiffPerfStats& s = model.stats();
-                        double output_tps = output_tps_for(s);
-                        double tok_per_fwd = tokens_per_forward_for(s);
+                        double output_tps = diffusion_output_tps_for(s);
+                        double tok_per_fwd = diffusion_tokens_per_forward_for(s);
                         if (result_tokenizer)
-                            print_bench_result(*result_tokenizer, out, kname, p, n, r + 1, runs);
+                            diffusion_print_bench_result(*result_tokenizer, out, kname, p, n, r + 1, runs);
                         pre.push_back(s.prefill_tps());
                         dec.push_back(output_tps);
                         fwd.push_back(s.decode_passes_ps());
@@ -307,8 +312,8 @@ int main(int argc, char** argv) {
                                     s.decode_passes_ps() * model.config().canvas_length,
                                     s.decode_passes_ps(), s.decode_passes, kv_mb_per_t, arena_gb);
                     }
-                    rows.push_back({kname, p, n, ds, runs, aggregate(pre), aggregate(dec),
-                                    aggregate(canvas), aggregate(fwd), tpf / runs, pass / runs});
+                    rows.push_back({kname, p, n, ds, runs, diffusion_aggregate(pre), diffusion_aggregate(dec),
+                                    diffusion_aggregate(canvas), diffusion_aggregate(fwd), tpf / runs, pass / runs});
                 }
             }
         }
@@ -370,3 +375,5 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
+}  // namespace arcaine::bench

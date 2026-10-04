@@ -19,6 +19,7 @@
 #include <string>
 #include "buffer.hpp"
 #include "engine.hpp"
+#include "sycl_graph_session.hpp"
 #ifndef DIFF_DPAS_INTRINSIC_DECL
 #define DIFF_DPAS_INTRINSIC_DECL
 using diff_dpas_v8s = short __attribute__((ext_vector_type(8)));
@@ -89,291 +90,47 @@ inline bool nvfp4_sycl_graph_enabled() {
     return enabled;
 }
 
-// This scope disables graph capture for one request.
-inline int& nvfp4_capture_disable_depth() {
-    static thread_local int depth = 0;
-    return depth;
-}
-inline bool nvfp4_capture_disabled() { return nvfp4_capture_disable_depth() > 0; }
-struct Nvfp4EagerScope {
-    Nvfp4EagerScope() { ++nvfp4_capture_disable_depth(); }
-    ~Nvfp4EagerScope() { --nvfp4_capture_disable_depth(); }
-    Nvfp4EagerScope(const Nvfp4EagerScope&) = delete;
-    Nvfp4EagerScope& operator=(const Nvfp4EagerScope&) = delete;
-};
-inline size_t nvfp4_sycl_graph_cache_limit() {
-    static size_t limit = [] {
-        const char* env = std::getenv("DIFF_NVFP4_SYCL_GRAPH_CACHE_LIMIT");
-        if (!env) return size_t{512};
-        char* end = nullptr;
-        unsigned long parsed = std::strtoul(env, &end, 10);
-        return end != env && parsed > 0 ? static_cast<size_t>(parsed) : size_t{512};
-    }();
-    return limit;
-}
-struct Nvfp4SyclGraphKey {
-    const sycl::queue* queue = nullptr;
-    int kind = 0;
-    std::vector<uintptr_t> args;
-    bool operator==(const Nvfp4SyclGraphKey& other) const {
-        return queue == other.queue && kind == other.kind && args == other.args;
-    }
-};
-struct Nvfp4SyclGraphKeyHash {
-    size_t operator()(const Nvfp4SyclGraphKey& key) const {
-        size_t hash = std::hash<const sycl::queue*>{}(key.queue);
-        auto mix = [&](uintptr_t value) {
-            hash ^= std::hash<uintptr_t>{}(value) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-        };
-        mix(static_cast<uintptr_t>(key.kind));
-        for (uintptr_t value : key.args) mix(value);
-        return hash;
-    }
-};
-struct Nvfp4SyclGraphEntry {
-    using Modifiable = sycl::ext::oneapi::experimental::command_graph<>;
-    using Executable = sycl::ext::oneapi::experimental::command_graph<
-        sycl::ext::oneapi::experimental::graph_state::executable>;
-    std::unique_ptr<Modifiable> graph;
-    std::unique_ptr<Executable> executable;
-    bool unavailable = false;
-};
-struct Nvfp4SyclGraphCache {
-    std::mutex mutex;
-    std::unordered_map<Nvfp4SyclGraphKey, Nvfp4SyclGraphEntry,
-                       Nvfp4SyclGraphKeyHash> entries;
-    size_t captures = 0;
-    size_t replays = 0;
-    size_t fallbacks = 0;
-    size_t capacity_bypasses = 0;
-};
-inline Nvfp4SyclGraphCache& nvfp4_sycl_graph_cache() {
-    static Nvfp4SyclGraphCache cache;
-    return cache;
-}
-inline uintptr_t nvfp4_sycl_graph_float_key(float value) {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    return bits;
-}
-
 // ---------------------------------------------------------------------------
-// Nvfp4GraphSession
+// NVFP4 SYCL-graph glue over the shared session machinery
+// (common/gpu/sycl_graph_session.hpp).
 //
 // The per-call micro-graph cache below (nvfp4_sycl_graph_submit) captures and
 // replays ONE kernel at a time, keyed by that kernel's own buffer pointers.
-// That's fine for amortizing a single pack/matmul launch, but a denoising
-// step calls many of these in sequence (attention -> router -> gather/pack ->
-// grouped GEMM -> combine), and today each still gets its own
-// begin_recording/end_recording/finalize and its own q.ext_oneapi_graph()
-// dispatch. A session instead lets a caller open ONE graph, have every kernel
-// in the step record into it (including attention kernels defined outside
-// this file), and replay the whole step with a single graph launch -- which
-// is the piece that actually removes host round-trips between kernels within
-// a step, not just between repeated steps.
-//
-// Usage:
-//   Nvfp4GraphSession session;
-//   if (session.begin(q, step_key)) {
-//       attn_forward(..., &session);
-//       moe_forward(..., &session);
-//       session.end_and_replay();
-//   } else {
-//       // cache hit: session.begin() already replayed the cached graph.
-//   }
-//
-// Layer types are static per DiffusionGemma config (layer_types is fixed at
-// model-build time), so the sequence of kernels captured for a given
-// (layer_index, is_sliding) step_key never changes shape across replays --
-// this is what makes whole-step capture safe to cache and replay verbatim,
-// the same way the per-kernel cache below already relies on stable shapes.
-// Queue-keyed registry of *actively recording* sessions. nvfp4_sycl_graph_submit()
-// consults this as a backstop: when a session is recording on a queue, ANY
-// per-kernel micro-capture attempt on that queue would call begin_recording on
-// an already-recording queue, which throws (intel-llvm graph_impl.cpp:2238) and
-// would poison the per-kernel cache (entry marked `unavailable` forever).
-// The registry lets such call sites stand down to a bare submit() -- which the
-// active session's recording captures as a node -- even when the caller didn't
-// receive an explicit session pointer (e.g. the dense-MLP pack_bf16_to_nvfp4
-// and the MoE Xe-pack paths, which thread through matmul_nvfp4 / expert_parallel
-// without an explicit session argument). Explicit session threading (Phases 1-2)
-// remains the preferred fast path; this registry is the correctness backstop.
-struct Nvfp4GraphSession;
-inline std::mutex& nvfp4_session_registry_mutex() {
-    static std::mutex m;
-    return m;
+// That amortizes a single pack/matmul launch; a DiffGraphSession instead lets
+// a caller open ONE graph over a queue, have every kernel of a whole step
+// record into it (attention, pack, matmul, grouped GEMM -- including kernels
+// defined outside this file), and replay the step with a single
+// queue.ext_oneapi_graph() dispatch, which removes the host round-trips
+// between kernels within a step, not just between repeated steps. Sessions
+// are opened by model code (modeling/diffusion_gemma/model.cpp); while any
+// session is recording on a queue the micro-cache below stands down to bare
+// submits via the shared diff_graph_active_session() registry backstop.
+// ---------------------------------------------------------------------------
+
+// nvfp4-local alias of the shared bit-cast helper; micro-capture call sites
+// key their fp parameters (scales, temperature) through it.
+inline uintptr_t nvfp4_sycl_graph_float_key(float value) {
+    return diff_graph_float_key(value);
 }
-inline std::unordered_map<const sycl::queue*, Nvfp4GraphSession*>&
-nvfp4_session_registry() {
-    static std::unordered_map<const sycl::queue*, Nvfp4GraphSession*> r;
-    return r;
-}
-// Returns the session currently recording on `q`, or nullptr if none. Called
-// on the hot path of nvfp4_sycl_graph_submit; the map is normally empty when no
-// session is active, so the lookup is a fast miss.
-inline Nvfp4GraphSession* nvfp4_active_session(const sycl::queue& q) {
-    std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
-    auto it = nvfp4_session_registry().find(&q);
-    return it == nvfp4_session_registry().end() ? nullptr : it->second;
-}
-// True iff a Nvfp4GraphSession is currently recording on `q`. Forward-declarable
-// (no Nvfp4GraphSession definition needed) so lightweight headers such as
-// utils/profile.hpp can call it without including nvfp4.hpp's DPAS intrinsics.
-// Used to skip queue waits during recording (q.wait()/stream.wait() throw on a
-// recording queue: "wait cannot be called for a queue which is recording to a
-// command graph").
-//
-// NOTE: declared here, defined out-of-line in common/gpu/expert_parallel.cpp.
-// It must NOT be `inline`: a TU that only forward-declares it (e.g. profile.cpp)
-// emits an external reference; an `inline` definition is only emitted as
-// linkonce_odr by TUs that include this header and use it, and if all such uses
-// are inlined away there is no standalone symbol to satisfy that reference.
-bool nvfp4_session_recording(const sycl::queue& q);
-struct Nvfp4GraphSession {
-    using Modifiable = sycl::ext::oneapi::experimental::command_graph<>;
-    using Executable = sycl::ext::oneapi::experimental::command_graph<
-        sycl::ext::oneapi::experimental::graph_state::executable>;
 
-    sycl::queue* queue_ = nullptr;
-    std::unique_ptr<Modifiable> graph_;
-    bool recording_ = false;
-    // True once begin() has opened a *new* recording that the caller must
-    // populate and close with end_and_replay(). False if begin() found a
-    // cached executable and already replayed it (nothing left to record).
-    bool needs_recording_ = false;
-
-    // True while this session is actively recording -- kernels submitted via
-    // nvfp4_sycl_graph_submit() check this and skip their own micro-graph
-    // capture, just enqueuing directly so they land inside the session graph.
-    bool active() const { return recording_; }
-
-    // Returns true if the caller must record the step's kernels (cache miss);
-    // false if a cached graph was found and already replayed (cache hit).
-    bool begin(sycl::queue& q, const Nvfp4SyclGraphKey& step_key) {
-        queue_ = &q;
-        if (nvfp4_capture_disabled()) {
-            needs_recording_ = false;
-            recording_ = false;
-            return true;  // per-call eager policy: caller runs kernels eagerly
-        }
-        if (!nvfp4_sycl_graph_enabled()) {
-            needs_recording_ = false;
-            recording_ = false;
-            return true;  // graphs disabled: caller runs kernels eagerly every time
-        }
-        auto& cache = nvfp4_sycl_graph_cache();
-        std::lock_guard<std::mutex> lock(cache.mutex);
-        auto found = cache.entries.find(step_key);
-        if (found != cache.entries.end() && found->second.executable) {
-            ++cache.replays;
-            q.ext_oneapi_graph(*found->second.executable);
-            needs_recording_ = false;
-            recording_ = false;
-            return false;
-        }
-        // Either not present, or present-but-unavailable (previous capture
-        // failed) -- try recording fresh. Reserve/replace the slot now so a
-        // racing session doesn't also try to record the same key.
-        if (found == cache.entries.end() &&
-            cache.entries.size() >= nvfp4_sycl_graph_cache_limit()) {
-            ++cache.capacity_bypasses;
-            needs_recording_ = false;
-            recording_ = false;
-            return true;  // caller runs kernels eagerly, no capture this time
-        }
-        key_ = step_key;
-        // assume_buffer_outlives_graph: oneDNN's SYCL interop may internally use
-        // sycl::buffer for some primitives (e.g. non-batched matmul_bf16). SYCL
-        // throws "Cannot use buffers in a graph without ... assume_buffer_outlives_graph"
-        // if a buffer-accessor is recorded into a graph lacking this property. All
-        // persistent data (weights, KV cache, arena workspaces) is USM and outlives
-        // the graph; the property is the documented oneDNN-interop capture enabler.
-        graph_ = std::make_unique<Modifiable>(q,
-            sycl::property_list{
-                sycl::ext::oneapi::experimental::property::graph::assume_buffer_outlives_graph{}});
-        try {
-            graph_->begin_recording(q);
-        } catch (const std::exception& error) {
-            graph_.reset();
-            needs_recording_ = false;
-            recording_ = false;
-            if (nvfp4_verbose())
-                std::fprintf(stderr, "[nvfp4-graph] session capture disabled: %s\n",
-                             error.what());
-            return true;  // caller runs kernels eagerly this time
-        }
-        recording_ = true;
-        needs_recording_ = true;
-        {
-            std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
-            nvfp4_session_registry()[&q] = this;
-        }
-        return true;
-    }
-
-    // Closes recording, finalizes, caches, and replays the freshly-captured
-    // graph. Call exactly once, after the caller has submitted every kernel
-    // for the step, only when begin() returned true AND active() is true
-    // (i.e. begin() did not already replay a cached hit).
-    void end_and_replay() {
-        if (!recording_) return;  // begin() already replayed a cached graph
-        auto& cache = nvfp4_sycl_graph_cache();
-        // Unregister from the active-session registry now that recording has
-        // ended, so nvfp4_sycl_graph_submit stops standing down for this queue.
-        {
-            std::lock_guard<std::mutex> lock(nvfp4_session_registry_mutex());
-            nvfp4_session_registry().erase(queue_);
-        }
-        try {
-            graph_->end_recording(*queue_);
-            recording_ = false;
-            auto executable = std::make_unique<Executable>(graph_->finalize());
-            std::lock_guard<std::mutex> lock(cache.mutex);
-            Nvfp4SyclGraphEntry entry;
-            entry.graph = std::move(graph_);
-            entry.executable = std::move(executable);
-            ++cache.captures;
-            queue_->ext_oneapi_graph(*entry.executable);
-            cache.entries[key_] = std::move(entry);
-        } catch (const std::exception& error) {
-            if (recording_) {
-                try { graph_->end_recording(*queue_); } catch (...) {}
-                recording_ = false;
-            }
-            std::lock_guard<std::mutex> lock(cache.mutex);
-            ++cache.fallbacks;
-            Nvfp4SyclGraphEntry entry;
-            entry.unavailable = true;
-            cache.entries[key_] = std::move(entry);
-            if (nvfp4_verbose())
-                std::fprintf(stderr, "[nvfp4-graph] session finalize failed: %s\n",
-                             error.what());
-            // Kernels already ran eagerly on queue_ during recording attempts
-            // in SYCL graph semantics recording still enqueues work, so no
-            // separate re-run is needed here; the step's results are correct,
-            // only the *caching* of it for next time failed.
-        }
-    }
-
-    Nvfp4SyclGraphKey key_;
-};
-
-// Builds a step-level cache key from a layer index and its (static) attention
-// kind, so sliding-window layers and global layers -- which submit different
-// kernel sequences -- are never conflated into the same cached graph even
-// though both are "one decoder layer step" at the call site.
-inline Nvfp4SyclGraphKey nvfp4_step_key(const sycl::queue& q, int layer_index,
-                                       bool is_sliding, int denoise_step) {
+// NVFP4 whole-layer step key: (queue, Nvfp4 scope, layer index, attention
+// kind). Layer types are static per DiffusionGemma config, so sliding-window
+// layers and global layers -- which submit different kernel sequences -- are
+// never conflated into the same cached graph.
+inline DiffGraphKey nvfp4_step_key(const sycl::queue& q, int layer_index,
+                                        bool is_sliding, int denoise_step) {
     // denoise_step is intentionally NOT part of the key for the *replay*
     // path -- the kernel sequence for "decoder layer L, sliding" is identical
-    // on every denoising step, so one capture at step 0 should serve all
-    // subsequent steps. It's accepted here only so callers that want
-    // per-step keys (e.g. while validating that shapes truly don't change
-    // across steps) can opt into it via kind, without changing this
+    // on every denoising step (the NVFP4 path shapes everything on
+    // enc_len/seq, which travel in the caller's dispatch decision), so one
+    // capture at step 0 serves all subsequent steps. It's accepted here only
+    // so callers that want per-step keys (e.g. while validating that shapes
+    // truly don't change across steps) can opt into it without changing this
     // function's signature.
     (void)denoise_step;
-    Nvfp4SyclGraphKey key;
+    DiffGraphKey key;
     key.queue = &q;
+    key.scope = static_cast<int>(DiffGraphScope::Nvfp4);
     key.kind = 1000 + layer_index * 2 + (is_sliding ? 0 : 1);
     return key;
 }
@@ -382,27 +139,27 @@ template <class Submit>
 inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
                                     std::initializer_list<uintptr_t> args,
                                     Submit&& submit,
-                                    Nvfp4GraphSession* session = nullptr) {
-    if (nvfp4_capture_disabled()) {
+                                    DiffGraphSession* session = nullptr) {
+    if (diff_graph_capture_disabled()) {
         // Per-call eager policy (structured reads): bypass every micro-capture.
         submit();
         return;
     }
     if (session && session->active()) {
-        // An outer Nvfp4GraphSession is already recording this step's graph;
+        // An outer DiffGraphSession is already recording this step's graph;
         // just enqueue -- it gets captured as part of that larger graph
         // rather than owning its own begin/end/finalize here.
         submit();
         return;
     }
-    if (Nvfp4GraphSession* active = nvfp4_active_session(q)) {
+    if (DiffGraphSession* active = diff_graph_active_session(q)) {
         // Backstop: a session is recording on this queue but the caller didn't
-        // carry an explicit session pointer (e.g. dense-MLP pack_bf16_to_nvfp4
-        // via matmul_nvfp4, or MoE pack paths via expert_parallel). Stand down
-        // the same way -- a bare submit() is captured as a node of the active
-        // session's graph. Without this, the begin_recording() below would
-        // throw on the already-recording queue and poison this per-kernel
-        // cache entry (unavailable forever).
+        // carry an explicit session pointer (e.g. the dense-MLP
+        // pack_bf16_to_nvfp4 via matmul_nvfp4, or MoE pack paths via
+        // expert_parallel). Stand down the same way -- a bare submit() is
+        // captured as a node of the active session's graph. Without this,
+        // the begin_recording() below would throw on the already-recording
+        // queue and poison this per-kernel cache entry (unavailable forever).
         (void)active;
         submit();
         return;
@@ -411,8 +168,12 @@ inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
         submit();
         return;
     }
-    Nvfp4SyclGraphKey key{&q, kind, args};
-    auto& cache = nvfp4_sycl_graph_cache();
+    DiffGraphKey key;
+    key.queue = &q;
+    key.scope = static_cast<int>(DiffGraphScope::Nvfp4);
+    key.kind = kind;
+    key.args.assign(args);
+    auto& cache = diff_graph_cache();
     std::lock_guard<std::mutex> lock(cache.mutex);
     auto found = cache.entries.find(key);
     if (found != cache.entries.end()) {
@@ -425,22 +186,23 @@ inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
         submit();
         return;
     }
-    if (cache.entries.size() >= nvfp4_sycl_graph_cache_limit()) {
+    if (cache.entries.size() >= diff_graph_cache_limit()) {
         ++cache.capacity_bypasses;
         submit();
         return;
     }
-    auto [it, inserted] = cache.entries.emplace(std::move(key), Nvfp4SyclGraphEntry{});
+    auto [it, inserted] = cache.entries.emplace(std::move(key), DiffGraphEntry{});
     auto& entry = it->second;
     bool recording = false;
     try {
-        entry.graph = std::make_unique<Nvfp4SyclGraphEntry::Modifiable>(q);
+        entry.graph = std::make_unique<DiffGraphEntry::Modifiable>(q);
         entry.graph->begin_recording(q);
         recording = true;
         submit();
         entry.graph->end_recording(q);
         recording = false;
-        entry.executable = std::make_unique<Nvfp4SyclGraphEntry::Executable>(entry.graph->finalize());
+        entry.executable = std::make_unique<DiffGraphEntry::Executable>(entry.graph->finalize());
+        entry.warmed = true;
         ++cache.captures;
         q.ext_oneapi_graph(*entry.executable);
     } catch (const std::exception& error) {
@@ -453,20 +215,12 @@ inline void nvfp4_sycl_graph_submit(sycl::queue& q, int kind,
         entry.graph.reset();
         entry.executable.reset();
         entry.unavailable = true;
+        entry.warmed = true;
         ++cache.fallbacks;
         if (nvfp4_verbose())
             std::fprintf(stderr, "[nvfp4-graph] capture disabled: %s\n", error.what());
         submit();
     }
-}
-inline void nvfp4_sycl_graph_report() {
-    if (!nvfp4_sycl_graph_enabled()) return;
-    auto& cache = nvfp4_sycl_graph_cache();
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    std::fprintf(stderr,
-                 "[nvfp4-graph] captures=%zu replays=%zu fallbacks=%zu cache-bypasses=%zu entries=%zu\n",
-                 cache.captures, cache.replays, cache.fallbacks,
-                 cache.capacity_bypasses, cache.entries.size());
 }
 struct Nvfp4MatmulKey {
     int gpu, M, K, N, layout;
@@ -548,7 +302,7 @@ inline void pack_bf16_to_nvfp4(
     int M,
     int K,
     float input_global_scale,
-    Nvfp4GraphSession* session = nullptr)
+    DiffGraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("NVFP4 activation K must be divisible by 16");
     int G = K / 16;
@@ -883,7 +637,7 @@ inline void matmul_nvfp4(
     // ctx.stream.wait() (the in-order queue serializes the pack before the
     // matmul, and the workspace is owned by the caller so there is no
     // use-after-free on free). This makes matmul_nvfp4 safe to capture inside a
-    // Nvfp4GraphSession. Without caller workspaces, fall back to the original
+    // DiffGraphSession. Without caller workspaces, fall back to the original
     // transient-GpuBuffer + synchronous-wait behavior (unchanged for existing
     // callers that don't opt in).
     if (A_packed_buf && A_scale_buf) {
@@ -899,7 +653,7 @@ inline void matmul_nvfp4(
     matmul_nvfp4_packed(A_packed.data(), A_scale.data(), M, K, W, C, ctx);
     // A_packed/A_scale are temporary workspaces owned by this call. Keep the
     // execution synchronous until callers pass reusable workspaces explicitly.
-    if (!nvfp4_session_recording(q)) ctx.stream.wait();
+    if (!diff_graph_recording(q)) ctx.stream.wait();
 }
 inline float nvfp4_e2m1_to_float(uint8_t bits) {
     float mag = 0.0f;
@@ -1264,7 +1018,7 @@ inline void pack_bf16_to_nvfp4_grouped(
     const float* input_global_scale,
     uint8_t* packed,
     uint8_t* scales,
-    Nvfp4GraphSession* session = nullptr)
+    DiffGraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("grouped NVFP4 activation K must be divisible by 16");
     int G = K / 16;
@@ -1327,7 +1081,7 @@ inline void geglu_pack_nvfp4_grouped(
     const float* input_global_scale,  // [num_experts] (down proj's per-expert input scale)
     uint8_t* packed,              // [total_rows, inter/2]
     uint8_t* scales,              // [total_rows, inter/16]
-    Nvfp4GraphSession* session = nullptr)
+    DiffGraphSession* session = nullptr)
 {
     if (inter % 16 != 0)
         throw std::runtime_error("geglu_pack_nvfp4_grouped: inter must be divisible by 16");
@@ -1407,7 +1161,7 @@ inline void scatter_pack_nvfp4_grouped(
     int top_k,
     uint8_t* packed,             // [total_rows, H/2]
     uint8_t* scales,             // [total_rows, H/16]
-    Nvfp4GraphSession* session = nullptr)
+    DiffGraphSession* session = nullptr)
 {
     if (H % 16 != 0)
         throw std::runtime_error("scatter_pack_nvfp4_grouped: H must be divisible by 16");
@@ -1465,7 +1219,7 @@ inline void scatter_pack_nvfp4_grouped(
 // These submit raw sycl kernels via q.submit (no oneDNN primitive, no per-kernel
 // nvfp4_sycl_graph_submit wrapper). Session-awareness (Phase 2): each accepts a
 // trailing `session` pointer for API consistency with the pack functions and so
-// the orchestrator (Phase 3) can pass an active Nvfp4GraphSession through the
+// the orchestrator (Phase 3) can pass an active DiffGraphSession through the
 // MoE call chain. They are NOT individually wrapped in nvfp4_sycl_graph_submit
 // (task Phase-2 option a) because:
 //   * Under an active session recording, bare q.submit calls are captured
@@ -1494,7 +1248,7 @@ inline void matmul_nvfp4_grouped_custom(
     const float* const* dst_scale_by_expert,
     int N,
     bf16* C,
-    Nvfp4GraphSession* /*session*/ = nullptr)
+    DiffGraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("grouped NVFP4 matmul K must be divisible by 16");
     int G = K / 16;
@@ -1540,7 +1294,7 @@ inline void pack_bf16_to_nvfp4_grouped_rows(
     const float* input_global_scale,
     uint8_t* packed,
     uint8_t* scales,
-    Nvfp4GraphSession* session = nullptr)
+    DiffGraphSession* session = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("counted grouped NVFP4 activation K must be divisible by 16");
     int G = K / 16;
@@ -1633,7 +1387,7 @@ inline void matmul_nvfp4_grouped_dpas_gateup_geglu_pack(
     const float* down_input_global_scale,      // [localE] down proj input scale
     uint8_t* act_packed,              // [total_rows, inter/2]
     uint8_t* act_scale,              // [total_rows, inter/16]
-    Nvfp4GraphSession* /*session*/ = nullptr)
+    DiffGraphSession* /*session*/ = nullptr)
 {
     if (H % 16 != 0 || inter % 16 != 0)
         throw std::runtime_error("grouped-dpas gateup: H and inter must be divisible by 16");
@@ -1771,7 +1525,7 @@ inline void matmul_nvfp4_grouped_rows_custom(
     const float* const* dst_scale_by_expert,
     int N,
     bf16* C,
-    Nvfp4GraphSession* /*session*/ = nullptr)
+    DiffGraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0) throw std::runtime_error("counted grouped NVFP4 matmul K must be divisible by 16");
     int G = K / 16;
@@ -1820,7 +1574,7 @@ inline void matmul_nvfp4_grouped_rows_xe2(
     const float* const* dst_scale_by_expert,
     int N,
     bf16* C,
-    Nvfp4GraphSession* /*session*/ = nullptr)
+    DiffGraphSession* /*session*/ = nullptr)
 {
     if (K % 16 != 0 || N % 16 != 0)
         throw std::runtime_error("xe2 grouped NVFP4 matmul requires K%16 and N%16");

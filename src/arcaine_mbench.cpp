@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -28,6 +30,24 @@
 #include "common/registry.hpp"
 #include "common/gpu/device_select.hpp"
 #include "common/gpu/engine.hpp"
+#include "bench/diffusion_model_bench.hpp"
+
+// Reads config.json::model_type without constructing the model.
+static std::string read_model_type(const std::string& model_dir) {
+    std::ifstream f(model_dir + "/config.json");
+    if (!f) return "";
+    std::string s((std::istreambuf_iterator<char>(f)),
+                  std::istreambuf_iterator<char>());
+    auto p = s.find("\"model_type\"");
+    if (p == std::string::npos) return "";
+    p = s.find(':', p);
+    if (p == std::string::npos) return "";
+    p = s.find('"', p);
+    if (p == std::string::npos) return "";
+    auto q = s.find('"', p + 1);
+    if (q == std::string::npos) return "";
+    return s.substr(p + 1, q - p - 1);
+}
 
 // ---------------------------------------------------------------------------
 using Clk = std::chrono::high_resolution_clock;
@@ -103,7 +123,23 @@ int main(int argc, char* argv[]) {
         "  -r, --r R     timed repetitions      (default: 3)\n"
         "  -w, --w W     warmup runs            (default: 1)\n"
         "  --max-seq N   KvCache capacity       (default: auto)\n"
-        "  --device N    run with one visible Level Zero GPU\n";
+        "  --device N    run with one visible Level Zero GPU\n"
+        "\n"
+        "DiffusionGemma models delegate to the block-diffusion driver, which\n"
+        "accepts -ds/--kernels/--layers/--experts/--seed/--md/--print-result.\n";
+
+    // DiffusionGemma uses a different arg set (-ds/--experts/...), so detect
+    // the architecture up front and hand off before the AR parser rejects it.
+    {
+        std::string pre_model;
+        for (int i = 1; i + 1 < argc; ++i)
+            if (!strcmp(argv[i], "--model") || !strcmp(argv[i], "-m"))
+                pre_model = argv[i + 1];
+        if (pre_model.empty() && argc > 1 && argv[1][0] != '-')
+            pre_model = argv[1];
+        if (!pre_model.empty() && read_model_type(pre_model) == "diffusion_gemma")
+            return arcaine::bench::run_diffusion_bench(argc, argv);
+    }
 
     std::string model_dir;
     std::vector<int> pp_list  = {128, 512};

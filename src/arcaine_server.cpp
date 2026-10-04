@@ -28,7 +28,7 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
-#include "common/gpu/nvfp4_session_stats.hpp"
+#include "common/gpu/diff_graph_stats.hpp"
 #include "common/gpu/placement.hpp"
 #include "common/model_interface.hpp"
 #include "common/registry.hpp"
@@ -1409,14 +1409,14 @@ void handle_systemone(const httplib::Request& req, httplib::Response& res,
         json answers = json::object();
         json diagnostics = json::object();
         long long input_tokens = 0, output_tokens = 0;
-        Nvfp4GraphCounts graph_before{}, graph_after{};
+        DiffGraphCounts graph_before{}, graph_after{};
         {
             // Run questions in order under the model lock.
             std::lock_guard<std::mutex> lock(app.generate_mu);
             // Read both graph counters inside the lock. A concurrent chat call
             // would otherwise add captures or replays between the two reads, and
             // the delta would not describe this structured request.
-            if (dreq.want_diagnostics) graph_before = nvfp4_graph_capture_counts();
+            if (dreq.want_diagnostics) graph_before = diff_graph_capture_counts();
             for (auto& q : dreq.questions) {
                 DecisionReadResult r = model.read_decisions(
                     q.prompt_ids, q.templ, read_options(q.stream_seed));
@@ -1430,7 +1430,7 @@ void handle_systemone(const httplib::Request& req, httplib::Response& res,
                     answers[q.external_id] = dg::map_decision_answer(q, r, nullptr);
                 }
             }
-            if (dreq.want_diagnostics) graph_after = nvfp4_graph_capture_counts();
+            if (dreq.want_diagnostics) graph_after = diff_graph_capture_counts();
         }
 
         json out;

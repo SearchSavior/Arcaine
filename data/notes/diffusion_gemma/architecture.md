@@ -56,6 +56,27 @@ All three fusions preserve the original BF16 rounding boundaries. The expert
 weighted sum is explicitly rounded to BF16 before RMS statistics, and the
 self-conditioning residual is rounded to BF16 before its norm.
 
+## W4A8 prefill path
+
+`DIFF_INT4_W4A8_PREFILL=1` switches the quantized projections from the default
+W4A16 path (BF16 activations, oneDNN decompresses s4 weights into a BF16 GEMM)
+to a mixed s8×s4 GEMM: the activations are quantized to s8 per-token and oneDNN
+runs its native mixed s8xs4 DPAS, which pre-Xe3p (BMG) supports directly when
+the s4 matrix carries no zero points. The weights are unchanged — same raw
+`tag::ba` nibble stream and group-32 BF16 scales — and the weight dequant stays
+in the GEMM epilogue, so only the activation side changes.
+
+Dispatch is applied only when it is measured to win: `M >= 128`
+(`DIFF_INT4_W4A8_MIN_M`), `K >= 1024`, and `N >= K`. Narrow output projections
+(o_proj, N < K) and the small-K expert down projection regress 0.5–0.96× and
+stay on W4A16, as do the small per-expert decode buckets. On the wide
+projections (q/k/v, fused qkv/qk) it is 1.15–1.5× on the GEMM. End-to-end the
+gain is modest (prefill +0.4–3.9 %, decode/canvas +1–9 %) because the MoE expert
+GEMMs dominate and remain W4A16.
+
+Kernel-path benchmark (no model load):
+`./build/arcaine_kbench diffusion-int4-w4a8 --m 256,512,1024,2048 --k 2816 --n 8192`
+
 ## Remaining INT4 MoE opportunity
 
 The dominant unfused region is expert execution itself: a device route is

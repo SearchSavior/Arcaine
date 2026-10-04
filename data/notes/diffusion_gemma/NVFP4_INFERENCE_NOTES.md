@@ -320,11 +320,11 @@ bucket choices, and custom expert kernels without changing normal CLI behavior:
   for apples-to-apples per-pass throughput. For real-world signal prefer a full
   generation (`--steps 48 --max-tokens 2048`, longish prompt, no force).
 
-**Benchmarking:** prefer `build/diffusion_bench` (llama-bench style) — it loads
+**Benchmarking:** prefer `build/arcaine_mbench` (llama-bench style) — it loads
 the model once and sweeps kernels in-process with warmup + reps + mean/stddev:
-`./build/diffusion_bench --model <dir> --kernels default,hybrid,custom --reps 5
+`./build/arcaine_mbench --model <dir> --kernels default,hybrid,custom -r 5
 [--md]`. It uses the runtime `set_nvfp4_kernel()` API rather than the env vars,
-so no per-config model reload. See `src/diffusion_bench.cpp`.
+so no per-config model reload. See `src/bench/diffusion_model_bench.hpp`.
 
 A tiled Battlemage XMX/DPAS expert kernel (reached via the SPIR-V Intel
 sub-group matrix-mad builtin, since portable SYCL `joint_matrix` is
