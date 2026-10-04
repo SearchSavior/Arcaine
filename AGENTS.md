@@ -17,7 +17,18 @@ AGENTS.md documents rules and practices for working in the Arcaine repository; t
 - **PREFER** `reference-use` skill over `webfetch` to reference source code used in this project.
 
 - **NEVER** use `/tmp` for scratch work. **REFER** to `scratchpad` skill.
-### Modules
+
+
+## Best Practices
+
+Refer to these when making decisions in long sessions.
+
+- If you notice anything while working that could help me give you better tools for the task, call it out and explain the siutation 
+
+- Adding a model starts with deciding what kernels it needs and building a scaffold under `modeling`. Usually operators will provide instructions to get you going.
+
+
+## Codebase Modules
 
 Arcaine compiles into a few binaries which stratify the codebase into distinct modules that interop with model, kernel and benchmark implementations. The next sections describe intended end-state and collection surfaces for interacting with the Arcaine codebase.
 
@@ -31,15 +42,23 @@ Workflow: the last stage of model deployment
 
 CLI based end-to-end benchmarking tool for evalutation of implemented inference pipelines. Mirrors real world conditions in a synthetic setting. 
 
-Workflow:
+Once `arcaine_mbench` is deemed the appropriate test evaluate these kv-cache depths for language models depending on stage of development.
+
+- **EARLY DAYS** and correctness- conservative path: `512,1024,2048,4096`
+    - For probing and baselines
+- **DEEPER** long context: `8192,12000,16384,32000`
+    - Only promote to this level once the pipeline is correct.
+
+- For **BASELINE** runs if the test or environment has not changed between runs do not rerun
+
 
 #### `arcaine_kbench`
 
 CLI based benchmarking tool to coordinate individual kernels extracted from the data flow. 
 
-- When first adding a kernel to Arcaine, register its shapes and profiling semantics here. 
+- When adding a kernel to Arcaine, register its shapes and profiling semantics to iterate. 
 
-- Scratchpad
+- 
 
 
 
