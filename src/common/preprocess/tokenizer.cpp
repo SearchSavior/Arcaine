@@ -55,11 +55,23 @@ Tokenizer Tokenizer::from_json(const std::string& path) {
                   });
     }
 
-    // merges: [["piece_a", "piece_b"], ...] — array of 2-element arrays
+    // merges: [["piece_a","piece_b"], ...] OR ["piece_a piece_b", ...]. Newer
+    // byte-level BPE exports (e.g. Qwen-AgentWorld) use the flat string form,
+    // where the two pieces are separated by a single space (byte-level pieces
+    // encode spaces as Ġ, so the first literal space is the separator).
     auto& merges = model["merges"];
     for (int i = 0; i < (int)merges.size(); ++i) {
-        std::string a = merges[i][0].get<std::string>();
-        std::string b = merges[i][1].get<std::string>();
+        std::string a, b;
+        if (merges[i].is_array()) {
+            a = merges[i][0].get<std::string>();
+            b = merges[i][1].get<std::string>();
+        } else {
+            const std::string entry = merges[i].get<std::string>();
+            size_t sp = entry.find(' ');
+            if (sp == std::string::npos) continue;
+            a = entry.substr(0, sp);
+            b = entry.substr(sp + 1);
+        }
         tok.merge_rank_[a + " " + b] = i;
     }
 

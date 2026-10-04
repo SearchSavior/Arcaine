@@ -67,7 +67,15 @@ TokenizerMetadata load_tokenizer_metadata(const std::string& model_dir) {
     if (t.contains("video_token")) {
         meta.video_token = string_or_empty(t, "video_token");
     } else if (t.contains("extra_special_tokens") && !t.at("extra_special_tokens").empty()) {
-        meta.video_token = t.at("extra_special_tokens").at(0).get<std::string>();
+        // Newer tokenizer_config.json stores this as an object keyed by token
+        // name; older exports used an array.
+        const auto& extra = t.at("extra_special_tokens");
+        if (extra.is_object()) {
+            if (extra.contains("video_token") && extra.at("video_token").is_string())
+                meta.video_token = extra.at("video_token").get<std::string>();
+        } else if (extra.is_array()) {
+            meta.video_token = extra.at(0).get<std::string>();
+        }
     }
     return meta;
 }

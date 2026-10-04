@@ -4,8 +4,59 @@
 #include <stdexcept>
 #include <string>
 
+#include "../../common/io/tensor_reader.hpp"
+
 namespace {
 const char* kPrefix = "model.language_model.";
+
+// Pick the projection's quantization from the checkpoint: I32 packed -> AWQ
+// INT4, U8 packed -> NVFP4, otherwise a plain (BF16/F16) weight.
+QwenLinearWeight load_linear(const TensorSource& sf, const std::string& prefix,
+                             sycl::queue& q) {
+    QwenLinearWeight w;
+    if (sf.has(prefix + ".weight_packed")) {
+        if (sf.get(prefix + ".weight_packed").dtype == "I32") {
+            w.kind = QwenLinearWeight::Kind::INT4;
+            w.int4 = upload_int4_linear(sf, prefix, q);
+            w.out_features = w.int4.out_features;
+        } else {
+            w.kind = QwenLinearWeight::Kind::NVFP4;
+            w.fp4 = upload_nvfp4_linear(sf, prefix, q);
+            w.out_features = w.fp4.out_features;
+        }
+    } else {
+        const TensorView& tv = sf.get(prefix + ".weight");
+        w.kind = QwenLinearWeight::Kind::BF16;
+        w.bf16 = upload(tv, q, (prefix + ".weight").c_str());
+        w.out_features = (int)tv.shape[0];
+    }
+    return w;
+}
+
+// gate_proj + up_proj fused into one (2*out, K) projection for the SwiGLU path.
+QwenLinearWeight load_linear_pair(const TensorSource& sf, const std::string& gate,
+                                  const std::string& up, sycl::queue& q) {
+    QwenLinearWeight w;
+    if (sf.has(gate + ".weight_packed")) {
+        if (sf.get(gate + ".weight_packed").dtype == "I32") {
+            w.kind = QwenLinearWeight::Kind::INT4;
+            w.int4 = upload_int4_linear_pair(sf, gate, up, q);
+            w.out_features = w.int4.out_features;
+        } else {
+            w.kind = QwenLinearWeight::Kind::NVFP4;
+            w.fp4 = upload_nvfp4_linear_pair(sf, gate, up, q);
+            w.out_features = w.fp4.out_features;
+        }
+    } else {
+        const TensorView& gtv = sf.get(gate + ".weight");
+        w.kind = QwenLinearWeight::Kind::BF16;
+        w.bf16 = upload_bf16_pair(gtv, sf.get(up + ".weight"), q,
+                                  (gate + ".weight").c_str());
+        w.out_features = (int)gtv.shape[0] * 2;
+    }
+    return w;
+}
+
 }  // namespace
 
 QwenWeights load_qwen_weights(const TensorSource& sf, const QwenConfig& cfg,
@@ -39,10 +90,10 @@ QwenWeights load_qwen_weights(const TensorSource& sf, const QwenConfig& cfg,
         if (layer.is_full_attention) {
             QwenFullAttn a;
             const std::string ap = lp + "self_attn.";
-            a.q_proj = upload_nvfp4_linear(sf, ap + "q_proj", q);
-            a.k_proj = upload_nvfp4_linear(sf, ap + "k_proj", q);
-            a.v_proj = upload_nvfp4_linear(sf, ap + "v_proj", q);
-            a.o_proj = upload_nvfp4_linear(sf, ap + "o_proj", q);
+            a.q_proj = load_linear(sf, ap + "q_proj", q);
+            a.k_proj = load_linear(sf, ap + "k_proj", q);
+            a.v_proj = load_linear(sf, ap + "v_proj", q);
+            a.o_proj = load_linear(sf, ap + "o_proj", q);
             a.q_norm = upload_plus_one(sf.get(ap + "q_norm.weight"), q, (ap + "q_norm.weight").c_str());
             a.k_norm = upload_plus_one(sf.get(ap + "k_norm.weight"), q, (ap + "k_norm.weight").c_str());
             layer.attn = std::move(a);
@@ -63,7 +114,7 @@ QwenWeights load_qwen_weights(const TensorSource& sf, const QwenConfig& cfg,
             a.A_log       = upload(sf.get(ap + "A_log"), q, (ap + "A_log").c_str());
             a.dt_bias     = upload(sf.get(ap + "dt_bias"), q, (ap + "dt_bias").c_str());
             a.norm        = upload(sf.get(ap + "norm.weight"), q, (ap + "norm.weight").c_str());
-            a.out_proj    = upload_nvfp4_linear(sf, ap + "out_proj", q);
+            a.out_proj    = load_linear(sf, ap + "out_proj", q);
             layer.attn = std::move(a);
         }
 
@@ -76,12 +127,12 @@ QwenWeights load_qwen_weights(const TensorSource& sf, const QwenConfig& cfg,
         for (int e = 0; e < cfg.num_experts; ++e) {
             const std::string ep = mp + "experts." + std::to_string(e) + ".";
             m.experts_gate_up.push_back(
-                upload_nvfp4_linear_pair(sf, ep + "gate_proj", ep + "up_proj", q));
-            m.experts_down.push_back(upload_nvfp4_linear(sf, ep + "down_proj", q));
+                load_linear_pair(sf, ep + "gate_proj", ep + "up_proj", q));
+            m.experts_down.push_back(load_linear(sf, ep + "down_proj", q));
         }
         const std::string sep = mp + "shared_expert.";
-        m.shared_gate_up = upload_nvfp4_linear_pair(sf, sep + "gate_proj", sep + "up_proj", q);
-        m.shared_down    = upload_nvfp4_linear(sf, sep + "down_proj", q);
+        m.shared_gate_up = load_linear_pair(sf, sep + "gate_proj", sep + "up_proj", q);
+        m.shared_down    = load_linear(sf, sep + "down_proj", q);
         m.shared_expert_gate =
             upload(sf.get(mp + "shared_expert_gate.weight"), q,
                    (mp + "shared_expert_gate.weight").c_str());

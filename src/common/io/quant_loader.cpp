@@ -119,12 +119,16 @@ GpuBuffer<bf16> upload_plus_one(const TensorView& tv, sycl::queue& q, const char
         const bf16* src = static_cast<const bf16*>(tv.data);
         for (size_t i = 0; i < n; ++i)
             staging[i] = float_to_bf16(bf16_to_float(src[i]) + 1.0f);
+    } else if (tv.dtype == "F16") {
+        const uint16_t* src = static_cast<const uint16_t*>(tv.data);
+        for (size_t i = 0; i < n; ++i)
+            staging[i] = float_to_bf16(f16_to_float(src[i]) + 1.0f);
     } else if (tv.dtype == "F32") {
         const float* src = static_cast<const float*>(tv.data);
         for (size_t i = 0; i < n; ++i)
             staging[i] = float_to_bf16(src[i] + 1.0f);
     } else {
-        throw std::runtime_error(std::string("Expected BF16/F32 for +1 norm ") + name + ", got " + tv.dtype);
+        throw std::runtime_error(std::string("Expected BF16/F16/F32 for +1 norm ") + name + ", got " + tv.dtype);
     }
     GpuBuffer<bf16> buf(n, q);
     buf.upload(staging.data(), n);
@@ -442,6 +446,52 @@ GpuBuffer<uint8_t> upload_int4_packed_rebased(
     return upload_int4_packed_rebased(std::vector<ByteSpan>{{data, bytes}}, bytes, q);
 }
 
+// Unpack compressed-tensors asymmetric int4 weight zero points. Stored as int32
+// with 8 little-endian 4-bit nibbles per word, each nibble = zp + 8. Two possible
+// axis orders are accepted based on the stored shape: rows = out/8 (packed along
+// N, observed for Qwen-AgentWorld, e.g. down_proj [N/8=256, groups=16]) or rows =
+// groups. Returns signed int8 laid out (groups, out_features) row-major — exactly
+// oneDNN's weights zero-point layout {G, N} for mask (K|N), groups {group_size,1}.
+std::vector<int8_t> unpack_int4_zero_point_host(const TensorView& tv, int out_features,
+                                                int groups, const char* name) {
+    if (tv.dtype != "I32")
+        throw std::runtime_error(std::string("Expected I32 packed zero point for ") + name + ", got " + tv.dtype);
+    if (groups <= 0 || out_features <= 0)
+        throw std::runtime_error(std::string("Bad zero-point dims for ") + name);
+    int words_n = (out_features + 7) / 8;
+    if (tv.shape.size() != 2)
+        throw std::runtime_error(std::string("Unexpected zero-point shape for ") + name);
+
+    long d0 = tv.shape[0], d1 = tv.shape[1];
+    bool row_is_n = (d0 == words_n && d1 == groups);      // [N/8, groups]
+    bool row_is_g = (d0 == groups && d1 == words_n);     // [groups, N/8]
+    if (!row_is_n && !row_is_g)
+        throw std::runtime_error(std::string("Unexpected zero-point shape for ") + name);
+
+    const int32_t* src = static_cast<const int32_t*>(tv.data);
+    std::vector<int8_t> out((size_t)groups * out_features);
+    for (int g = 0; g < groups; ++g) {
+        for (int n = 0; n < out_features; ++n) {
+            int32_t word = row_is_n ? src[(size_t)(n / 8) * groups + g]
+                                    : src[(size_t)g * words_n + n / 8];
+            int nib = (word >> (4 * (n % 8))) & 0xF;
+            out[(size_t)g * out_features + n] = (int8_t)(nib - 8);
+        }
+    }
+    return out;
+}
+
+void attach_int4_zero_point(const TensorSource& sf, const std::string& prefix,
+                            int out_features, int groups, sycl::queue& q, Int4Linear& lin) {
+    if (!sf.has(prefix + ".weight_zero_point")) return;
+    std::vector<int8_t> zp = unpack_int4_zero_point_host(
+        sf.get(prefix + ".weight_zero_point"), out_features, groups,
+        (prefix + ".weight_zero_point").c_str());
+    lin.weight_zero_point = GpuBuffer<int8_t>(zp.size(), q);
+    lin.weight_zero_point.upload(zp.data(), zp.size());
+    lin.has_zero_point = true;
+}
+
 }  // namespace
 
 Int4Linear upload_int4_linear(const TensorSource& sf,
@@ -469,6 +519,7 @@ Int4Linear upload_int4_linear(const TensorSource& sf,
     lin.weight_packed = upload_int4_packed_rebased(packed.data, packed.nbytes, q);
     lin.weight_scale = upload_int4_scales_transposed(
         scale, lin.out_features, groups, q, (prefix + ".weight_scale").c_str());
+    attach_int4_zero_point(sf, prefix, lin.out_features, groups, q, lin);
     return lin;
 }
 
@@ -485,6 +536,7 @@ Int4Linear upload_int4_linear_concat(const TensorSource& sf,
     struct Part {
         const TensorView* packed;
         const TensorView* scale;
+        const TensorView* zp;
         int out_features;
     };
     std::vector<Part> parts;
@@ -514,7 +566,9 @@ Int4Linear upload_int4_linear_concat(const TensorSource& sf,
             throw std::runtime_error(std::string("fused int4 attention projection shape mismatch: ") + name);
 
         int out = (int)packed.shape[0];
-        parts.push_back({&packed, &scale, out});
+        const TensorView* zp = sf.has(prefix + ".weight_zero_point")
+            ? &sf.get(prefix + ".weight_zero_point") : nullptr;
+        parts.push_back({&packed, &scale, zp, out});
         total_out += out;
     }
 
@@ -552,6 +606,28 @@ Int4Linear upload_int4_linear_concat(const TensorSource& sf,
     }
     lin.weight_scale = GpuBuffer<bf16>(transposed.size(), q);
     lin.weight_scale.upload(transposed.data(), transposed.size());
+
+    // Asymmetric zero points: fuse along N exactly like the scales.
+    bool any_zp = false;
+    for (const Part& part : parts) any_zp = any_zp || part.zp != nullptr;
+    if (any_zp) {
+        std::vector<int8_t> fused((size_t)groups * total_out);
+        int zoff = 0;
+        for (const Part& part : parts) {
+            if (!part.zp)
+                throw std::runtime_error(std::string("int4 concat: mixed zero-point presence: ") + name);
+            std::vector<int8_t> z = unpack_int4_zero_point_host(
+                *part.zp, part.out_features, groups, name);
+            for (int g = 0; g < groups; ++g)
+                for (int n = 0; n < part.out_features; ++n)
+                    fused[(size_t)g * total_out + zoff + n] =
+                        z[(size_t)g * part.out_features + n];
+            zoff += part.out_features;
+        }
+        lin.weight_zero_point = GpuBuffer<int8_t>(fused.size(), q);
+        lin.weight_zero_point.upload(fused.data(), fused.size());
+        lin.has_zero_point = true;
+    }
     return lin;
 }
 
@@ -604,9 +680,29 @@ Int4Linear upload_int4_linear_pair(const TensorSource& sf,
     }
     lin.weight_scale = GpuBuffer<bf16>(transposed.size(), q);
     lin.weight_scale.upload(transposed.data(), transposed.size());
+
+    // Asymmetric zero points: fuse gate|up blocks exactly like the scales.
+    if (sf.has(gate_prefix + ".weight_zero_point")) {
+        std::vector<int8_t> gz = unpack_int4_zero_point_host(
+            sf.get(gate_prefix + ".weight_zero_point"), half_out, groups, "gate zp");
+        std::vector<int8_t> uz = unpack_int4_zero_point_host(
+            sf.get(up_prefix + ".weight_zero_point"), half_out, groups, "up zp");
+        std::vector<int8_t> fused((size_t)groups * lin.out_features);
+        for (int g = 0; g < groups; ++g) {
+            for (int n = 0; n < half_out; ++n) {
+                fused[(size_t)g * lin.out_features + n] =
+                    gz[(size_t)g * half_out + n];
+                fused[(size_t)g * lin.out_features + half_out + n] =
+                    uz[(size_t)g * half_out + n];
+            }
+        }
+        lin.weight_zero_point = GpuBuffer<int8_t>(fused.size(), q);
+        lin.weight_zero_point.upload(fused.data(), fused.size());
+        lin.has_zero_point = true;
+    }
     return lin;
 }
-
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // GGUF Q8_0
 // ---------------------------------------------------------------------------

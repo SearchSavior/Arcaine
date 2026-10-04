@@ -498,6 +498,6 @@ inline void qwen_linear_attn_forward(
                   S * n_v, d_v, cfg.rms_norm_eps);
 
     // 9. out_proj: [S, value_dim] -> [S, H] (NVFP4).
-    matmul_nvfp4(core.data(), S, value_dim, w.out_proj, out, ctx);
+    qwen_linear_matmul(core.data(), S, value_dim, w.out_proj, out, ctx);
     q.wait();
 }

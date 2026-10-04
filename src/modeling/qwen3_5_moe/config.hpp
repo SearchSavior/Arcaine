@@ -85,11 +85,16 @@ struct QwenConfig {
 
         std::ifstream f(dir + "/config.json");
         if (!f) throw std::runtime_error("Cannot open " + dir + "/config.json");
-        auto j = nlohmann::json::parse(f);
+        auto jroot = nlohmann::json::parse(f);
 
-        cfg.model_type = j.at("model_type").get<std::string>();
-        if (cfg.model_type != "qwen3_5_moe_text")
+        cfg.model_type = jroot.at("model_type").get<std::string>();
+        if (cfg.model_type != "qwen3_5_moe_text" && cfg.model_type != "qwen3_5_moe")
             throw std::runtime_error("Expected model_type=qwen3_5_moe_text, got " + cfg.model_type);
+
+        // Two checkpoint layouts: flat text-only (NVFP4 target) and the full
+        // multimodal container (AWQ), whose language-model dims live under
+        // `text_config`. Read dims from text_config when present.
+        const nlohmann::json& j = jroot.contains("text_config") ? jroot["text_config"] : jroot;
 
         auto opt_int = [](const nlohmann::json& o, const char* k, int d) {
             if (!o.contains(k) || o[k].is_null()) return d;
@@ -155,8 +160,8 @@ struct QwenConfig {
         if (j.contains("eos_token_id") && !j["eos_token_id"].is_null())
             cfg.eos_token_ids = load_eos(j["eos_token_id"]);
 
-        if (j.contains("quantization_config")) {
-            auto& q = j["quantization_config"];
+        if (jroot.contains("quantization_config")) {
+            auto& q = jroot["quantization_config"];
             cfg.quant_format = q.value("format", std::string());
             if (q.contains("config_groups") && q["config_groups"].contains("group_0") &&
                 q["config_groups"]["group_0"].contains("weights"))
