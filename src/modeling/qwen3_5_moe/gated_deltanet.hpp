@@ -38,7 +38,10 @@
 // chunked-vs-recurrent equivalence (prefill(N) == prefill(N-1)+decode).
 //
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -239,6 +242,21 @@ inline void recurrent_gated_delta_decode(
             out[(size_t)hd * d_v + d_v_i] = float_to_bf16(o);
         });
     });
+}
+
+// PREFILL via the device recurrent rule. `qwen_moe_recurrent_delta` iterates the
+// whole sequence inside one kernel launch (state resident in SLM), replacing the
+// host-orchestrated chunked rule that dominated prefill. Mathematically
+// identical (QWEN_GDN_CHECK audits it against the host chunked rule).
+// Gate: QWEN_GDN_PREFILL=host restores the host chunked path (AB).
+inline void recurrent_gated_delta_prefill(
+    sycl::queue& q,
+    const bf16* qv, const bf16* kv, const bf16* vv,
+    const bf16* beta, const bf16* graw,
+    float* Sstate, bf16* out, int S_len, int n_v, int d_k, int d_v)
+{
+    qwen_moe_recurrent_delta(q, qv, kv, vv, beta, graw, Sstate, out,
+                             S_len, n_v, d_k, d_v);
 }
 
 // ===========================================================================
@@ -480,16 +498,62 @@ inline void qwen_linear_attn_forward(
 
     // 7. core gated delta rule.
     GpuBuffer<bf16> core((size_t)S * n_v * d_v, q);
-    if (S == 1 && cache.has_state) {
+    static const bool gdn_check = std::getenv("QWEN_GDN_CHECK") != nullptr;
+    if (S > 1 && gdn_check) {
+        // Equivalence audit: run the host chunked rule and the device recurrent
+        // rule from the same initial state and diff core + final S.
+        size_t ssz = (size_t)n_v * d_k * d_v;
+        std::vector<float> s0(ssz);
+        q.memcpy(s0.data(), cache.ssm_state.data(), ssz * sizeof(float)).wait();
+
+        GpuBuffer<bf16> core_h((size_t)S * n_v * d_v, q);
+        host_chunk_gated_delta_rule(ctx, qbuf.data(), kbuf.data(), vbuf.data(),
+                                    bbuf.data(), gbuf.data(),
+                                    cache.ssm_state.data(), core_h.data(),
+                                    S, n_v, d_k, d_v, 64);
+        std::vector<float> sh(ssz);
+        q.memcpy(sh.data(), cache.ssm_state.data(), ssz * sizeof(float)).wait();
+
+        q.memcpy(cache.ssm_state.data(), s0.data(), ssz * sizeof(float)).wait();
+        recurrent_gated_delta_prefill(q, qbuf.data(), kbuf.data(), vbuf.data(),
+                                      bbuf.data(), gbuf.data(),
+                                      cache.ssm_state.data(), core.data(),
+                                      S, n_v, d_k, d_v);
+        std::vector<float> sr(ssz);
+        q.memcpy(sr.data(), cache.ssm_state.data(), ssz * sizeof(float)).wait();
+
+        std::vector<bf16> ch((size_t)S * n_v * d_v), cr((size_t)S * n_v * d_v);
+        q.memcpy(ch.data(), core_h.data(), ch.size() * sizeof(bf16)).wait();
+        q.memcpy(cr.data(), core.data(), cr.size() * sizeof(bf16)).wait();
+        double maxo = 0, maxs = 0;
+        for (size_t i = 0; i < ch.size(); ++i)
+            maxo = std::max(maxo, std::fabs((double)bf16_to_float(ch[i]) - bf16_to_float(cr[i])));
+        for (size_t i = 0; i < ssz; ++i)
+            maxs = std::max(maxs, std::fabs((double)sh[i] - sr[i]));
+        std::fprintf(stderr,
+                     "[gdn-check] seq=%d max|core_host-core_rec|=%.5g max|S_host-S_rec|=%.5g\n",
+                     S, maxo, maxs);
+    } else if (S == 1 && cache.has_state) {
         recurrent_gated_delta_decode(q, qbuf.data(), kbuf.data(), vbuf.data(),
                                      bbuf.data(), gbuf.data(),
                                      cache.ssm_state.data(), core.data(),
                                      n_v, d_k, d_v);
     } else {
-        host_chunk_gated_delta_rule(ctx, qbuf.data(), kbuf.data(), vbuf.data(),
-                                    bbuf.data(), gbuf.data(),
-                                    cache.ssm_state.data(), core.data(),
-                                    S, n_v, d_k, d_v, 64);
+        static const bool host_prefill = [] {
+            const char* e = std::getenv("QWEN_GDN_PREFILL");
+            return e && std::strcmp(e, "host") == 0;
+        }();
+        if (host_prefill) {
+            host_chunk_gated_delta_rule(ctx, qbuf.data(), kbuf.data(), vbuf.data(),
+                                        bbuf.data(), gbuf.data(),
+                                        cache.ssm_state.data(), core.data(),
+                                        S, n_v, d_k, d_v, 64);
+        } else {
+            recurrent_gated_delta_prefill(q, qbuf.data(), kbuf.data(), vbuf.data(),
+                                          bbuf.data(), gbuf.data(),
+                                          cache.ssm_state.data(), core.data(),
+                                          S, n_v, d_k, d_v);
+        }
     }
     cache.has_state = true;
 

@@ -34,7 +34,10 @@
 //
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <utility>
@@ -130,6 +133,13 @@ inline void qwen_moe_forward(
     int E     = cfg.num_experts;              // 256
     int top_k = cfg.num_experts_per_tok;      // 8
     int inter = cfg.moe_intermediate_size;    // 512
+    static const bool prof = std::getenv("QWEN_MOE_PROF") != nullptr;
+    using ProfClk = std::chrono::high_resolution_clock;
+    auto pnow = [] { return ProfClk::now(); };
+    auto pms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = pnow();
 
     // ---- 1. Router: hidden @ router_gate.T -> [S, E]; host softmax+topk+renorm ----
     GpuBuffer<bf16> scores((size_t)S * E, q);
@@ -163,9 +173,11 @@ inline void qwen_moe_forward(
         for (int s = 0; s < top_k; ++s) wgt[(size_t)t * top_k + s] *= sinv;
     }
 
+    auto t1 = pnow();
     // ---- 2. Routed experts (host-orchestrated) -> fp32 accumulator ----
     std::vector<float> out_h((size_t)S * H, 0.0f);
     qwen_routed_experts_forward(ctx, w, hidden, idx, wgt, out_h, S, cfg);
+    auto t2 = pnow();
 
     // Upload routed (bf16) into `out`.
     std::vector<bf16> out_b((size_t)S * H);
@@ -188,4 +200,9 @@ inline void qwen_moe_forward(
     // ---- 4. Combine: out (routed) += shared ----
     add_inplace(q, out, sdn.data(), (size_t)S * H);
     q.wait();
+    if (prof) {
+        std::fprintf(stderr,
+                     "[moe-prof] S=%d router=%.1f routed=%.1f shared=%.1f total=%.1f ms\n",
+                     S, pms(t0, t1), pms(t1, t2), pms(t2, pnow()), pms(t0, pnow()));
+    }
 }
