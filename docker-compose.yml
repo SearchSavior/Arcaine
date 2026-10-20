@@ -33,6 +33,10 @@ services:
     # --- Source + build artifacts -----------------------------------------
     volumes:
       - .:/workspace:cached          # edit on host, build in container
+      # Keep the SYCL / Intel GPU compiler caches across container recreations
+      # (SYCL_CACHE_PERSISTENT is set in the image). Without this, the first
+      # kernel compile restarts cold every `docker compose up --build`.
+      - arcaine-cache:/root/.cache
     working_dir: /workspace
     ports:
       - "7461:7461"
@@ -41,3 +45,6 @@ services:
     stdin_open: true
     tty: true
     command: bash
+
+volumes:
+  arcaine-cache:
