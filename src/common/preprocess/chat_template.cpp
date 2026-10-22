@@ -104,6 +104,40 @@ const CachedChatTemplate& cached_chat_template(const std::string& model_dir) {
     return res.first->second;
 }
 
+// Flint's template tests `t is string` and then applies Jinja `replace`
+// filters. OpenAI-shaped requests carry content as [{type:text,text:...}];
+// flatten text-only parts so the template sees a string.
+bool wants_string_content(const std::string& model_dir) {
+    std::ifstream f(model_dir + "/config.json");
+    if (!f) return false;
+    nlohmann::json j;
+    f >> j;
+    return j.value("model_type", "") == "flint";
+}
+
+void flatten_text_parts(json& messages) {
+    if (!messages.is_array()) return;
+    for (auto& m : messages) {
+        if (!m.contains("content")) continue;
+        auto& c = m["content"];
+        if (!c.is_array()) continue;
+        if (c.empty()) {
+            c = std::string();
+            continue;
+        }
+        std::string text;
+        bool all_text = true;
+        for (auto& part : c) {
+            if (!part.is_object() || part.value("type", "") != "text") {
+                all_text = false;
+                break;
+            }
+            text += part.value("text", "");
+        }
+        if (all_text) c = text;
+    }
+}
+
 void replace_one(std::string& text, const std::string& needle, const std::string& replacement) {
     size_t pos = text.find(needle);
     if (pos == std::string::npos)
@@ -130,6 +164,7 @@ PromptBuildResult render_chat_prompt(
 ) {
     const CachedChatTemplate& cached = cached_chat_template(model_dir);
     const TokenizerMetadata& meta = cached.meta;
+    if (wants_string_content(model_dir)) flatten_text_parts(messages);
     minja::chat_template_inputs inputs;
     inputs.messages = std::move(messages);
     inputs.tools = std::move(tools);
@@ -243,6 +278,7 @@ std::string build_chat_prompt_text(
                                      {"content", message.content}});
     }
     const CachedChatTemplate& cached = cached_chat_template(model_dir);
+    if (wants_string_content(model_dir)) flatten_text_parts(rendered_messages);
     minja::chat_template_inputs inputs;
     inputs.messages = std::move(rendered_messages);
     inputs.tools = json::array();

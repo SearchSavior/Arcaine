@@ -87,8 +87,14 @@ set(QWEN35_SRCS
     src/modeling/qwen3_5/register.cpp
 )
 
+set(FLINT_SRCS
+    src/modeling/flint/loader.cpp
+    src/modeling/flint/model.cpp
+    src/modeling/flint/register.cpp
+)
+
 # All built-in architectures linked into the inference/bench binaries.
-set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS} ${QWEN35_SRCS})
+set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS} ${QWEN35_SRCS} ${FLINT_SRCS})
 
 # DiffusionGemma 26B-A4B (block-diffusion MoE) decoder sources. Defined here so
 # arcaine_mbench (below) can link the diffusion bench driver as well as the AR
@@ -206,6 +212,19 @@ target_link_libraries(arcaine_server PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(arcaine_server PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
     INSTALL_RPATH "${ORT_DIR}/lib")
+
+# ---------------------------------------------------------------------------
+# Flint INT4 standalone driver + kernel self-tests. Deliberately does NOT link
+# DNNL: this target is the mechanical proof that the Flint path is oneDNN-free.
+add_executable(flint_main
+    src/modeling/flint/main.cpp
+    ${FLINT_SRCS}
+    src/common/preprocess/tokenizer.cpp
+    src/common/preprocess/chat_template.cpp
+    src/common/registry.cpp
+    ${UNICODE_SRCS})
+target_compile_options(flint_main PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(flint_main   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 
 # ---------------------------------------------------------------------------
 # Unified kernel benchmark binary. Each kernel bench registers itself via
