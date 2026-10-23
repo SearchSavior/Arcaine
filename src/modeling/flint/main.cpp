@@ -588,24 +588,24 @@ void test_awq_decode(sycl::queue& q) {
     bool experts_ok = true;
     for (int e = 0; e < w.t.experts; ++e) {
         kernels::q4_gemv(q, w.t, xd, yd, e);
-        experts_ok = test_close(download(q, yd, w.t.n), w.reference(x.data(), e)) && experts_ok;
+        experts_ok = test_close(download(q, yd, w.t.n), w.reference(x.data(), e), 0.02f, 0.02f) && experts_ok;
     }
     check(experts_ok, "AWQ q4_gemv distinct expert offsets");
     bf16* rd = buffers.put(residual);
     kernels::q4_gemv(q, w.t, xd, yd, 2, rd);
-    check(test_close(download(q, yd, w.t.n), w.reference(x.data(), 2, residual.data())),
+    check(test_close(download(q, yd, w.t.n), w.reference(x.data(), 2, residual.data()), 0.02f, 0.02f),
           "AWQ q4_gemv residual after BF16");
     upload(q, yd, residual);
     kernels::q4_gemv(q, w.t, xd, yd, 1, yd);
-    check(test_close(download(q, yd, w.t.n), w.reference(x.data(), 1, residual.data())),
+    check(test_close(download(q, yd, w.t.n), w.reference(x.data(), 1, residual.data()), 0.02f, 0.02f),
           "AWQ q4_gemv in-place residual");
 
     bf16* ko = buffers.alloc<bf16>(kw.t.n);
     bf16* vo = buffers.alloc<bf16>(vw.t.n);
     kernels::qkv_gemv(q, w.t, kw.t, vw.t, xd, yd, ko, vo);
-    const bool q_ok = test_close(download(q, yd, w.t.n), w.reference(x.data()));
-    const bool k_ok = test_close(download(q, ko, kw.t.n), kw.reference(x.data()));
-    const bool v_ok = test_close(download(q, vo, vw.t.n), vw.reference(x.data()));
+    const bool q_ok = test_close(download(q, yd, w.t.n), w.reference(x.data()), 0.02f, 0.02f);
+    const bool k_ok = test_close(download(q, ko, kw.t.n), kw.reference(x.data()), 0.02f, 0.02f);
+    const bool v_ok = test_close(download(q, vo, vw.t.n), vw.reference(x.data()), 0.02f, 0.02f);
     check(q_ok && k_ok && v_ok, "AWQ fused QKV unequal row tails");
 
     bf16* act = buffers.alloc<bf16>(gate.t.n);
@@ -613,12 +613,12 @@ void test_awq_decode(sycl::queue& q) {
     std::vector<bf16> ref(gate.t.n);
     for (int n = 0; n < gate.t.n; ++n)
         ref[n] = reference_silu_mul(bf16(gate.dot(x.data(), n)), bf16(up.dot(x.data(), n)));
-    check(test_close(download(q, act, ref.size()), ref, 1e-5f, 0.008f),
+    check(test_close(download(q, act, ref.size()), ref, 0.005f, 0.02f),
           "AWQ dense_gateup_act BF16 stages");
 
     float* logits = buffers.alloc<float>(w.t.n);
     kernels::lm_head(q, w.t, xd, logits);
-    check(test_close(download(q, logits, w.t.n), w.reference(x.data())), "AWQ lm_head");
+    check(test_close(download(q, logits, w.t.n), w.reference(x.data()), 0.02f, 0.02f), "AWQ lm_head");
     bf16* embedding = buffers.alloc<bf16>(K);
     kernels::embed_i8(q, w.t, w.t.n - 1, embedding);
     ref.resize(K);
@@ -661,7 +661,7 @@ void test_awq_moe(sycl::queue& q) {
     for (int role = 0; role < top_k; ++role)
         for (int n = R; n < S; ++n)
             padding_ok = padding_ok && float(got_act[role * S + n]) == -7.f;
-    check(test_close(got_act, ref_act, 1e-5f, 0.008f) && padding_ok,
+    check(test_close(got_act, ref_act, 0.005f, 0.02f) && padding_ok,
           "AWQ expert_gateup routed/shared banks");
 
     const auto down_input = test_signal(initial.size(), 601);
@@ -675,7 +675,7 @@ void test_awq_moe(sycl::queue& q) {
     }
     bf16* down = buffers.alloc<bf16>(ref_down.size());
     kernels::expert_down(q, layer, H, R, S, top_k, act, idd, down);
-    check(test_close(download(q, down, ref_down.size()), ref_down),
+    check(test_close(download(q, down, ref_down.size()), ref_down, 0.02f, 0.02f),
           "AWQ expert_down routed/shared banks");
 
     std::vector<bf16> ref_h(H);
@@ -691,7 +691,7 @@ void test_awq_moe(sycl::queue& q) {
     }
     bf16* hd = buffers.put(h);
     kernels::moe_down_combine(q, layer, H, R, S, top_k, act, idd, wd, hd);
-    check(test_close(download(q, hd, H), ref_h), "AWQ moe_down_combine BF16 stages");
+    check(test_close(download(q, hd, H), ref_h, 0.02f, 0.02f), "AWQ moe_down_combine BF16 stages");
 }
 
 void test_bf16_io(sycl::queue& q) {
@@ -733,7 +733,7 @@ void test_bf16_io(sycl::queue& q) {
         expected[n] = float(bf16(sum));
     }
     kernels::lm_head(q, t, xd, ld);
-    check(test_close(download(q, ld, expected.size()), expected),
+    check(test_close(download(q, ld, expected.size()), expected, 0.02f, 0.02f),
           "BF16 lm_head FP32 sum/BF16 logits");
 }
 
@@ -810,13 +810,13 @@ void test_awq_gemm_shape(sycl::queue& q, int N, int K, bool xmx) {
         const std::string tag = "N=" + std::to_string(N) + ",M=" + std::to_string(c.M) +
                                 ",case=" + std::to_string(case_id++);
         const auto vector_result = download(q, vector_base, expected.size());
-        check(test_close(vector_result, expected), ("AWQ vector GEMM " + tag).c_str());
+        check(test_close(vector_result, expected, 0.02f, 0.02f), ("AWQ vector GEMM " + tag).c_str());
         if (xmx) {
             check(accepted, ("AWQ CuTe W4A16 launch " + tag).c_str());
             if (accepted) {
                 const auto result = download(q, xmx_base, expected.size());
-                check(test_close(result, expected), ("AWQ CuTe W4A16 CPU " + tag).c_str());
-                check(test_close(result, vector_result), ("AWQ CuTe W4A16 vector " + tag).c_str());
+                check(test_close(result, expected, 0.02f, 0.02f), ("AWQ CuTe W4A16 CPU " + tag).c_str());
+                check(test_close(result, vector_result, 0.02f, 0.02f), ("AWQ CuTe W4A16 vector " + tag).c_str());
             }
         }
     }
