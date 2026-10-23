@@ -15,10 +15,16 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 // MLX affine quantized tensor (group size 64).
 // w: packed codes, row-major [n, k/2] bytes (4-bit) — low nibble first.
 // s/b: bf16 [n, k/64]; 3-D expert tensors add a leading expert dimension.
+enum class WeightFormat { MLX, AWQ, BF16 };
+
 struct QTensor {
+    WeightFormat format = WeightFormat::MLX;
     const uint8_t* w = nullptr;
     const bf16* s = nullptr;
     const bf16* b = nullptr;
+    const sycl::half* awq_s = nullptr;
+    const uint8_t* awq_z = nullptr;
+    const bf16* dense = nullptr;
     int n = 0;
     int k = 0;
     int experts = 0;
@@ -26,7 +32,7 @@ struct QTensor {
     size_t stride_s = 0;  // elements (bf16) per expert
     size_t stride_b = 0;
 
-    bool valid() const { return w != nullptr; }
+    bool valid() const { return w != nullptr || dense != nullptr; }
 };
 
 struct FlintLayer {

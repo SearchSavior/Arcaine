@@ -91,7 +91,11 @@ set(FLINT_SRCS
     src/modeling/flint/loader.cpp
     src/modeling/flint/model.cpp
     src/modeling/flint/register.cpp
+    src/modeling/flint/awq_xmx.cpp
 )
+set_source_files_properties(src/modeling/flint/awq_xmx.cpp PROPERTIES
+    COMPILE_DEFINITIONS "SYCL_INTEL_TARGET;CUTLASS_ENABLE_SYCL"
+    INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/sycl-tla/include;${CMAKE_SOURCE_DIR}/third_party/sycl-tla/tools/util/include")
 
 # All built-in architectures linked into the inference/bench binaries.
 set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS} ${QWEN35_SRCS} ${FLINT_SRCS})
@@ -135,7 +139,7 @@ target_compile_options(gemma4 PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2
 target_link_options(gemma4   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # ARCH_SRCS now pulls qwen3_5_moe (NVFP4 loader) + common/quant_loader.cpp, both
 # of which include nvfp4.hpp -> __spirv_SubgroupMatrixMultiplyAccumulateINTEL.
-target_link_options(gemma4 PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(gemma4 PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 target_link_libraries(gemma4 PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(gemma4 PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
@@ -171,7 +175,7 @@ add_executable(arcaine_mbench ${MBENCH_SRCS})
 target_compile_options(arcaine_mbench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_mbench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # See gemma4: ARCH_SRCS / COMMON_SRCS include nvfp4.hpp-bearing loader TUs.
-target_link_options(arcaine_mbench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(arcaine_mbench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 target_link_libraries(arcaine_mbench PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(arcaine_mbench PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
@@ -182,7 +186,7 @@ set_target_properties(arcaine_mbench PROPERTIES
 add_executable(diffusion_gemma src/diffusion_main.cpp ${DIFFUSION_SRCS})
 target_compile_options(diffusion_gemma PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_gemma   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 
 # OpenAI-compatible HTTP API server. Single binary serving every registered
 # architecture: dispatches by config.json::model_type at startup.
@@ -203,7 +207,7 @@ add_executable(arcaine_server
     src/register_builtins.cpp)
 target_compile_options(arcaine_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(arcaine_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(arcaine_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 
 # DiffusionGemma throughput benchmark is folded into arcaine_mbench (the driver
 # is bench/diffusion_model_bench.hpp, dispatched on config.json::model_type).
@@ -225,6 +229,15 @@ add_executable(flint_main
     ${UNICODE_SRCS})
 target_compile_options(flint_main PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(flint_main   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(flint_main PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
+
+# Flint kernel benchmark (per-kernel timings; no DNNL, no end-to-end model).
+add_executable(flint_kbench
+    src/modeling/flint/kbench.cpp
+    src/modeling/flint/awq_xmx.cpp)
+target_compile_options(flint_kbench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(flint_kbench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(flint_kbench   PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 
 # ---------------------------------------------------------------------------
 # Unified kernel benchmark binary. Each kernel bench registers itself via
@@ -252,7 +265,7 @@ target_compile_options(arcaine_kbench PRIVATE
     -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_kbench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_kbench PRIVATE
-    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 target_link_libraries(arcaine_kbench PRIVATE DNNL::dnnl)
 
 

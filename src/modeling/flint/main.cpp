@@ -9,6 +9,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "awq_xmx.hpp"
 #include "config.hpp"
 #include "kernels.hpp"
 #include "model.hpp"
@@ -48,6 +49,131 @@ T* dev_alloc(sycl::queue& q, size_t n) {
 template <typename T>
 void upload(sycl::queue& q, T* dst, const std::vector<T>& src) {
     q.memcpy(dst, src.data(), src.size() * sizeof(T)).wait();
+}
+
+struct TestAllocations {
+    sycl::queue& q;
+    std::vector<void*> pointers;
+
+    explicit TestAllocations(sycl::queue& queue) : q(queue) {}
+    TestAllocations(const TestAllocations&) = delete;
+    TestAllocations& operator=(const TestAllocations&) = delete;
+    ~TestAllocations() {
+        q.wait();
+        for (void* p : pointers) sycl::free(p, q);
+    }
+
+    template <typename T>
+    T* alloc(size_t count) {
+        const size_t bytes = (count * sizeof(T) + 63) & ~size_t(63);
+        T* p = static_cast<T*>(sycl::aligned_alloc_device(64, bytes, q));
+        if (!p) throw std::runtime_error("test alloc");
+        pointers.push_back(p);
+        return p;
+    }
+
+    template <typename T>
+    T* put(const std::vector<T>& values) {
+        T* p = alloc<T>(values.size());
+        upload(q, p, values);
+        return p;
+    }
+};
+
+template <typename T>
+std::vector<T> download(sycl::queue& q, const T* p, size_t count) {
+    std::vector<T> values(count);
+    q.wait_and_throw();
+    q.memcpy(values.data(), p, count * sizeof(T)).wait_and_throw();
+    return values;
+}
+
+template <typename T, typename U>
+bool test_close(const std::vector<T>& got, const std::vector<U>& ref,
+                float atol = 0.f, float rtol = 0.f) {
+    if (got.size() != ref.size()) return false;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float a = float(got[i]), b = float(ref[i]);
+        if (!std::isfinite(a) || !std::isfinite(b) ||
+            std::fabs(a - b) > atol + rtol * std::fabs(b)) {
+            std::printf("[test] index %zu: got %.9g, expected %.9g\n", i, a, b);
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<flint::bf16> test_signal(size_t count, uint32_t seed) {
+    std::vector<flint::bf16> values(count);
+    for (auto& v : values) {
+        seed = seed * 1664525u + 1013904223u;
+        v = flint::bf16(float(int((seed >> 16) % 15) - 7) / 16.f);
+    }
+    return values;
+}
+
+struct AwqTestTensor {
+    flint::QTensor t;
+    std::vector<uint8_t> codes, zeros;
+    std::vector<sycl::half> scales;
+
+    AwqTestTensor(TestAllocations& buffers, int N, int K, int E, int seed)
+        : codes((size_t)E * N * K), zeros((size_t)E * (K / 64) * N),
+          scales(zeros.size()) {
+        const float palette[] = {0x1.008p-7f, 0x1.018p-6f, 0x1.038p-7f, 0x1.058p-5f,
+                                 0x1.07cp-6f, 0x1.084p-7f, 0x1.0bcp-5f, 0x1.0fcp-6f};
+        for (int e = 0; e < E; ++e) {
+            for (int n = 0; n < N; ++n)
+                for (int k = 0; k < K; ++k)
+                    codes[((size_t)e * N + n) * K + k] =
+                        uint8_t((k * 5 + (k / 16) * 3 + n * 7 + e * 11 + seed * 3) & 15);
+            for (int g = 0; g < K / 64; ++g)
+                for (int n = 0; n < N; ++n) {
+                    const size_t p = ((size_t)e * (K / 64) + g) * N + n;
+                    zeros[p] = uint8_t((n * 3 + g * 5 + e * 7 + seed) & 15);
+                    scales[p] = sycl::half(palette[(n + g * 3 + e * 5 + seed) % 8]);
+                }
+        }
+        std::vector<uint8_t> packed(codes.size() / 2);
+        for (size_t i = 0; i < packed.size(); ++i)
+            packed[i] = uint8_t(codes[2 * i] | (codes[2 * i + 1] << 4));
+        t.format = flint::WeightFormat::AWQ;
+        t.n = N; t.k = K; t.experts = E;
+        t.stride_w = (size_t)N * K / 2;
+        t.stride_s = t.stride_b = (size_t)N * (K / 64);
+        t.w = buffers.put(packed);
+        t.awq_s = buffers.put(scales);
+        t.awq_z = buffers.put(zeros);
+    }
+
+    flint::bf16 weight(int expert, int row, int k) const {
+        const size_t p = ((size_t)expert * (t.k / 64) + k / 64) * t.n + row;
+        const int code = codes[((size_t)expert * t.n + row) * t.k + k];
+        return flint::bf16(float(code - int(zeros[p])) * float(scales[p]));
+    }
+
+    float dot(const flint::bf16* x, int row, int expert = 0) const {
+        float sum = 0.f;
+        for (int k = 0; k < t.k; ++k) sum += float(weight(expert, row, k)) * float(x[k]);
+        return sum;
+    }
+
+    std::vector<flint::bf16> reference(const flint::bf16* x, int expert = 0,
+                                      const flint::bf16* residual = nullptr) const {
+        std::vector<flint::bf16> ref(t.n);
+        for (int n = 0; n < t.n; ++n) {
+            const flint::bf16 value = flint::bf16(dot(x, n, expert));
+            ref[n] = residual ? flint::bf16(float(value) + float(residual[n])) : value;
+        }
+        return ref;
+    }
+};
+
+flint::bf16 reference_silu_mul(flint::bf16 g, flint::bf16 u) {
+    const float x = float(g);
+    const float tail = 1.f / (1.f + std::exp(std::fabs(x)));
+    const flint::bf16 silu = flint::bf16(x * (x < 0.f ? tail : 1.f - tail));
+    return flint::bf16(float(silu) * float(u));
 }
 
 // ---------------------------------------------------------------- kernel tests
@@ -364,6 +490,39 @@ void test_gemm(sycl::queue& q) {
     sycl::free(cd, q);
 }
 
+void test_attention_split(sycl::queue& q) {
+    using namespace flint;
+    const int heads = 32, kvh = 4, cap = 128, pos = 95, parts = 8;
+    std::vector<bf16> qbuf((size_t)heads * 128), sink(heads);
+    std::vector<bf16> kc((size_t)kvh * cap * 128), vc((size_t)kvh * cap * 128);
+    uint32_t rng = 8181;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng; };
+    for (auto& v : qbuf) v = bf16(-2.f + 4.f * (next() % 1000) / 1000.f);
+    for (auto& v : sink) v = bf16(-1.f + 2.f * (next() % 1000) / 1000.f);
+    for (auto& v : kc) v = bf16(-2.f + 4.f * (next() % 1000) / 1000.f);
+    for (auto& v : vc) v = bf16(-2.f + 4.f * (next() % 1000) / 1000.f);
+    bf16 *qd = dev_alloc<bf16>(q, qbuf.size()), *sd = dev_alloc<bf16>(q, heads);
+    bf16 *kd = dev_alloc<bf16>(q, kc.size()), *vd = dev_alloc<bf16>(q, vc.size());
+    bf16 *ref = dev_alloc<bf16>(q, qbuf.size()), *out = dev_alloc<bf16>(q, qbuf.size());
+    float* partial = dev_alloc<float>(q, (size_t)heads * parts * 128);
+    float* stats = dev_alloc<float>(q, (size_t)heads * parts * 2);
+    upload(q, qd, qbuf); upload(q, sd, sink); upload(q, kd, kc); upload(q, vd, vc);
+    flint::kernels::attention(q, qd, kd, vd, sd, ref, heads, kvh, true, pos, cap);
+    flint::kernels::attention_split(q, qd, kd, vd, sd, partial, stats, heads, kvh,
+                                    true, pos, cap, parts);
+    flint::kernels::attention_merge(q, partial, stats, out, heads, parts);
+    q.wait_and_throw();
+    std::vector<bf16> a(qbuf.size()), b(qbuf.size());
+    q.memcpy(a.data(), ref, a.size() * sizeof(bf16)).wait();
+    q.memcpy(b.data(), out, b.size() * sizeof(bf16)).wait();
+    float worst = 0.f;
+    for (size_t i = 0; i < a.size(); ++i)
+        worst = std::fmax(worst, std::fabs(float(a[i]) - float(b[i])));
+    check(worst < 0.02f, "attention split(8) == serial");
+    sycl::free(qd, q); sycl::free(sd, q); sycl::free(kd, q); sycl::free(vd, q);
+    sycl::free(ref, q); sycl::free(out, q); sycl::free(partial, q); sycl::free(stats, q);
+}
+
 void test_router(sycl::queue& q) {
     using namespace flint;
     const int experts = 256, H = 256, top_k = 6;
@@ -416,6 +575,261 @@ void test_router(sycl::queue& q) {
     sycl::free(wd, q); sycl::free(xd, q); sycl::free(idd, q); sycl::free(swd, q);
 }
 
+void test_awq_decode(sycl::queue& q) {
+    using namespace flint;
+    TestAllocations buffers(q);
+    const int K = 128;
+    AwqTestTensor w(buffers, 35, K, 3, 1), kw(buffers, 19, K, 1, 2);
+    AwqTestTensor vw(buffers, 13, K, 1, 3), gate(buffers, 45, K, 1, 4);
+    AwqTestTensor up(buffers, 45, K, 1, 5);
+    const auto x = test_signal(K, 301), residual = test_signal(w.t.n, 401);
+    bf16* xd = buffers.put(x);
+    bf16* yd = buffers.alloc<bf16>(w.t.n);
+    bool experts_ok = true;
+    for (int e = 0; e < w.t.experts; ++e) {
+        kernels::q4_gemv(q, w.t, xd, yd, e);
+        experts_ok = test_close(download(q, yd, w.t.n), w.reference(x.data(), e)) && experts_ok;
+    }
+    check(experts_ok, "AWQ q4_gemv distinct expert offsets");
+    bf16* rd = buffers.put(residual);
+    kernels::q4_gemv(q, w.t, xd, yd, 2, rd);
+    check(test_close(download(q, yd, w.t.n), w.reference(x.data(), 2, residual.data())),
+          "AWQ q4_gemv residual after BF16");
+    upload(q, yd, residual);
+    kernels::q4_gemv(q, w.t, xd, yd, 1, yd);
+    check(test_close(download(q, yd, w.t.n), w.reference(x.data(), 1, residual.data())),
+          "AWQ q4_gemv in-place residual");
+
+    bf16* ko = buffers.alloc<bf16>(kw.t.n);
+    bf16* vo = buffers.alloc<bf16>(vw.t.n);
+    kernels::qkv_gemv(q, w.t, kw.t, vw.t, xd, yd, ko, vo);
+    const bool q_ok = test_close(download(q, yd, w.t.n), w.reference(x.data()));
+    const bool k_ok = test_close(download(q, ko, kw.t.n), kw.reference(x.data()));
+    const bool v_ok = test_close(download(q, vo, vw.t.n), vw.reference(x.data()));
+    check(q_ok && k_ok && v_ok, "AWQ fused QKV unequal row tails");
+
+    bf16* act = buffers.alloc<bf16>(gate.t.n);
+    kernels::dense_gateup_act(q, gate.t, up.t, xd, act);
+    std::vector<bf16> ref(gate.t.n);
+    for (int n = 0; n < gate.t.n; ++n)
+        ref[n] = reference_silu_mul(bf16(gate.dot(x.data(), n)), bf16(up.dot(x.data(), n)));
+    check(test_close(download(q, act, ref.size()), ref, 1e-5f, 0.008f),
+          "AWQ dense_gateup_act BF16 stages");
+
+    float* logits = buffers.alloc<float>(w.t.n);
+    kernels::lm_head(q, w.t, xd, logits);
+    check(test_close(download(q, logits, w.t.n), w.reference(x.data())), "AWQ lm_head");
+    bf16* embedding = buffers.alloc<bf16>(K);
+    kernels::embed_i8(q, w.t, w.t.n - 1, embedding);
+    ref.resize(K);
+    for (int k = 0; k < K; ++k) ref[k] = w.weight(0, w.t.n - 1, k);
+    check(test_close(download(q, embedding, K), ref), "AWQ embed_i8 group-major parameters");
+}
+
+void test_awq_moe(sycl::queue& q) {
+    using namespace flint;
+    TestAllocations buffers(q);
+    const int H = 128, R = 64, S = 128, E = 4, top_k = 3;
+    AwqTestTensor eg(buffers, R, H, E, 6), eu(buffers, R, H, E, 7);
+    AwqTestTensor ed(buffers, H, R, E, 8), sg(buffers, S, H, 1, 9);
+    AwqTestTensor su(buffers, S, H, 1, 10), sd(buffers, H, S, 1, 11);
+    FlintLayer layer;
+    layer.moe = true;
+    layer.egate = eg.t; layer.eup = eu.t; layer.edown = ed.t;
+    layer.sgate = sg.t; layer.sup = su.t; layer.sdown = sd.t;
+    const std::vector<int> ids = {3, 1, 2};
+    const std::vector<float> weights = {0.173f, 0.319f, 0.508f};
+    const auto x = test_signal(H, 503), h = test_signal(H, 607);
+    bf16* xd = buffers.put(x);
+    int* idd = buffers.put(ids);
+    float* wd = buffers.put(weights);
+    const std::vector<bf16> initial((top_k + 1) * S, bf16(-7.f));
+    std::vector<bf16> ref_act = initial;
+    for (int role = 0; role <= top_k; ++role) {
+        const bool routed = role < top_k;
+        const auto& g = routed ? eg : sg;
+        const auto& u = routed ? eu : su;
+        const int expert = routed ? ids[role] : 0;
+        for (int n = 0; n < (routed ? R : S); ++n)
+            ref_act[role * S + n] = reference_silu_mul(bf16(g.dot(x.data(), n, expert)),
+                                                      bf16(u.dot(x.data(), n, expert)));
+    }
+    bf16* act = buffers.put(initial);
+    kernels::expert_gateup(q, layer, H, R, S, top_k, xd, idd, act);
+    const auto got_act = download(q, act, initial.size());
+    bool padding_ok = true;
+    for (int role = 0; role < top_k; ++role)
+        for (int n = R; n < S; ++n)
+            padding_ok = padding_ok && float(got_act[role * S + n]) == -7.f;
+    check(test_close(got_act, ref_act, 1e-5f, 0.008f) && padding_ok,
+          "AWQ expert_gateup routed/shared banks");
+
+    const auto down_input = test_signal(initial.size(), 601);
+    upload(q, act, down_input);
+    std::vector<bf16> ref_down((top_k + 1) * H);
+    for (int role = 0; role <= top_k; ++role) {
+        const auto& d = role < top_k ? ed : sd;
+        const int expert = role < top_k ? ids[role] : 0;
+        for (int n = 0; n < H; ++n)
+            ref_down[role * H + n] = bf16(d.dot(down_input.data() + role * S, n, expert));
+    }
+    bf16* down = buffers.alloc<bf16>(ref_down.size());
+    kernels::expert_down(q, layer, H, R, S, top_k, act, idd, down);
+    check(test_close(download(q, down, ref_down.size()), ref_down),
+          "AWQ expert_down routed/shared banks");
+
+    std::vector<bf16> ref_h(H);
+    for (int n = 0; n < H; ++n) {
+        float acc = 0.f;
+        for (int role = 0; role < top_k; ++role) {
+            const float term = float(bf16(float(ref_down[role * H + n]) *
+                                          float(bf16(weights[role]))));
+            acc = role == 0 ? term : float(bf16(acc + term));
+        }
+        const bf16 mlp = bf16(acc + float(ref_down[top_k * H + n]));
+        ref_h[n] = bf16(float(h[n]) + float(mlp));
+    }
+    bf16* hd = buffers.put(h);
+    kernels::moe_down_combine(q, layer, H, R, S, top_k, act, idd, wd, hd);
+    check(test_close(download(q, hd, H), ref_h), "AWQ moe_down_combine BF16 stages");
+}
+
+void test_bf16_io(sycl::queue& q) {
+    using namespace flint;
+    TestAllocations buffers(q);
+    const int V = 19, H = 96, guard = 16;
+    const auto dense = test_signal((size_t)V * H, 709);
+    QTensor t;
+    t.format = WeightFormat::BF16;
+    t.n = V; t.k = H;
+    t.dense = buffers.put(dense);
+    const std::vector<int> tokens = {18, 1, 7, 18, 0};
+    const std::vector<bf16> initial(H + guard, bf16(-47.f));
+    bf16* out = buffers.put(initial);
+    bool embed_ok = true;
+    for (int token : tokens) {
+        std::vector<bf16> ref = initial;
+        for (int k = 0; k < H; ++k) ref[k] = dense[token * H + k];
+        kernels::embed_i8(q, t, token, out);
+        embed_ok = test_close(download(q, out, ref.size()), ref) && embed_ok;
+    }
+    check(embed_ok, "BF16 embed_i8 raw rows and canary");
+    int* td = buffers.put(tokens);
+    std::vector<bf16> ref(tokens.size() * H + guard, bf16(-47.f));
+    bf16* batch = buffers.put(ref);
+    for (size_t m = 0; m < tokens.size(); ++m)
+        for (int k = 0; k < H; ++k) ref[m * H + k] = dense[tokens[m] * H + k];
+    prefill::embed_batch(q, t, td, batch, (int)tokens.size());
+    check(test_close(download(q, batch, ref.size()), ref),
+          "BF16 embed_batch repeated/edge tokens");
+
+    const auto x = test_signal(H, 811);
+    bf16* xd = buffers.put(x);
+    std::vector<float> logits(V + guard, -47.f), expected = logits;
+    float* ld = buffers.put(logits);
+    for (int n = 0; n < V; ++n) {
+        float sum = 0.f;
+        for (int k = 0; k < H; ++k) sum += float(dense[n * H + k]) * float(x[k]);
+        expected[n] = float(bf16(sum));
+    }
+    kernels::lm_head(q, t, xd, ld);
+    check(test_close(download(q, ld, expected.size()), expected),
+          "BF16 lm_head FP32 sum/BF16 logits");
+}
+
+void test_awq_gemm_shape(sycl::queue& q, int N, int K, bool xmx) {
+    using namespace flint;
+    TestAllocations buffers(q);
+    AwqTestTensor w(buffers, N, K, 3, 12);
+    const int source_rows = 79, guard = 32;
+    const auto A = test_signal((size_t)source_rows * K, 907);
+    bf16* ad = buffers.put(A);
+    struct Case {
+        int M, expert, stride, repeats;
+        bool gather, scatter;
+        int residual;
+    };
+    const Case cases[] = {
+        {16, 0, 0, 1, false, false, 0},
+        {17, 2, 0, 1, false, false, 0},
+        {7, 0, N + 3, 1, true, false, 0},
+        {11, 1, N + 11, 1, false, true, 1},
+        {19, 2, N + 13, 2, true, true, 0},
+        {9, 1, N + 5, 1, true, true, 1},
+        {5, 1, N + 17, 3, true, true, 2},
+        {33, 2, N + 9, 2, true, true, 2},
+        {3, 0, N + 7, 3, true, true, 2},
+    };
+    int case_id = 0;
+    for (const auto& c : cases) {
+        const int stride = c.stride ? c.stride : N;
+        const int rows = c.scatter ? 2 * c.M + 3 : c.M + 3;
+        std::vector<int> gather(c.M), scatter(c.M);
+        for (int m = 0; m < c.M; ++m) {
+            gather[m] = 2 * ((m * 7 + 5) % 39) + 1;
+            scatter[m] = 2 * (c.M - 1 - m) + 1;
+        }
+        int* gd = c.gather ? buffers.put(gather) : nullptr;
+        int* sd = c.scatter ? buffers.put(scatter) : nullptr;
+        std::vector<bf16> initial((size_t)rows * stride + 2 * guard, bf16(-47.f));
+        const auto residual = test_signal(initial.size(), 1009 + case_id);
+        if (c.residual == 2)
+            for (int m = 0; m < c.M; ++m)
+                for (int n = 0; n < N; ++n) {
+                    const size_t at = guard + (size_t)(c.scatter ? scatter[m] : m) * stride + n;
+                    initial[at] = residual[at];
+                }
+        std::vector<bf16> expected = initial;
+        for (int repeat = 0; repeat < c.repeats; ++repeat)
+            for (int m = 0; m < c.M; ++m) {
+                const int source = c.gather ? gather[m] : m;
+                const int destination = c.scatter ? scatter[m] : m;
+                for (int n = 0; n < N; ++n) {
+                    const size_t at = guard + (size_t)destination * stride + n;
+                    const bf16 value = bf16(w.dot(A.data() + (size_t)source * K, n, c.expert));
+                    const bf16 r = c.residual == 2 ? expected[at] : residual[at];
+                    expected[at] = c.residual ? bf16(float(r) + float(value)) : value;
+                }
+            }
+        bf16* vector_base = buffers.put(initial);
+        bf16* vector_out = vector_base + guard;
+        bf16* xmx_base = xmx ? buffers.put(initial) : nullptr;
+        bf16* xmx_out = xmx ? xmx_base + guard : nullptr;
+        bf16* rd = c.residual == 1 ? buffers.put(residual) + guard : nullptr;
+        bool accepted = true;
+        for (int repeat = 0; repeat < c.repeats; ++repeat) {
+            prefill::gemm_awq(q, w.t, ad, gd, vector_out, c.M, N,
+                              c.residual == 2 ? vector_out : rd, sd, c.stride, c.expert);
+            if (xmx) {
+                const bool launched = awq_xmx::gemm(q, w.t, ad, gd, xmx_out, c.M, N,
+                                                   c.residual == 2 ? xmx_out : rd,
+                                                   sd, c.stride, c.expert);
+                accepted = launched && accepted;
+            }
+        }
+        const std::string tag = "N=" + std::to_string(N) + ",M=" + std::to_string(c.M) +
+                                ",case=" + std::to_string(case_id++);
+        const auto vector_result = download(q, vector_base, expected.size());
+        check(test_close(vector_result, expected), ("AWQ vector GEMM " + tag).c_str());
+        if (xmx) {
+            check(accepted, ("AWQ CuTe W4A16 launch " + tag).c_str());
+            if (accepted) {
+                const auto result = download(q, xmx_base, expected.size());
+                check(test_close(result, expected), ("AWQ CuTe W4A16 CPU " + tag).c_str());
+                check(test_close(result, vector_result), ("AWQ CuTe W4A16 vector " + tag).c_str());
+            }
+        }
+    }
+}
+
+void test_awq_gemm(sycl::queue& q) {
+    const char* enabled = std::getenv("ARCAINE_FLINT_AWQ_XMX");
+    const bool xmx = enabled && std::strcmp(enabled, "1") == 0;
+    if (!xmx) std::printf("[test] AWQ CuTe W4A16 skipped (ARCAINE_FLINT_AWQ_XMX != 1)\n");
+    test_awq_gemm_shape(q, 64, 128, xmx);
+    test_awq_gemm_shape(q, 48, 256, xmx);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -448,9 +862,14 @@ int main(int argc, char** argv) {
         test_rmsnorm_batch(q);
         test_embed_batch(q);
         test_attention(q);
+        test_attention_split(q);
         test_router(q);
         test_gemm(q);
         test_gemm_int8(q);
+        test_awq_decode(q);
+        test_awq_moe(q);
+        test_bf16_io(q);
+        test_awq_gemm(q);
         if (failures) {
             std::printf("[test] %d kernel test(s) failed\n", failures);
             return 1;

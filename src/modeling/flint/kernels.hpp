@@ -63,6 +63,118 @@ inline void dot_q4_pair(const uint8_t* w0, const bf16* s0, const bf16* b0,
     a1 = sycl::reduce_over_group(sg, y1, sycl::plus<>());
 }
 
+inline float dot_awq(const QTensor& t, int row, int expert, const bf16* x,
+                     int lane, sycl::sub_group sg) {
+    const uint8_t* w = t.w + (size_t)expert * t.stride_w + (size_t)row * (t.k / 2);
+    const sycl::half* s = t.awq_s + (size_t)expert * t.stride_s + row;
+    const uint8_t* z = t.awq_z + (size_t)expert * t.stride_b + row;
+    float acc = 0.f;
+    int gi = -1, zv = 0;
+    float sv = 0.f;
+    for (int i = lane; i < t.k; i += kSG) {
+        const int g = i >> 6;
+        if (g != gi) {
+            gi = g;
+            sv = float(s[(size_t)g * t.n]);
+            zv = int(z[(size_t)g * t.n]);
+        }
+        const uint8_t byte = w[i >> 1];
+        const int code = (byte >> ((i & 1) * 4)) & 15;
+        const bf16 weight = bf16(float(code - zv) * sv);
+        acc += float(weight) * float(x[i]);
+    }
+    return sycl::reduce_over_group(sg, acc, sycl::plus<>());
+}
+
+inline void dot_awq_pair(const QTensor& t0, const QTensor& t1, int row,
+                         int expert, const bf16* x, int lane, sycl::sub_group sg,
+                         float& a0, float& a1) {
+    const uint8_t* w0 = t0.w + (size_t)expert * t0.stride_w + (size_t)row * (t0.k / 2);
+    const uint8_t* w1 = t1.w + (size_t)expert * t1.stride_w + (size_t)row * (t1.k / 2);
+    const sycl::half* s0 = t0.awq_s + (size_t)expert * t0.stride_s + row;
+    const sycl::half* s1 = t1.awq_s + (size_t)expert * t1.stride_s + row;
+    const uint8_t* z0 = t0.awq_z + (size_t)expert * t0.stride_b + row;
+    const uint8_t* z1 = t1.awq_z + (size_t)expert * t1.stride_b + row;
+    float y0 = 0.f, y1 = 0.f;
+    int gi = -1, zv0 = 0, zv1 = 0;
+    float sv0 = 0.f, sv1 = 0.f;
+    for (int i = lane; i < t0.k; i += kSG) {
+        const int g = i >> 6;
+        if (g != gi) {
+            gi = g;
+            sv0 = float(s0[(size_t)g * t0.n]);
+            sv1 = float(s1[(size_t)g * t1.n]);
+            zv0 = int(z0[(size_t)g * t0.n]);
+            zv1 = int(z1[(size_t)g * t1.n]);
+        }
+        const int byte = i >> 1;
+        const int shift = (i & 1) * 4;
+        const int c0 = (w0[byte] >> shift) & 15;
+        const int c1 = (w1[byte] >> shift) & 15;
+        const float xv = float(x[i]);
+        y0 += float(bf16(float(c0 - zv0) * sv0)) * xv;
+        y1 += float(bf16(float(c1 - zv1) * sv1)) * xv;
+    }
+    a0 = sycl::reduce_over_group(sg, y0, sycl::plus<>());
+    a1 = sycl::reduce_over_group(sg, y1, sycl::plus<>());
+}
+
+inline float dot_bf16(const bf16* w, int k, const bf16* x, int lane,
+                      sycl::sub_group sg) {
+    float acc = 0.f;
+    for (int i = lane; i < k; i += kSG) acc += float(w[i]) * float(x[i]);
+    return sycl::reduce_over_group(sg, acc, sycl::plus<>());
+}
+
+inline float dot_tensor(const QTensor& t, int row, int expert, const bf16* x,
+                        int lane, sycl::sub_group sg) {
+    if (t.format == WeightFormat::AWQ) return dot_awq(t, row, expert, x, lane, sg);
+    if (t.format == WeightFormat::BF16)
+        return dot_bf16(t.dense + ((size_t)expert * t.n + row) * t.k, t.k, x,
+                        lane, sg);
+    return dot_q4(t.w + (size_t)expert * t.stride_w + (size_t)row * (t.k / 2),
+                  t.s + (size_t)expert * t.stride_s + (size_t)row * (t.k / 64),
+                  t.b + (size_t)expert * t.stride_b + (size_t)row * (t.k / 64),
+                  t.k, x, lane, sg);
+}
+
+inline void dot_tensor_pair(const QTensor& t0, const QTensor& t1, int row,
+                            int expert, const bf16* x, int lane,
+                            sycl::sub_group sg, float& a0, float& a1) {
+    if (t0.format == WeightFormat::AWQ && t1.format == WeightFormat::AWQ) {
+        dot_awq_pair(t0, t1, row, expert, x, lane, sg, a0, a1);
+    } else if (t0.format == WeightFormat::MLX && t1.format == WeightFormat::MLX) {
+        dot_q4_pair(
+            t0.w + (size_t)expert * t0.stride_w + (size_t)row * (t0.k / 2),
+            t0.s + (size_t)expert * t0.stride_s + (size_t)row * (t0.k / 64),
+            t0.b + (size_t)expert * t0.stride_b + (size_t)row * (t0.k / 64),
+            t1.w + (size_t)expert * t1.stride_w + (size_t)row * (t1.k / 2),
+            t1.s + (size_t)expert * t1.stride_s + (size_t)row * (t1.k / 64),
+            t1.b + (size_t)expert * t1.stride_b + (size_t)row * (t1.k / 64),
+            t0.k, x, lane, sg, a0, a1);
+    } else {
+        a0 = dot_tensor(t0, row, expert, x, lane, sg);
+        a1 = dot_tensor(t1, row, expert, x, lane, sg);
+    }
+}
+
+template <typename F>
+inline void decode_rows(sycl::queue& q, int rows, F fn) {
+    if (rows <= 0) return;
+    const int groups = (rows + kRowsPerGroup - 1) / kRowsPerGroup;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t)groups * 256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int sgid = (int)it.get_local_id(0) / kSG;
+                const int row = (int)it.get_group(0) * kRowsPerGroup + sgid;
+                if (row >= rows) return;
+                const auto sg = it.get_sub_group();
+                fn(row, (int)sg.get_local_id()[0], sg);
+            });
+    });
+}
+
 inline bf16 silu_mul(bf16 g, bf16 u) {
     const float gf = float(g);
     const float tail = 1.f / (1.f + sycl::exp(sycl::fabs(gf)));
@@ -75,6 +187,23 @@ inline bf16 silu_mul(bf16 g, bf16 u) {
 
 inline void embed_i8(sycl::queue& q, const QTensor& t, int token, bf16* out) {
     const int H = t.k;
+    if (t.format == WeightFormat::BF16) {
+        q.memcpy(out, t.dense + (size_t)token * H, (size_t)H * sizeof(bf16));
+        return;
+    }
+    if (t.format == WeightFormat::AWQ) {
+        const uint8_t* w = t.w + (size_t)token * (H / 2);
+        q.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::range<1>(256), [=](sycl::id<1> id) {
+                for (int i = (int)id[0]; i < H; i += 256) {
+                    const size_t p = (size_t)(i >> 6) * t.n + token;
+                    const int code = (w[i >> 1] >> ((i & 1) * 4)) & 15;
+                    out[i] = bf16(float(code - int(t.awq_z[p])) * float(t.awq_s[p]));
+                }
+            });
+        });
+        return;
+    }
     const uint8_t* w = t.w + (size_t)token * H;
     const bf16* s = t.s + (size_t)token * (H / 64);
     const bf16* b = t.b + (size_t)token * (H / 64);
@@ -125,6 +254,16 @@ inline void rmsnorm(sycl::queue& q, const bf16* x, const bf16* w, bf16* out,
 // y[row] = dot(w[row], x) (+ residual[row] when add != 0).
 inline void q4_gemv(sycl::queue& q, const QTensor& t, const bf16* x, bf16* y,
                     int expert = 0, const bf16* residual = nullptr) {
+    if (t.format != WeightFormat::MLX) {
+        decode_rows(q, t.n, [=](int row, int lane, sycl::sub_group sg) {
+            const float v = dot_tensor(t, row, expert, x, lane, sg);
+            if (lane == 0) {
+                const bf16 r = bf16(v);
+                y[row] = residual ? bf16(float(residual[row]) + float(r)) : r;
+            }
+        });
+        return;
+    }
     const int n = t.n, k = t.k;
     const uint8_t* w = t.w + (size_t)expert * t.stride_w;
     const bf16* s = t.s + (size_t)expert * t.stride_s;
@@ -150,6 +289,13 @@ inline void q4_gemv(sycl::queue& q, const QTensor& t, const bf16* x, bf16* y,
 
 // lm_head: bf16 dot, then float logits.
 inline void lm_head(sycl::queue& q, const QTensor& t, const bf16* x, float* y) {
+    if (t.format != WeightFormat::MLX) {
+        decode_rows(q, t.n, [=](int row, int lane, sycl::sub_group sg) {
+            const float v = dot_tensor(t, row, 0, x, lane, sg);
+            if (lane == 0) y[row] = float(bf16(v));
+        });
+        return;
+    }
     const int n = t.n, k = t.k;
     const int groups = n / kRowsPerGroup;
     q.submit([&](sycl::handler& h) {
@@ -164,6 +310,51 @@ inline void lm_head(sycl::queue& q, const QTensor& t, const bf16* x, float* y) {
                                        t.s + (size_t)row * (k / 64),
                                        t.b + (size_t)row * (k / 64), k, x, lane, sg);
                 if (lane == 0) y[row] = float(bf16(v));
+            });
+    });
+}
+
+// Fused QKV GEMV: one launch for q/k/v (all share K).
+inline void qkv_gemv(sycl::queue& q, const QTensor& qw, const QTensor& kw,
+                     const QTensor& vw, const bf16* x, bf16* qo, bf16* ko,
+                     bf16* vo) {
+    const int nq = qw.n, nk = kw.n, nv = vw.n, k = qw.k;
+    const int rows = nq + nk + nv;
+    if (qw.format != WeightFormat::MLX || kw.format != WeightFormat::MLX ||
+        vw.format != WeightFormat::MLX) {
+        decode_rows(q, rows, [=](int row, int lane, sycl::sub_group sg) {
+            const QTensor& t = row < nq ? qw : (row < nq + nk ? kw : vw);
+            const int r = row < nq ? row : (row < nq + nk ? row - nq : row - nq - nk);
+            bf16* out = row < nq ? qo : (row < nq + nk ? ko : vo);
+            const float v = dot_tensor(t, r, 0, x, lane, sg);
+            if (lane == 0) out[r] = bf16(v);
+        });
+        return;
+    }
+    const int groups = rows / kRowsPerGroup;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(groups * 256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int sgid = (int)it.get_local_id(0) / kSG;
+                const int row = (int)it.get_group(0) * kRowsPerGroup + sgid;
+                const auto sg = it.get_sub_group();
+                const int lane = (int)sg.get_local_id()[0];
+                const uint8_t* w;
+                const bf16 *s, *b;
+                bf16* out;
+                int r;
+                if (row < nq) {
+                    w = qw.w; s = qw.s; b = qw.b; out = qo; r = row;
+                } else if (row < nq + nk) {
+                    w = kw.w; s = kw.s; b = kw.b; out = ko; r = row - nq;
+                } else {
+                    w = vw.w; s = vw.s; b = vw.b; out = vo; r = row - nq - nk;
+                }
+                const float v =
+                    dot_q4(w + (size_t)r * (k / 2), s + (size_t)r * (k / 64),
+                           b + (size_t)r * (k / 64), k, x, lane, sg);
+                if (lane == 0) out[r] = bf16(v);
             });
     });
 }
@@ -275,6 +466,95 @@ inline void kv_finish(sycl::queue& q, bf16* kbuf, const bf16* vbuf,
     });
 }
 
+// Fused q/k RMS+RoPE (q in place), k store, v store: one launch for 40 heads.
+inline void qkv_post(sycl::queue& q, bf16* qbuf, bf16* kbuf, const bf16* vbuf,
+                     const bf16* q_norm, const bf16* k_norm, bf16* kcache,
+                     bf16* vcache, int heads, int kv_heads, bool global, int pos,
+                     int cap, bool rope, float log2base, float eps) {
+    const int works = heads + 2 * kv_heads;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t)works * kSG),
+                              sycl::range<1>(kSG)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int w = (int)it.get_group(0);
+                const auto sg = it.get_sub_group();
+                const int lane = (int)sg.get_local_id()[0];
+                if (w < heads) {
+                    bf16* p = qbuf + (size_t)w * 128;
+                    float ss = 0.f;
+                    for (int d = 0; d < 4; ++d) {
+                        const float v = float(p[lane * 4 + d]);
+                        ss += v * v;
+                    }
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<>());
+                    const float inv = sycl::rsqrt(ss / 128.f + eps);
+                    if (rope) {
+                        for (int j = 0; j < 2; ++j) {
+                            const int pair = lane * 2 + j;
+                            const float a = float(q_norm[pair]) *
+                                float(bf16(float(p[pair]) * inv));
+                            const float bb = float(q_norm[pair + 64]) *
+                                float(bf16(float(p[pair + 64]) * inv));
+                            const float th = float(pos) *
+                                sycl::exp2(-float(pair) / 64.f * log2base);
+                            const float c = sycl::cos(th);
+                            const float s = sycl::sin(th);
+                            p[pair] = bf16(a * c - bb * s);
+                            p[pair + 64] = bf16(a * s + bb * c);
+                        }
+                    } else {
+                        for (int d = 0; d < 4; ++d) {
+                            const int i = lane * 4 + d;
+                            p[i] = bf16(float(q_norm[i]) *
+                                        float(bf16(float(p[i]) * inv)));
+                        }
+                    }
+                } else if (w < heads + kv_heads) {
+                    const int kh = w - heads;
+                    bf16* p = kbuf + (size_t)kh * 128;
+                    float ss = 0.f;
+                    for (int d = 0; d < 4; ++d) {
+                        const float v = float(p[lane * 4 + d]);
+                        ss += v * v;
+                    }
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<>());
+                    const float inv = sycl::rsqrt(ss / 128.f + eps);
+                    const int slot = global ? pos : (pos % cap);
+                    bf16* dst = kcache + ((size_t)kh * cap + slot) * 128;
+                    if (rope) {
+                        for (int j = 0; j < 2; ++j) {
+                            const int pair = lane * 2 + j;
+                            const float a = float(k_norm[pair]) *
+                                float(bf16(float(p[pair]) * inv));
+                            const float bb = float(k_norm[pair + 64]) *
+                                float(bf16(float(p[pair + 64]) * inv));
+                            const float th = float(pos) *
+                                sycl::exp2(-float(pair) / 64.f * log2base);
+                            const float c = sycl::cos(th);
+                            const float s = sycl::sin(th);
+                            dst[pair] = bf16(a * c - bb * s);
+                            dst[pair + 64] = bf16(a * s + bb * c);
+                        }
+                    } else {
+                        for (int d = 0; d < 4; ++d) {
+                            const int i = lane * 4 + d;
+                            dst[i] = bf16(float(k_norm[i]) *
+                                          float(bf16(float(p[i]) * inv)));
+                        }
+                    }
+                } else {
+                    const int vh = w - heads - kv_heads;
+                    const int slot = global ? pos : (pos % cap);
+                    const bf16* src = vbuf + (size_t)vh * 128;
+                    bf16* dst = vcache + ((size_t)vh * cap + slot) * 128;
+                    for (int d = 0; d < 4; ++d)
+                        dst[lane * 4 + d] = src[lane * 4 + d];
+                }
+            });
+    });
+}
+
 // ---------------------------------------------------------------- attention
 
 inline void attention(sycl::queue& q, const bf16* qbuf, const bf16* kcache,
@@ -324,6 +604,104 @@ inline void attention(sycl::queue& q, const bf16* qbuf, const bf16* kcache,
     });
 }
 
+// Split-K decode attention for long contexts: one work-group per (head, part),
+// then a small merge pass. Short contexts keep the single-group kernel.
+inline int attention_parts(int count) {
+    if (count <= 1024) return 1;
+    if (count <= 4096) return 16;
+    if (count <= 16384) return 32;
+    return 64;
+}
+
+inline void attention_split(sycl::queue& q, const bf16* qbuf, const bf16* kcache,
+                            const bf16* vcache, const bf16* sink, float* partial,
+                            float* stats, int heads, int kv_heads, bool global,
+                            int pos, int cap, int parts) {
+    const float scale = 0.08838834764831845f;
+    const int repeat = heads / kv_heads;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t)heads * parts * kSG),
+                              sycl::range<1>(kSG)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int gid = (int)it.get_group(0);
+                const int head = gid / parts;
+                const int part = gid % parts;
+                const auto sg = it.get_sub_group();
+                const int lane = (int)sg.get_local_id()[0];
+                const int kvh = head / repeat;
+                const int count = global ? pos + 1 : sycl::min(pos + 1, cap);
+                const int start = pos + 1 - count;
+
+                float qv[4];
+                for (int d = 0; d < 4; ++d)
+                    qv[d] = float(qbuf[(size_t)head * 128 + lane * 4 + d]) * scale;
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                float hi = -3.402823466e+38f;
+                float z = 0.f;
+                if (part == 0) {
+                    hi = float(sink[head]);
+                    z = 1.f;
+                }
+                for (int t = start + part; t <= pos; t += parts) {
+                    const int slot = global ? t : (t % cap);
+                    const bf16* kp =
+                        kcache + ((size_t)kvh * cap + slot) * 128 + lane * 4;
+                    const bf16* vp =
+                        vcache + ((size_t)kvh * cap + slot) * 128 + lane * 4;
+                    float sc = 0.f;
+                    for (int d = 0; d < 4; ++d) sc += qv[d] * float(kp[d]);
+                    sc = sycl::reduce_over_group(sg, sc, sycl::plus<>());
+                    const float m = sycl::fmax(hi, sc);
+                    const float old_w = sycl::exp(hi - m);
+                    const float new_w = sycl::exp(sc - m);
+                    z = z * old_w + new_w;
+                    for (int d = 0; d < 4; ++d)
+                        acc[d] = acc[d] * old_w + new_w * float(vp[d]);
+                    hi = m;
+                }
+                const size_t row = (size_t)head * parts + part;
+                for (int d = 0; d < 4; ++d)
+                    partial[row * 128 + lane * 4 + d] = acc[d];
+                if (lane == 0) {
+                    stats[row * 2] = hi;
+                    stats[row * 2 + 1] = z;
+                }
+            });
+    });
+}
+
+inline void attention_merge(sycl::queue& q, const float* partial,
+                            const float* stats, bf16* out, int heads, int parts) {
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(heads * kSG),
+                                         sycl::range<1>(kSG)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                           const int head = (int)it.get_group(0);
+                           const auto sg = it.get_sub_group();
+                           const int lane = (int)sg.get_local_id()[0];
+                           float top = -3.402823466e+38f;
+                           for (int p = 0; p < parts; ++p)
+                               top = sycl::fmax(
+                                   top, stats[((size_t)head * parts + p) * 2]);
+                           float z = 0.f;
+                           float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                           for (int p = 0; p < parts; ++p) {
+                               const size_t row = (size_t)head * parts + p;
+                               const float factor =
+                                   sycl::exp(stats[row * 2] - top);
+                               z += factor * stats[row * 2 + 1];
+                               for (int d = 0; d < 4; ++d)
+                                   acc[d] += factor * partial[row * 128 + lane * 4 + d];
+                           }
+                           const float inv = z == 0.f ? 0.f : 1.f / z;
+                           for (int d = 0; d < 4; ++d)
+                               out[(size_t)head * 128 + lane * 4 + d] =
+                                   bf16(acc[d] * inv);
+                       });
+    });
+}
+
 // ---------------------------------------------------------------- router
 
 inline void router_topk(sycl::queue& q, const bf16* w, const bf16* x, int experts,
@@ -333,13 +711,22 @@ inline void router_topk(sycl::queue& q, const bf16* w, const bf16* x, int expert
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
                        [=](sycl::nd_item<1> it) {
                            const int tid = (int)it.get_local_id(0);
-                           if (tid < experts) {
+                           const auto sg = it.get_sub_group();
+                           const int lane = (int)sg.get_local_id()[0];
+                           const int sgid = tid / kSG;
+                           const int rows = (experts + 7) / 8;
+                           for (int r = 0; r < rows; ++r) {
+                               const int row = sgid * rows + r;
+                               if (row >= experts) break;
+                               const bf16* wr = w + (size_t)row * H;
                                float a = 0.f;
-                               const bf16* row = w + (size_t)tid * H;
-                               for (int i = 0; i < H; ++i)
-                                   a += float(row[i]) * float(x[i]);
-                               a = float(bf16(a));
-                               scores[tid] = 1.f / (1.f + sycl::exp(-a));
+                               for (int i = lane; i < H; i += kSG)
+                                   a += float(wr[i]) * float(x[i]);
+                               a = sycl::reduce_over_group(sg, a, sycl::plus<>());
+                               if (lane == 0) {
+                                   a = float(bf16(a));
+                                   scores[row] = 1.f / (1.f + sycl::exp(-a));
+                               }
                            }
                            sycl::group_barrier(it.get_group());
                            if (tid == 0) {
@@ -370,7 +757,7 @@ inline void router_topk(sycl::queue& q, const bf16* w, const bf16* x, int expert
     });
 }
 
-// ---------------------------------------------------------------- MoE
+// ---------------------------------------------------------------- MoE// ---------------------------------------------------------------- MoE
 
 // Routed roles 0..top_k-1 use the 3-D expert tensors; role top_k is shared.
 inline void expert_gateup(sycl::queue& q, const FlintLayer& L, int hidden, int moe_n,
@@ -378,6 +765,22 @@ inline void expert_gateup(sycl::queue& q, const FlintLayer& L, int hidden, int m
                           bf16* act) {
     const int width_r = moe_n;
     const int rows = top_k * width_r + shared_n;
+    if (L.egate.format != WeightFormat::MLX || L.eup.format != WeightFormat::MLX ||
+        L.sgate.format != WeightFormat::MLX || L.sup.format != WeightFormat::MLX) {
+        const QTensor eg = L.egate, eu = L.eup, sg = L.sgate, su = L.sup;
+        decode_rows(q, rows, [=](int row, int lane, sycl::sub_group group) {
+            const bool routed = row < top_k * width_r;
+            const int role = routed ? row / width_r : top_k;
+            const int local = routed ? row - role * width_r : row - top_k * width_r;
+            const int expert = routed ? ids[role] : 0;
+            float ga = 0.f, ua = 0.f;
+            dot_tensor_pair(routed ? eg : sg, routed ? eu : su, local, expert,
+                            x, lane, group, ga, ua);
+            if (lane == 0)
+                act[(size_t)role * shared_n + local] = silu_mul(bf16(ga), bf16(ua));
+        });
+        return;
+    }
     const int groups = rows / kRowsPerGroup;
     const uint8_t* gw = L.egate.w;
     const bf16* gs = L.egate.s;
@@ -444,6 +847,19 @@ inline void expert_down(sycl::queue& q, const FlintLayer& L, int hidden, int moe
                         int shared_n, int top_k, const bf16* act, const int* ids,
                         bf16* down) {
     const int rows = (top_k + 1) * hidden;
+    if (L.edown.format != WeightFormat::MLX || L.sdown.format != WeightFormat::MLX) {
+        const QTensor ed = L.edown, sd = L.sdown;
+        decode_rows(q, rows, [=](int row, int lane, sycl::sub_group sg) {
+            const int role = row / hidden;
+            const int local = row - role * hidden;
+            const bool routed = role < top_k;
+            const int expert = routed ? ids[role] : 0;
+            const float v = dot_tensor(routed ? ed : sd, local, expert,
+                                       act + (size_t)role * shared_n, lane, sg);
+            if (lane == 0) down[(size_t)role * hidden + local] = bf16(v);
+        });
+        return;
+    }
     const int groups = rows / kRowsPerGroup;
     const uint8_t* dw = L.edown.w;
     const bf16* ds = L.edown.s;
@@ -500,10 +916,79 @@ inline void moe_combine(sycl::queue& q, bf16* h, const bf16* down,
     });
 }
 
+// Fused routed experts + shared expert + residual: one launch, no down buffer.
+inline void moe_down_combine(sycl::queue& q, const FlintLayer& L, int hidden,
+                             int moe_n, int shared_n, int top_k,
+                             const bf16* act, const int* ids, const float* weights,
+                             bf16* h) {
+    if (L.edown.format != WeightFormat::MLX || L.sdown.format != WeightFormat::MLX) {
+        const QTensor ed = L.edown, sd = L.sdown;
+        decode_rows(q, hidden, [=](int j, int lane, sycl::sub_group sg) {
+            float acc = 0.f;
+            for (int r = 0; r < top_k; ++r) {
+                const float v = dot_tensor(ed, j, ids[r], act + (size_t)r * shared_n,
+                                           lane, sg);
+                const bf16 prod = bf16(float(bf16(v)) * float(bf16(weights[r])));
+                const float term = float(prod);
+                acc = r == 0 ? term : float(bf16(term + acc));
+            }
+            const float sv = dot_tensor(sd, j, 0, act + (size_t)top_k * shared_n,
+                                        lane, sg);
+            const float mlp = float(bf16(acc + float(bf16(sv))));
+            if (lane == 0) h[j] = bf16(float(h[j]) + mlp);
+        });
+        return;
+    }
+    const int groups = hidden / kRowsPerGroup;
+    const size_t ew = L.edown.stride_w, es = L.edown.stride_s;
+    q.submit([&](sycl::handler& hdl) {
+        hdl.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(groups * 256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int sgid = (int)it.get_local_id(0) / kSG;
+                const int j = (int)it.get_group(0) * kRowsPerGroup + sgid;
+                const auto sg = it.get_sub_group();
+                const int lane = (int)sg.get_local_id()[0];
+                float acc = 0.f;
+                for (int r = 0; r < top_k; ++r) {
+                    const int expert = ids[r];
+                    const uint8_t* wrow =
+                        L.edown.w + (size_t)expert * ew + (size_t)j * (moe_n / 2);
+                    const bf16* srow =
+                        L.edown.s + (size_t)expert * es + (size_t)j * (moe_n / 64);
+                    const bf16* brow =
+                        L.edown.b + (size_t)expert * es + (size_t)j * (moe_n / 64);
+                    const float v =
+                        dot_q4(wrow, srow, brow, moe_n, act + (size_t)r * shared_n,
+                               lane, sg);
+                    const bf16 prod =
+                        bf16(float(bf16(v)) * float(bf16(weights[r])));
+                    const float term = float(prod);
+                    acc = r == 0 ? term : float(bf16(term + acc));
+                }
+                const float sv = dot_q4(
+                    L.sdown.w + (size_t)j * (shared_n / 2),
+                    L.sdown.s + (size_t)j * (shared_n / 64),
+                    L.sdown.b + (size_t)j * (shared_n / 64), shared_n,
+                    act + (size_t)top_k * shared_n, lane, sg);
+                const float mlp = float(bf16(acc + float(bf16(sv))));
+                if (lane == 0) h[j] = bf16(float(h[j]) + mlp);
+            });
+    });
+}
+
 // ---------------------------------------------------------------- dense MLP
 
-inline void dense_gateup(sycl::queue& q, const QTensor& g, const QTensor& u,
-                         const bf16* x, bf16* gout, bf16* uout) {
+inline void dense_gateup_act(sycl::queue& q, const QTensor& g, const QTensor& u,
+                             const bf16* x, bf16* act) {
+    if (g.format != WeightFormat::MLX || u.format != WeightFormat::MLX) {
+        decode_rows(q, g.n, [=](int row, int lane, sycl::sub_group sg) {
+            float ga = 0.f, ua = 0.f;
+            dot_tensor_pair(g, u, row, 0, x, lane, sg, ga, ua);
+            if (lane == 0) act[row] = silu_mul(bf16(ga), bf16(ua));
+        });
+        return;
+    }
     const int n = g.n, k = g.k;
     const int groups = n / kRowsPerGroup;
     q.submit([&](sycl::handler& h) {
@@ -519,10 +1004,7 @@ inline void dense_gateup(sycl::queue& q, const QTensor& g, const QTensor& u,
                             g.b + (size_t)row * (k / 64), u.w + (size_t)row * (k / 2),
                             u.s + (size_t)row * (k / 64),
                             u.b + (size_t)row * (k / 64), k, x, lane, sg, ga, ua);
-                if (lane == 0) {
-                    gout[row] = bf16(ga);
-                    uout[row] = bf16(ua);
-                }
+                if (lane == 0) act[row] = silu_mul(bf16(ga), bf16(ua));
             });
     });
 }

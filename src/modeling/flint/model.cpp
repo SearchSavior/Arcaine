@@ -14,6 +14,8 @@
 #include "../../common/preprocess/tokenizer.hpp"
 #include "kernels.hpp"
 #include "prefill.hpp"
+#include "prefill_xmx.hpp"
+#include "awq_xmx.hpp"
 
 namespace {
 // Mirrors the checkpoint template's flint_text() sanitization.
@@ -88,6 +90,10 @@ FlintModel::FlintModel(const std::string& model_dir, int max_seq_len) {
     trace_ = alloc<flint::bf16>(q_, (size_t)(cfg_.num_hidden_layers + 1) * H, "trace");
     ids_dev_ = alloc<int>(q_, cfg_.num_experts_per_tok, "ids");
     weights_dev_ = alloc<float>(q_, cfg_.num_experts_per_tok, "route_weights");
+    attn_partial_ = alloc<float>(q_, (size_t)cfg_.num_attention_heads * 64 * 128,
+                                 "attn_partial");
+    attn_stats_ = alloc<float>(q_, (size_t)cfg_.num_attention_heads * 64 * 2,
+                               "attn_stats");
 
     kv_.resize(w_.layers.size());
     for (size_t i = 0; i < w_.layers.size(); ++i) {
@@ -138,12 +144,15 @@ FlintModel::~FlintModel() {
     if (trace_) sycl::free(trace_, q_);
     if (ids_dev_) sycl::free(ids_dev_, q_);
     if (weights_dev_) sycl::free(weights_dev_, q_);
+    if (attn_partial_) sycl::free(attn_partial_, q_);
+    if (attn_stats_) sycl::free(attn_stats_, q_);
     auto bfree = [&](auto* p) { if (p) sycl::free(p, q_); };
     bfree(b_tokens); bfree(b_h); bfree(b_normed); bfree(b_q); bfree(b_k);
     bfree(b_v); bfree(b_attn); bfree(b_gate); bfree(b_up); bfree(b_routed);
     bfree(b_shared_act); bfree(b_shared_up); bfree(b_shared_down);
     bfree(b_egate); bfree(b_eup); bfree(b_eact); bfree(b_ids); bfree(b_weights);
     bfree(b_rows); bfree(b_outs); bfree(b_xq); bfree(b_xs); bfree(b_xq2); bfree(b_xs2);
+    bfree(b_xi);
 }
 
 PreparedInput FlintModel::prepare_input(const std::string& prompt,
@@ -162,6 +171,23 @@ PreparedInput FlintModel::prepare_input(const std::string& prompt,
     return out;
 }
 
+void FlintModel::attend(const flint::bf16* q, const KVCache& c,
+                        const flint::bf16* sink, flint::bf16* out, int pos) {
+    using namespace flint::kernels;
+    const int count = c.global ? pos + 1 : std::min(pos + 1, c.cap);
+    const int parts = attention_parts(count);
+    if (parts <= 1) {
+        attention(q_, q, c.k, c.v, sink, out, cfg_.num_attention_heads,
+                  cfg_.num_key_value_heads, c.global, pos, c.cap);
+    } else {
+        attention_split(q_, q, c.k, c.v, sink, attn_partial_, attn_stats_,
+                        cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                        c.global, pos, c.cap, parts);
+        attention_merge(q_, attn_partial_, attn_stats_, out,
+                        cfg_.num_attention_heads, parts);
+    }
+}
+
 void FlintModel::step(int token) {
     using namespace flint;
     using namespace flint::kernels;
@@ -178,21 +204,16 @@ void FlintModel::step(int token) {
         const int cap = kv_[L.index].cap;
 
         rmsnorm(q_, h_, L.in_norm, normed_, H, cfg_.rms_norm_eps);
-        q4_gemv(q_, L.q, normed_, qbuf_);
-        q4_gemv(q_, L.k, normed_, kbuf_);
-        q4_gemv(q_, L.v, normed_, vbuf_);
-        head_norm_rope(q_, qbuf_, L.q_norm, heads, rope, pos_, log2base_,
-                       cfg_.rms_norm_eps);
-        kv_finish(q_, kbuf_, vbuf_, L.k_norm, kv_[L.index].k, kv_[L.index].v,
-                  kvh, global, pos_, cap, rope, log2base_, cfg_.rms_norm_eps);
-        attention(q_, qbuf_, kv_[L.index].k, kv_[L.index].v, L.sink, attn_,
-                  heads, kvh, global, pos_, cap);
+        qkv_gemv(q_, L.q, L.k, L.v, normed_, qbuf_, kbuf_, vbuf_);
+        qkv_post(q_, qbuf_, kbuf_, vbuf_, L.q_norm, L.k_norm, kv_[L.index].k,
+                 kv_[L.index].v, heads, kvh, global, pos_, cap, rope, log2base_,
+                 cfg_.rms_norm_eps);
+        attend(qbuf_, kv_[L.index], L.sink, attn_, pos_);
         q4_gemv(q_, L.o, attn_, h_, 0, h_);
 
         rmsnorm(q_, h_, L.post_norm, normed_, H, cfg_.rms_norm_eps);
         if (!L.moe) {
-            dense_gateup(q_, L.gate, L.up, normed_, gate_, up_);
-            silu_mul_vec(q_, gate_, up_, cfg_.intermediate_size);
+            dense_gateup_act(q_, L.gate, L.up, normed_, gate_);
             q4_gemv(q_, L.down, gate_, h_, 0, h_);
         } else {
             router_topk(q_, L.router, normed_, cfg_.num_experts, H, top_k,
@@ -200,10 +221,9 @@ void FlintModel::step(int token) {
             expert_gateup(q_, L, H, cfg_.moe_intermediate_size,
                           cfg_.shared_expert_intermediate_size, top_k, normed_,
                           ids_dev_, act_);
-            expert_down(q_, L, H, cfg_.moe_intermediate_size,
-                        cfg_.shared_expert_intermediate_size, top_k, act_,
-                        ids_dev_, down_);
-            moe_combine(q_, h_, down_, weights_dev_, H, top_k);
+            moe_down_combine(q_, L, H, cfg_.moe_intermediate_size,
+                             cfg_.shared_expert_intermediate_size, top_k, act_,
+                             ids_dev_, weights_dev_, h_);
         }
         q_.memcpy(trace_ + (size_t)(L.index + 1) * H, h_, (size_t)H * sizeof(bf16));
     }
@@ -247,6 +267,7 @@ void FlintModel::ensure_batch(int m) {
     b_xs = alloc<float>(q_, (size_t)cap * (maxk / 64), "b_xs");
     b_xq2 = alloc<int8_t>(q_, (size_t)cap * maxk, "b_xq2");
     b_xs2 = alloc<float>(q_, (size_t)cap * (maxk / 64), "b_xs2");
+    b_xi = alloc<int>(q_, (size_t)cap * (maxk / 64), "b_xi");
 }
 
 void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
@@ -260,7 +281,13 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
     const int heads = cfg_.num_attention_heads;
     const int kvh = cfg_.num_key_value_heads;
     const int top_k = cfg_.num_experts_per_tok;
-    const bool int8 = std::getenv("ARCAINE_FLINT_PREFILL_INT8") != nullptr;
+    const bool int8 = !cfg_.awq && std::getenv("ARCAINE_FLINT_PREFILL_INT8") != nullptr;
+    // The int8 prefill weights are repacked into DPAS fragment order at load
+    // time (see loader.cpp / prefill_xmx.hpp), so the int8 prefill path is
+    // XMX-only: the vector int8 kernel would read the permuted layout and
+    // produce garbage.  ARCAINE_FLINT_PREFILL_XMX is therefore implied by the
+    // INT8 flag (it still selects the bf16 path when INT8 is unset).
+    const bool xmx = int8;
     const bool dbg = std::getenv("ARCAINE_FLINT_DEBUG_SYNC") != nullptr;
     auto sync = [&](const char* what) {
         if (!dbg) return;
@@ -270,10 +297,43 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
             throw;
         }
     };
+    int xmx_hits = 0, xmx_miss = 0;
+    int awq_hits = 0, awq_miss = 0;
     auto gemm = [&](const QTensor& w, const bf16* A, const int8_t* Aq,
                     const float* xs, const int* ridx, bf16* C, int m, int N,
                     const bf16* res = nullptr, const int* oidx = nullptr,
                     int ostride = 0, int e = 0) {
+        if (w.format == WeightFormat::AWQ) {
+            if (awq_xmx::gemm(q_, w, A, ridx, C, m, N, res, oidx, ostride, e))
+                ++awq_hits;
+            else {
+                ++awq_miss;
+                gemm_awq(q_, w, A, ridx, C, m, N, res, oidx, ostride, e);
+            }
+            return;
+        }
+        // b_xi is sized for the widest K the model uses (see ensure_batch).
+        if (int8 && xmx && Aq && xs && b_xi) {
+            // Aq holds every quantized row of the chunk; expert GEMMs
+            // gather their rows through ridx, so xi must cover all of
+            // them, not just this call's token count.
+            prefill_xmx::group_sums(q_, Aq, b_xi, M, w.k);
+            if (prefill_xmx::gemm_q4_xmx(q_, w, Aq, xs, b_xi, ridx, C, m, N,
+                                         res, oidx, ostride, e)) {
+                ++xmx_hits;
+                return;
+            }
+            ++xmx_miss;
+            // No fallback: the weights are in DPAS fragment order, so the
+            // vector kernels would read the wrong bytes.
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                          "flint: gemm_q4_xmx rejected M=%d N=%d K=%d "
+                          "out_stride=%d (expert %d); the int8 prefill path is "
+                          "XMX-only",
+                          m, N, w.k, (ostride ? ostride : N), e);
+            throw std::runtime_error(msg);
+        }
         if (int8) gemm_q4<true>(q_, w, A, Aq, xs, ridx, C, m, N, res, oidx, ostride, e);
         else gemm_q4<false>(q_, w, A, Aq, xs, ridx, C, m, N, res, oidx, ostride, e);
     };
@@ -301,9 +361,8 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
                             kv_[L.index].v, M, kvh, true, pos_base, cap, rope,
                             log2base_, cfg_.rms_norm_eps);
             for (int t = 0; t < M; ++t)
-                kernels::attention(q_, b_q + (size_t)t * QD, kv_[L.index].k,
-                                   kv_[L.index].v, L.sink, b_attn + (size_t)t * QD,
-                                   heads, kvh, true, pos_base + t, cap);
+                attend(b_q + (size_t)t * QD, kv_[L.index], L.sink,
+                       b_attn + (size_t)t * QD, pos_base + t);
             sync("attention_global");
         } else {
             // Interleave stores and attention so the 513-slot ring is never
@@ -313,9 +372,8 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
                                    L.k_norm, kv_[L.index].k, kv_[L.index].v,
                                    kvh, false, pos_base + t, cap, rope, log2base_,
                                    cfg_.rms_norm_eps);
-                kernels::attention(q_, b_q + (size_t)t * QD, kv_[L.index].k,
-                                   kv_[L.index].v, L.sink, b_attn + (size_t)t * QD,
-                                   heads, kvh, false, pos_base + t, cap);
+                attend(b_q + (size_t)t * QD, kv_[L.index], L.sink,
+                       b_attn + (size_t)t * QD, pos_base + t);
                 sync("attention_sliding");
             }
         }
@@ -401,6 +459,15 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
         }
         q_.memcpy(trace_ + (size_t)(L.index + 1) * H,
                   b_h + (size_t)(M - 1) * H, (size_t)H * sizeof(bf16));
+    }
+
+    if (cfg_.awq && std::getenv("ARCAINE_FLINT_AWQ_XMX"))
+        std::fprintf(stderr, "[flint-awq-xmx] gemm hits=%d fallback=%d\n",
+                     awq_hits, awq_miss);
+    if (xmx) {
+        q_.wait();
+        std::fprintf(stderr, "[flint-xmx] gemm hits=%d fallback=%d\n",
+                     xmx_hits, xmx_miss);
     }
 
     // lm_head only needs the final position.

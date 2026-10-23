@@ -11,6 +11,7 @@
 struct FlintConfig {
     std::string model_dir;
     std::string model_type;
+    bool awq = false;
 
     int hidden_size = 2048;
     int intermediate_size = 6144;
@@ -68,6 +69,16 @@ struct FlintConfig {
         f >> j;
 
         c.model_type = j.value("model_type", "");
+        if (j.contains("quantization_config") &&
+            j["quantization_config"].value("quant_method", "") == "awq") {
+            const auto& qc = j.at("quantization_config");
+            if (qc.at("bits").get<int>() != 4 ||
+                qc.at("group_size").get<int>() != 64 ||
+                !qc.at("zero_point").get<bool>() ||
+                qc.at("version").get<std::string>() != "gemm")
+                throw std::runtime_error("flint: only AWQ GEMM W4A16 group-64 with zero points is supported");
+            c.awq = true;
+        }
         c.hidden_size = j.value("hidden_size", c.hidden_size);
         c.intermediate_size = j.value("intermediate_size", c.intermediate_size);
         c.moe_intermediate_size = j.value("moe_intermediate_size", c.moe_intermediate_size);
