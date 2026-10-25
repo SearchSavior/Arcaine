@@ -21,6 +21,15 @@ public:
                                 const std::string& vad_model) override;
     std::vector<float> forward(const ForwardInput& in) override;
     void reset_cache() override;
+    bool device_generation_enabled() const override;
+    void forward_device(const ForwardInput& in) override;
+    std::vector<int> generate_device(int max_tokens, float temperature, int top_k,
+                                     float top_p, uint64_t& rng) override;
+    bool decode_repeated_device(int token, int steps, int past_len) override;
+    int current_position() const { return pos_; }
+    // Benchmark-only prefix reuse: KV and logits remain in device memory.
+    void save_decode_prefix();
+    void restore_decode_prefix();
     const ModelInfo& info() const override { return info_; }
 
 private:
@@ -31,8 +40,15 @@ private:
         bool global = true;
     };
 
+    struct ResidentDecode;
+    std::shared_ptr<ResidentDecode> resident_decode_;
+    bool trace_enabled_ = false;
+    void enqueue_forward(const ForwardInput& in);
+    void enqueue_device_step(const int* token, int* position, const int* active);
+    void run_device_block(int steps, int mode);
     void step(int token);
     void ensure_batch(int m);
+    void release_batch();
     void prefill_batch(const std::vector<int>& tokens, int pos_base);
     void attend(const flint::bf16* q, const KVCache& c, const flint::bf16* sink,
                 flint::bf16* out, int pos);
@@ -73,6 +89,9 @@ private:
                 *b_eact = nullptr;
     int* b_ids = nullptr;
     float* b_weights = nullptr;
+    float* b_attn_partial = nullptr;
+    float* b_attn_stats = nullptr;
+    int* b_grouped_metadata = nullptr;
     int* b_rows = nullptr;
     int* b_outs = nullptr;
     int8_t* b_xq = nullptr;

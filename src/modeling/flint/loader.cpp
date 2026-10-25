@@ -1,4 +1,5 @@
 #include "weights.hpp"
+#include "awq_decode.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -450,6 +451,7 @@ FlintWeights load_flint_weights(const FlintConfig& cfg, sycl::queue& q,
         if (!arena) banks.push_back(bank);
         QTensor t;
         t.format = WeightFormat::AWQ;
+        t.decode_vector = awq_decode::enabled();
         t.w = at(bank.w_off);
         t.awq_s = reinterpret_cast<const sycl::half*>(at(bank.s_off));
         t.awq_z = at(bank.z_off);

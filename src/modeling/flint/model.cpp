@@ -16,6 +16,8 @@
 #include "prefill.hpp"
 #include "prefill_xmx.hpp"
 #include "awq_xmx.hpp"
+#include "grouped_moe.hpp"
+#include "gpu_prefill.hpp"
 
 namespace {
 // Mirrors the checkpoint template's flint_text() sanitization.
@@ -87,12 +89,16 @@ FlintModel::FlintModel(const std::string& model_dir, int max_seq_len) {
     gate_ = alloc<flint::bf16>(q_, cfg_.intermediate_size, "gate");
     up_ = alloc<flint::bf16>(q_, cfg_.intermediate_size, "up");
     logits_dev_ = alloc<float>(q_, cfg_.vocab_size, "logits");
-    trace_ = alloc<flint::bf16>(q_, (size_t)(cfg_.num_hidden_layers + 1) * H, "trace");
+    trace_enabled_ = std::getenv("ARCAINE_FLINT_TRACE") != nullptr;
+    if (trace_enabled_)
+        trace_ = alloc<flint::bf16>(q_, (size_t)(cfg_.num_hidden_layers + 1) * H, "trace");
     ids_dev_ = alloc<int>(q_, cfg_.num_experts_per_tok, "ids");
     weights_dev_ = alloc<float>(q_, cfg_.num_experts_per_tok, "route_weights");
-    attn_partial_ = alloc<float>(q_, (size_t)cfg_.num_attention_heads * 64 * 128,
+    const int decode_parts=std::max({64,flint::gpu_prefill::decode_min_parts(),
+                                     flint::gpu_prefill::decode_min_parts(true)});
+    attn_partial_ = alloc<float>(q_, (size_t)cfg_.num_attention_heads * decode_parts * 128,
                                  "attn_partial");
-    attn_stats_ = alloc<float>(q_, (size_t)cfg_.num_attention_heads * 64 * 2,
+    attn_stats_ = alloc<float>(q_, (size_t)cfg_.num_attention_heads * decode_parts * 2,
                                "attn_stats");
 
     kv_.resize(w_.layers.size());
@@ -125,6 +131,8 @@ FlintModel::FlintModel(const std::string& model_dir, int max_seq_len) {
 }
 
 FlintModel::~FlintModel() {
+    q_.wait();
+    resident_decode_.reset();
     if (w_.arena) sycl::free(w_.arena, q_);
     for (auto& c : kv_) {
         if (c.k) sycl::free(c.k, q_);
@@ -146,13 +154,7 @@ FlintModel::~FlintModel() {
     if (weights_dev_) sycl::free(weights_dev_, q_);
     if (attn_partial_) sycl::free(attn_partial_, q_);
     if (attn_stats_) sycl::free(attn_stats_, q_);
-    auto bfree = [&](auto* p) { if (p) sycl::free(p, q_); };
-    bfree(b_tokens); bfree(b_h); bfree(b_normed); bfree(b_q); bfree(b_k);
-    bfree(b_v); bfree(b_attn); bfree(b_gate); bfree(b_up); bfree(b_routed);
-    bfree(b_shared_act); bfree(b_shared_up); bfree(b_shared_down);
-    bfree(b_egate); bfree(b_eup); bfree(b_eact); bfree(b_ids); bfree(b_weights);
-    bfree(b_rows); bfree(b_outs); bfree(b_xq); bfree(b_xs); bfree(b_xq2); bfree(b_xs2);
-    bfree(b_xi);
+    release_batch();
 }
 
 PreparedInput FlintModel::prepare_input(const std::string& prompt,
@@ -197,7 +199,7 @@ void FlintModel::step(int token) {
     const int top_k = cfg_.num_experts_per_tok;
 
     embed_i8(q_, w_.embed, token, h_);
-    q_.memcpy(trace_, h_, (size_t)H * sizeof(bf16));
+    if (trace_enabled_) q_.memcpy(trace_, h_, (size_t)H * sizeof(bf16));
     for (auto& L : w_.layers) {
         const bool rope = cfg_.use_rope(L.index);
         const bool global = L.global;
@@ -225,19 +227,33 @@ void FlintModel::step(int token) {
                              cfg_.shared_expert_intermediate_size, top_k, act_,
                              ids_dev_, weights_dev_, h_);
         }
-        q_.memcpy(trace_ + (size_t)(L.index + 1) * H, h_, (size_t)H * sizeof(bf16));
+        if (trace_enabled_) q_.memcpy(trace_ + (size_t)(L.index + 1) * H, h_, (size_t)H * sizeof(bf16));
     }
     ++pos_;
     rmsnorm(q_, h_, w_.final_norm, normed_, H, cfg_.rms_norm_eps);
     lm_head(q_, w_.head, normed_, logits_dev_);
 }
 
+void FlintModel::release_batch() {
+    auto bfree = [&](auto*& p) { if (p) sycl::free(p, q_); p = nullptr; };
+    bfree(b_tokens); bfree(b_h); bfree(b_normed); bfree(b_q); bfree(b_k);
+    bfree(b_v); bfree(b_attn); bfree(b_gate); bfree(b_up); bfree(b_routed);
+    bfree(b_shared_act); bfree(b_shared_up); bfree(b_shared_down);
+    bfree(b_egate); bfree(b_eup); bfree(b_eact); bfree(b_ids); bfree(b_weights);
+    bfree(b_rows); bfree(b_outs); bfree(b_xq); bfree(b_xs); bfree(b_xq2); bfree(b_xs2);
+    bfree(b_xi);
+    bfree(b_grouped_metadata);
+    bfree(b_attn_partial); bfree(b_attn_stats);
+    batch_cap_ = 0;
+}
+
 void FlintModel::ensure_batch(int m) {
-    if (m <= batch_cap_) return;
+    if (m <= batch_cap_ && (!flint::gpu_prefill::enabled() || b_attn_partial)) return;
     int cap = std::max(m, 512);
     if (cap > max_seq_) cap = max_seq_;
     if (m > cap) throw std::runtime_error("flint: prefill chunk exceeds context");
-    batch_cap_ = cap;
+    q_.wait_and_throw();
+    release_batch();
     const int H = cfg_.hidden_size;
     const int QD = cfg_.q_dim();
     const int KV = cfg_.kv_dim();
@@ -258,7 +274,9 @@ void FlintModel::ensure_batch(int m) {
     b_shared_down = alloc<flint::bf16>(q_, (size_t)cap * H, "b_sdown");
     b_egate = alloc<flint::bf16>(q_, (size_t)cap * cfg_.moe_intermediate_size, "b_egate");
     b_eup = alloc<flint::bf16>(q_, (size_t)cap * cfg_.moe_intermediate_size, "b_eup");
-    b_eact = alloc<flint::bf16>(q_, (size_t)cap * cfg_.moe_intermediate_size, "b_eact");
+    b_eact = alloc<flint::bf16>(q_, (size_t)cap * top_k * cfg_.moe_intermediate_size, "b_eact");
+    b_grouped_metadata = alloc<int>(q_, flint::grouped_moe::metadata_size(cfg_.num_experts),
+                                    "b_grouped_metadata");
     b_ids = alloc<int>(q_, (size_t)cap * top_k, "b_ids");
     b_weights = alloc<float>(q_, (size_t)cap * top_k, "b_weights");
     b_rows = alloc<int>(q_, (size_t)cap * top_k, "b_rows");
@@ -268,6 +286,13 @@ void FlintModel::ensure_batch(int m) {
     b_xq2 = alloc<int8_t>(q_, (size_t)cap * maxk, "b_xq2");
     b_xs2 = alloc<float>(q_, (size_t)cap * (maxk / 64), "b_xs2");
     b_xi = alloc<int>(q_, (size_t)cap * (maxk / 64), "b_xi");
+    if (flint::gpu_prefill::enabled()) {
+        const size_t rows = (size_t)cap * cfg_.num_attention_heads *
+                            flint::gpu_prefill::parts_for(max_seq_);
+        b_attn_partial = alloc<float>(q_, rows * 128, "b_attn_partial");
+        b_attn_stats = alloc<float>(q_, rows * 2, "b_attn_stats");
+    }
+    batch_cap_ = cap;
 }
 
 void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
@@ -288,6 +313,7 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
     // produce garbage.  ARCAINE_FLINT_PREFILL_XMX is therefore implied by the
     // INT8 flag (it still selects the bf16 path when INT8 is unset).
     const bool xmx = int8;
+    const bool gpu_tokens = gpu_prefill::enabled();
     const bool dbg = std::getenv("ARCAINE_FLINT_DEBUG_SYNC") != nullptr;
     auto sync = [&](const char* what) {
         if (!dbg) return;
@@ -356,7 +382,18 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
                       nullptr, nullptr, 0, 0); sync("v_gemm");
         head_norm_rope_batch(q_, b_q, L.q_norm, M, heads, rope, pos_base,
                              log2base_, cfg_.rms_norm_eps); sync("headnorm");
-        if (global) {
+        if (gpu_tokens) {
+            // Preserve historical ring slots until every query in the chunk
+            // has consumed them. Normalize K in the chunk, attend, then commit.
+            head_norm_rope_batch(q_, b_k, L.k_norm, M, kvh, rope, pos_base,
+                                 log2base_, cfg_.rms_norm_eps);
+            gpu_prefill::attention(q_, b_q, b_k, b_v, kv_[L.index].k, kv_[L.index].v,
+                                   L.sink, b_attn, b_attn_partial, b_attn_stats,
+                                   M, heads, kvh, global, pos_base, cap);
+            gpu_prefill::commit(q_, b_k, b_v, kv_[L.index].k, kv_[L.index].v,
+                                M, kvh, global, pos_base, cap);
+            sync("gpu_attention_batch");
+        } else if (global) {
             kv_finish_batch(q_, b_k, b_v, L.k_norm, kv_[L.index].k,
                             kv_[L.index].v, M, kvh, true, pos_base, cap, rope,
                             log2base_, cfg_.rms_norm_eps);
@@ -399,46 +436,54 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
         } else {
             router_batch(q_, L.router, b_normed, M, cfg_.num_experts, H, top_k,
                          b_ids, b_weights);
-            std::vector<int> ids((size_t)M * top_k), rows((size_t)M * top_k),
-                outs((size_t)M * top_k);
             sync("router");
-            q_.memcpy(ids.data(), b_ids, ids.size() * sizeof(int)).wait();
-            std::vector<int> count(cfg_.num_experts, 0), off(cfg_.num_experts, 0);
-            for (int t = 0; t < M; ++t)
-                for (int r = 0; r < top_k; ++r) ++count[ids[t * top_k + r]];
-            int acc = 0;
-            for (int e = 0; e < cfg_.num_experts; ++e) {
-                off[e] = acc;
-                acc += count[e];
-            }
-            std::vector<int> fill = off;
-            for (int t = 0; t < M; ++t)
-                for (int r = 0; r < top_k; ++r) {
-                    const int e = ids[t * top_k + r];
-                    const int at = fill[e]++;
-                    rows[at] = t;
-                    outs[at] = t * top_k + r;
+            if (cfg_.awq && (grouped_moe::enabled() || gpu_tokens)) {
+                if (!grouped_moe::supported(q_, L.egate, L.eup, L.edown))
+                    throw std::runtime_error("flint: grouped W4A16 MoE unsupported");
+                grouped_moe::run(q_, L.egate, L.eup, L.edown, b_normed, b_ids,
+                                 b_eact, b_routed, M, top_k, b_grouped_metadata, b_outs);
+                sync("grouped_experts");
+            } else {
+                std::vector<int> ids((size_t)M * top_k), rows((size_t)M * top_k),
+                    outs((size_t)M * top_k);
+                q_.memcpy(ids.data(), b_ids, ids.size() * sizeof(int)).wait();
+                std::vector<int> count(cfg_.num_experts, 0), off(cfg_.num_experts, 0);
+                for (int t = 0; t < M; ++t)
+                    for (int r = 0; r < top_k; ++r) ++count[ids[t * top_k + r]];
+                int acc = 0;
+                for (int e = 0; e < cfg_.num_experts; ++e) {
+                    off[e] = acc;
+                    acc += count[e];
                 }
-            if (M) {
-                q_.memcpy(b_rows, rows.data(), rows.size() * sizeof(int)).wait();
-                q_.memcpy(b_outs, outs.data(), outs.size() * sizeof(int)).wait();
-            }
-            if (int8) quantize_int8(q_, b_normed, b_xq, b_xs, M, H);
-            for (int e = 0; e < cfg_.num_experts; ++e) {
-                const int n = count[e];
-                if (!n) continue;
-                const int* ridx = b_rows + off[e];
-                gemm(L.egate, b_normed, b_xq, b_xs, ridx, b_egate,
-                              n, cfg_.moe_intermediate_size, nullptr, nullptr, 0, e);
-                gemm(L.eup, b_normed, b_xq, b_xs, ridx, b_eup, n,
-                              cfg_.moe_intermediate_size, nullptr, nullptr, 0, e);
-                silu_mul_batch(q_, b_egate, b_eup, n * cfg_.moe_intermediate_size);
-                if (int8) quantize_int8(q_, b_egate, b_xq, b_xs, n,
-                                        cfg_.moe_intermediate_size);
-                sync("expert_gateup");
-                const int* oidx = b_outs + off[e];
-                gemm(L.edown, b_egate, b_xq, b_xs, nullptr, b_routed,
-                              n, H, nullptr, oidx, H, e);
+                std::vector<int> fill = off;
+                for (int t = 0; t < M; ++t)
+                    for (int r = 0; r < top_k; ++r) {
+                        const int e = ids[t * top_k + r];
+                        const int at = fill[e]++;
+                        rows[at] = t;
+                        outs[at] = t * top_k + r;
+                    }
+                if (M) {
+                    q_.memcpy(b_rows, rows.data(), rows.size() * sizeof(int)).wait();
+                    q_.memcpy(b_outs, outs.data(), outs.size() * sizeof(int)).wait();
+                }
+                if (int8) quantize_int8(q_, b_normed, b_xq, b_xs, M, H);
+                for (int e = 0; e < cfg_.num_experts; ++e) {
+                    const int n = count[e];
+                    if (!n) continue;
+                    const int* ridx = b_rows + off[e];
+                    gemm(L.egate, b_normed, b_xq, b_xs, ridx, b_egate,
+                                  n, cfg_.moe_intermediate_size, nullptr, nullptr, 0, e);
+                    gemm(L.eup, b_normed, b_xq, b_xs, ridx, b_eup, n,
+                                  cfg_.moe_intermediate_size, nullptr, nullptr, 0, e);
+                    silu_mul_batch(q_, b_egate, b_eup, n * cfg_.moe_intermediate_size);
+                    if (int8) quantize_int8(q_, b_egate, b_xq, b_xs, n,
+                                            cfg_.moe_intermediate_size);
+                    sync("expert_gateup");
+                    const int* oidx = b_outs + off[e];
+                    gemm(L.edown, b_egate, b_xq, b_xs, nullptr, b_routed,
+                                  n, H, nullptr, oidx, H, e);
+                }
             }
             if (int8) quantize_int8(q_, b_normed, b_xq, b_xs, M, H);
             gemm(L.sgate, b_normed, b_xq, b_xs, nullptr,
@@ -457,7 +502,7 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
                           top_k);
             sync("combine");
         }
-        q_.memcpy(trace_ + (size_t)(L.index + 1) * H,
+        if (trace_enabled_) q_.memcpy(trace_ + (size_t)(L.index + 1) * H,
                   b_h + (size_t)(M - 1) * H, (size_t)H * sizeof(bf16));
     }
 
@@ -477,6 +522,7 @@ void FlintModel::prefill_batch(const std::vector<int>& tokens, int pos_base) {
 }
 
 void FlintModel::dump_trace(const std::string& path) {
+    if (!trace_) throw std::logic_error("set ARCAINE_FLINT_TRACE before model construction");
     const int rows = cfg_.num_hidden_layers + 1;
     const int H = cfg_.hidden_size;
     std::vector<flint::bf16> host((size_t)rows * H);
@@ -497,12 +543,12 @@ std::vector<float> FlintModel::logits() {
     return out;
 }
 
-std::vector<float> FlintModel::forward(const ForwardInput& in) {
+void FlintModel::enqueue_forward(const ForwardInput& in) {
     if (in.past_len == 0) pos_ = 0;
     else if (in.past_len != pos_) pos_ = in.past_len;
     const char* mode = std::getenv("ARCAINE_FLINT_PREFILL");
-    const bool batched = mode && std::string(mode) == "batched" &&
-                         in.token_ids.size() > 1;
+    const bool batched = ((mode && std::string(mode) == "batched") ||
+                          flint::gpu_prefill::enabled()) && in.token_ids.size() > 1;
     if (batched) {
         int at = 0;
         const int total = (int)in.token_ids.size();
@@ -518,7 +564,17 @@ std::vector<float> FlintModel::forward(const ForwardInput& in) {
     } else {
         for (int tok : in.token_ids) step(tok);
     }
+}
+
+std::vector<float> FlintModel::forward(const ForwardInput& in) {
+    enqueue_forward(in);
     return logits();
+}
+
+void FlintModel::forward_device(const ForwardInput& in) {
+    if (!device_generation_enabled()) throw std::logic_error("Flint GPU decode is disabled");
+    enqueue_forward(in);
+    q_.wait_and_throw();
 }
 
 void FlintModel::reset_cache() { pos_ = 0; }

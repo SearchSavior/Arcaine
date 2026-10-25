@@ -27,6 +27,7 @@
 #include <memory>
 
 #include "common/model_interface.hpp"
+#include "modeling/flint/model.hpp"
 #include "common/registry.hpp"
 #include "common/gpu/device_select.hpp"
 #include "common/gpu/engine.hpp"
@@ -204,6 +205,13 @@ int main(int argc, char* argv[]) {
     double load_s = (now_ms() - t0) * 0.001;
 
     const ModelInfo& info = model->info();
+    const char* prefix_env = std::getenv("ARCAINE_FLINT_MBENCH_GPU_CHECKPOINT");
+    const bool reuse_prefix = prefix_env && prefix_env[0]=='1' && prefix_env[1]=='\0';
+    auto* flint_model = dynamic_cast<FlintModel*>(model.get());
+    if (reuse_prefix && (!flint_model || !model->device_generation_enabled())) {
+        std::fprintf(stderr,"GPU prefix checkpoints require Flint GPU decode\n");
+        return 1;
+    }
     printf("model   : %s\n", info.description.c_str());
     printf("backend : SYCL + oneDNN | GPUs: %d | max_seq: %d",
            GpuEngine::count(), max_seq);
@@ -231,7 +239,8 @@ int main(int argc, char* argv[]) {
         for (int r = 0; r < warmup + reps; ++r) {
             model->reset_cache();
             double t = now_ms();
-            model->forward(ForwardInput{prompt, 0});
+            if (model->device_generation_enabled()) model->forward_device(ForwardInput{prompt, 0});
+            else model->forward(ForwardInput{prompt, 0});
             double dt = now_ms() - t;
             if (r >= warmup) times.push_back(dt);
         }
@@ -251,9 +260,7 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        std::vector<double> times;
-
-        for (int r = 0; r < warmup + reps; ++r) {
+        auto prepare_prefix = [&] {
             model->reset_cache();
 
             // Pre-fill KV cache to `depth` tokens in chunks (untimed).
@@ -265,16 +272,30 @@ int main(int argc, char* argv[]) {
                 for (int pos = 0; pos < depth; pos += CHUNK) {
                     int sz = std::min(CHUNK, depth - pos);
                     std::vector<int> chunk(sz, bos_id);
-                    model->forward(ForwardInput{chunk, pos});
+                    if (model->device_generation_enabled()) model->forward_device(ForwardInput{chunk, pos});
+                    else model->forward(ForwardInput{chunk, pos});
                 }
             }
+
+        };
+        if (reuse_prefix) {
+            prepare_prefix();
+            flint_model->save_decode_prefix();
+        }
+
+        std::vector<double> times;
+
+        for (int r = 0; r < warmup + reps; ++r) {
+            if (reuse_prefix) flint_model->restore_decode_prefix();
+            else prepare_prefix();
 
             // Time `tg` single-token decode steps.
             // The cache grows from depth to depth+tg during this window,
             // which is realistic for mid-generation latency measurement.
             double t = now_ms();
-            for (int step = 0; step < tg; ++step)
-                model->forward(ForwardInput{single, depth + step});
+            if (!model->decode_repeated_device(bos_id, tg, depth))
+                for (int step = 0; step < tg; ++step)
+                    model->forward(ForwardInput{single, depth + step});
             double dt = now_ms() - t;
 
             if (r >= warmup) times.push_back(dt);

@@ -837,6 +837,8 @@ int main(int argc, char** argv) {
     std::string prompt = "The capital of France is";
     int max_new = 16;
     int ctx = 4096;
+    int runs = 1;
+    bool sample_ab = false;
     bool greedy = false;
     bool tests = true;
     bool tests_only = false;
@@ -847,6 +849,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-new") max_new = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--greedy") greedy = true;
+        else if (a == "--runs") runs = std::stoi(next());
+        else if (a == "--sample-ab") sample_ab = true;
         else if (a == "--no-tests") tests = false;
         else if (a == "--tests-only") { tests = true; tests_only = true; }
         else if (a.rfind("--", 0) != 0) model_dir = a;
@@ -884,8 +888,23 @@ int main(int argc, char** argv) {
 
     std::printf("[flint] decoded prompt tokens: %s\n",
                 decode_tokens(model_dir, in.tokens).c_str());
+    if(runs<=0 || (sample_ab && (!model.device_generation_enabled() || greedy || max_new<=0))) {
+        std::fprintf(stderr,"--runs must be positive; --sample-ab requires stochastic GPU generation\n");
+        return 1;
+    }
+    std::vector<int> sample_reference;
+    uint64_t sample_reference_rng=0;
+    bool sample_reference_ready=false;
+    for(int phase=0;phase<(sample_ab?2:1);++phase) {
+        if(sample_ab) ::setenv("ARCAINE_FLINT_DECODE_PARALLEL_SAMPLE",phase?"1":"0",1);
+        for(int run=0;run<runs;++run) {
+            if(runs>1 || sample_ab)
+                std::printf("[flint] generation run %d/%d parallel_sample=%d\n",run+1,runs,
+                            sample_ab?phase:(std::getenv("ARCAINE_FLINT_DECODE_PARALLEL_SAMPLE")!=nullptr));
     auto t0 = std::chrono::steady_clock::now();
-    auto logits = model.forward({in.tokens, 0});
+    std::vector<float> logits;
+    if (model.device_generation_enabled()) model.forward_device({in.tokens, 0});
+    else logits = model.forward({in.tokens, 0});
     auto t1 = std::chrono::steady_clock::now();
     std::printf("[flint] prefill: %.1f ms (%zu tokens)\n",
                 std::chrono::duration<double, std::milli>(t1 - t0).count(),
@@ -895,7 +914,9 @@ int main(int argc, char** argv) {
     std::vector<int> generated;
     int past = (int)in.tokens.size();
     auto t2 = std::chrono::steady_clock::now();
-    for (int i = 0; i < max_new; ++i) {
+    if (model.device_generation_enabled())
+        generated = model.generate_device(max_new, greedy ? 0.f : 1.f, 20, 0.95f, rng);
+    else for (int i = 0; i < max_new; ++i) {
         const int tok = flint_sample(logits, greedy ? 0.f : 1.0f, 20, 0.95f, rng);
         if (tok < 0) break;
         generated.push_back(tok);
@@ -918,5 +939,16 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::printf("[flint] detokenize failed: %s\n", e.what());
     }
+    if(sample_ab) {
+        if(!sample_reference_ready) {
+            sample_reference=generated; sample_reference_rng=rng; sample_reference_ready=true;
+        } else if(generated!=sample_reference || rng!=sample_reference_rng) {
+            std::fprintf(stderr,"[flint] GPU sampler A/B token or RNG mismatch\n");
+            return 1;
+        }
+    }
+        }
+    }
+    if(sample_ab) std::printf("[flint] GPU sampler A/B token and RNG parity PASS\n");
     return 0;
 }

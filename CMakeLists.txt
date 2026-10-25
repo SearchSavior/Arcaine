@@ -90,6 +90,7 @@ set(QWEN35_SRCS
 set(FLINT_SRCS
     src/modeling/flint/loader.cpp
     src/modeling/flint/model.cpp
+    src/modeling/flint/gpu_decode.cpp
     src/modeling/flint/register.cpp
     src/modeling/flint/awq_xmx.cpp
 )
@@ -257,6 +258,13 @@ set(KBENCH_SRCS
     src/bench/diffusion_int4_fusion_bench.cpp
     src/bench/diffusion_int4_w4a8_bench.cpp
     src/bench/diffusion_int4_grouped_s8s4_bench.cpp
+    src/bench/flint_awq_grouped_moe_bench.cpp
+    src/bench/flint_prefill_attention_bench.cpp
+    src/bench/flint_decode_head_bench.cpp
+    src/bench/flint_decode_moe_bench.cpp
+    src/bench/flint_decode_router_bench.cpp
+    src/bench/flint_decode_sampling_bench.cpp
+    src/modeling/flint/awq_xmx.cpp
     # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
     src/common/gpu/sycl_graph_session.cpp)

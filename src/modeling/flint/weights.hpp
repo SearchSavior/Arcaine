@@ -19,6 +19,7 @@ enum class WeightFormat { MLX, AWQ, BF16 };
 
 struct QTensor {
     WeightFormat format = WeightFormat::MLX;
+    bool decode_vector = false;
     const uint8_t* w = nullptr;
     const bf16* s = nullptr;
     const bf16* b = nullptr;

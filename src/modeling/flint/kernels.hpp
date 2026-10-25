@@ -4,6 +4,9 @@
 
 #include "config.hpp"
 #include "weights.hpp"
+#include "bf16_decode.hpp"
+#include "awq_decode.hpp"
+#include "decode_router.hpp"
 
 // All Flint decode kernels (M = 1). No oneDNN, no joint_matrix.
 // Weights are MLX affine int4: w = s*q + b over groups of 64.
@@ -65,6 +68,11 @@ inline void dot_q4_pair(const uint8_t* w0, const bf16* s0, const bf16* b0,
 
 inline float dot_awq(const QTensor& t, int row, int expert, const bf16* x,
                      int lane, sycl::sub_group sg) {
+    if (t.decode_vector && t.k % 128 == 0) {
+        float a=0.f,b=0.f;
+        awq_decode::dot4<false>(t,t,row,expert,x,lane,sg,a,b);
+        return a;
+    }
     const uint8_t* w = t.w + (size_t)expert * t.stride_w + (size_t)row * (t.k / 2);
     const sycl::half* s = t.awq_s + (size_t)expert * t.stride_s + row;
     const uint8_t* z = t.awq_z + (size_t)expert * t.stride_b + row;
@@ -89,6 +97,10 @@ inline float dot_awq(const QTensor& t, int row, int expert, const bf16* x,
 inline void dot_awq_pair(const QTensor& t0, const QTensor& t1, int row,
                          int expert, const bf16* x, int lane, sycl::sub_group sg,
                          float& a0, float& a1) {
+    if (t0.decode_vector && t1.decode_vector && t0.k % 128 == 0) {
+        awq_decode::dot4<true>(t0,t1,row,expert,x,lane,sg,a0,a1);
+        return;
+    }
     const uint8_t* w0 = t0.w + (size_t)expert * t0.stride_w + (size_t)row * (t0.k / 2);
     const uint8_t* w1 = t1.w + (size_t)expert * t1.stride_w + (size_t)row * (t1.k / 2);
     const sycl::half* s0 = t0.awq_s + (size_t)expert * t0.stride_s + row;
@@ -288,9 +300,12 @@ inline void q4_gemv(sycl::queue& q, const QTensor& t, const bf16* x, bf16* y,
 }
 
 // lm_head: bf16 dot, then float logits.
-inline void lm_head(sycl::queue& q, const QTensor& t, const bf16* x, float* y) {
+inline void lm_head(sycl::queue& q, const QTensor& t, const bf16* x, float* y,
+                    const int* active = nullptr) {
+    if (decode_vec::launch(q, t, x, y, active)) return;
     if (t.format != WeightFormat::MLX) {
         decode_rows(q, t.n, [=](int row, int lane, sycl::sub_group sg) {
+            if (active && !*active) return;
             const float v = dot_tensor(t, row, 0, x, lane, sg);
             if (lane == 0) y[row] = float(bf16(v));
         });
@@ -302,6 +317,7 @@ inline void lm_head(sycl::queue& q, const QTensor& t, const bf16* x, float* y) {
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(groups * 256), sycl::range<1>(256)),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                if (active && !*active) return;
                 const int sgid = (int)it.get_local_id(0) / kSG;
                 const int row = (int)it.get_group(0) * kRowsPerGroup + sgid;
                 const auto sg = it.get_sub_group();
@@ -470,13 +486,15 @@ inline void kv_finish(sycl::queue& q, bf16* kbuf, const bf16* vbuf,
 inline void qkv_post(sycl::queue& q, bf16* qbuf, bf16* kbuf, const bf16* vbuf,
                      const bf16* q_norm, const bf16* k_norm, bf16* kcache,
                      bf16* vcache, int heads, int kv_heads, bool global, int pos,
-                     int cap, bool rope, float log2base, float eps) {
+                     int cap, bool rope, float log2base, float eps,
+                     const int* device_position = nullptr) {
     const int works = heads + 2 * kv_heads;
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)works * kSG),
                               sycl::range<1>(kSG)),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                const int live_pos = device_position ? *device_position : pos;
                 const int w = (int)it.get_group(0);
                 const auto sg = it.get_sub_group();
                 const int lane = (int)sg.get_local_id()[0];
@@ -496,7 +514,7 @@ inline void qkv_post(sycl::queue& q, bf16* qbuf, bf16* kbuf, const bf16* vbuf,
                                 float(bf16(float(p[pair]) * inv));
                             const float bb = float(q_norm[pair + 64]) *
                                 float(bf16(float(p[pair + 64]) * inv));
-                            const float th = float(pos) *
+                            const float th = float(live_pos) *
                                 sycl::exp2(-float(pair) / 64.f * log2base);
                             const float c = sycl::cos(th);
                             const float s = sycl::sin(th);
@@ -520,7 +538,7 @@ inline void qkv_post(sycl::queue& q, bf16* qbuf, bf16* kbuf, const bf16* vbuf,
                     }
                     ss = sycl::reduce_over_group(sg, ss, sycl::plus<>());
                     const float inv = sycl::rsqrt(ss / 128.f + eps);
-                    const int slot = global ? pos : (pos % cap);
+                    const int slot = global ? live_pos : (live_pos % cap);
                     bf16* dst = kcache + ((size_t)kh * cap + slot) * 128;
                     if (rope) {
                         for (int j = 0; j < 2; ++j) {
@@ -529,7 +547,7 @@ inline void qkv_post(sycl::queue& q, bf16* qbuf, bf16* kbuf, const bf16* vbuf,
                                 float(bf16(float(p[pair]) * inv));
                             const float bb = float(k_norm[pair + 64]) *
                                 float(bf16(float(p[pair + 64]) * inv));
-                            const float th = float(pos) *
+                            const float th = float(live_pos) *
                                 sycl::exp2(-float(pair) / 64.f * log2base);
                             const float c = sycl::cos(th);
                             const float s = sycl::sin(th);
@@ -545,7 +563,7 @@ inline void qkv_post(sycl::queue& q, bf16* qbuf, bf16* kbuf, const bf16* vbuf,
                     }
                 } else {
                     const int vh = w - heads - kv_heads;
-                    const int slot = global ? pos : (pos % cap);
+                    const int slot = global ? live_pos : (live_pos % cap);
                     const bf16* src = vbuf + (size_t)vh * 128;
                     bf16* dst = vcache + ((size_t)vh * cap + slot) * 128;
                     for (int d = 0; d < 4; ++d)
@@ -705,7 +723,12 @@ inline void attention_merge(sycl::queue& q, const float* partial,
 // ---------------------------------------------------------------- router
 
 inline void router_topk(sycl::queue& q, const bf16* w, const bf16* x, int experts,
-                        int H, int top_k, int* ids, float* weights) {
+                        int H, int top_k, int* ids, float* weights,
+                        float* score_scratch = nullptr) {
+    if(score_scratch && decode_router::enabled()) {
+        decode_router::launch(q,w,x,experts,H,top_k,ids,weights,score_scratch);
+        return;
+    }
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> scores(sycl::range<1>(256), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
@@ -906,7 +929,7 @@ inline void moe_combine(sycl::queue& q, bf16* h, const bf16* down,
             float acc = 0.f;
             for (int r = 0; r < top_k; ++r) {
                 const float term = float(bf16(float(down[(size_t)r * hidden + j]) *
-                                              weights[r]));
+                                              float(bf16(weights[r]))));
                 acc = r == 0 ? term : float(bf16(term + acc));
             }
             const float mlp =
