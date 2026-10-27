@@ -212,6 +212,23 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,"GPU prefix checkpoints require Flint GPU decode\n");
         return 1;
     }
+    const char* attention_ab_env=std::getenv("ARCAINE_FLINT_MBENCH_ATTN_AB");
+    const int attention_ab_mode=attention_ab_env?std::atoi(attention_ab_env):0;
+    const bool attention_ab=attention_ab_mode!=0;
+    if(attention_ab&&!reuse_prefix){
+        std::fprintf(stderr,"Flint attention A/B requires GPU prefix checkpoints\n");return 1;
+    }
+    const char* original_two_pass_env=std::getenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS");
+    const char* original_global_split_env=std::getenv("ARCAINE_FLINT_DECODE_GLOBAL_ATTN_SPLIT");
+    const bool had_two_pass_env=original_two_pass_env!=nullptr,had_global_split_env=original_global_split_env!=nullptr;
+    const std::string original_two_pass=original_two_pass_env?original_two_pass_env:"";
+    const std::string original_global_split=original_global_split_env?original_global_split_env:"";
+    if(attention_ab_mode==2&&((original_two_pass!="1"&&original_two_pass!="auto")||std::atoi(original_global_split.c_str())<256)){
+        std::fprintf(stderr,"Three-way A/B requires initial TWO_PASS=auto and GLOBAL_ATTN_SPLIT>=256 for GPU workspace\n");return 1;
+    }
+    const char* original_native_env=std::getenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP");
+    const bool had_native_env=original_native_env!=nullptr;
+    const std::string original_native=original_native_env?original_native_env:"";
     printf("model   : %s\n", info.description.c_str());
     printf("backend : SYCL + oneDNN | GPUs: %d | max_seq: %d",
            GpuEngine::count(), max_seq);
@@ -283,6 +300,14 @@ int main(int argc, char* argv[]) {
             flint_model->save_decode_prefix();
         }
 
+        for(int variant=0;variant<(attention_ab?(attention_ab_mode==2?3:2):1);++variant){
+            if(attention_ab){
+                setenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP",variant==1?"2":"0",1);
+                setenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS",variant==2?"auto":"0",1);
+                setenv("ARCAINE_FLINT_DECODE_GLOBAL_ATTN_SPLIT",variant==2?"256":"16",1);
+                flint_model->clear_decode_graphs();
+                snprintf(name,sizeof(name),"tg %d %s",tg,variant==2?"twopass":variant==1?"native":"vector");
+            }
         std::vector<double> times;
 
         for (int r = 0; r < warmup + reps; ++r) {
@@ -302,9 +327,18 @@ int main(int argc, char* argv[]) {
         }
 
         print_row(name, dstr, compute_stats(times, tg));
+        }
       }
     }
 
+    if(attention_ab){
+        if(had_two_pass_env)setenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS",original_two_pass.c_str(),1);
+        else unsetenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS");
+        if(had_global_split_env)setenv("ARCAINE_FLINT_DECODE_GLOBAL_ATTN_SPLIT",original_global_split.c_str(),1);
+        else unsetenv("ARCAINE_FLINT_DECODE_GLOBAL_ATTN_SPLIT");
+        if(had_native_env)setenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP",original_native.c_str(),1);
+        else unsetenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP");
+    }
     printf("\n");
     return 0;
 }

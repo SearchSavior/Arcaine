@@ -30,15 +30,16 @@ struct Buffers {
 int run(int argc, char** argv) {
     try {
         int M = 512, depth = 0, heads = 32, kvh = 4, cap = 513, iters = 10;
-        bool global = false, check = false, decode = false;
+        bool global = false, check = false, decode = false, profile=false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--global") { global = true; continue; }
             if (arg == "--decode") { decode = true; continue; }
+            if (arg == "--profile") { profile=true; continue; }
             if (arg == "--check") { check = true; continue; }
             if (arg == "--help") {
                 std::printf("flint-prefill-attention --m 512 --depth 0 --heads 32 "
-                            "--kv-heads 4 --cap 513 --iters 10 [--global] [--decode] [--check]\n"
+                            "--kv-heads 4 --cap 513 --iters 10 [--global] [--decode] [--check] [--profile]\n"
                             "ARCAINE_FLINT_GPU_PREFILL=1 selects GPU token scheduling; "
                             "unset/0 selects serial host scheduling. Inputs are normalized K/V.\n");
                 return 0;
@@ -55,15 +56,15 @@ int run(int argc, char** argv) {
             else if (arg == "--iters") iters = n;
             else throw std::invalid_argument("unknown option " + arg);
         }
-        if (M <= 0 || M > 4096 || depth < 0 || depth > 32768 ||
+        if (M <= 0 || M > 4096 || depth < 0 || depth > 262144 ||
             heads <= 0 || heads > 32 || kvh <= 0 || heads % kvh ||
-            cap <= 0 || cap > 36864 || iters <= 0 ||
+            cap <= 0 || cap > 262272 || iters <= 0 ||
             (global && depth + M > cap) || (decode && M != 1))
             throw std::invalid_argument("invalid attention geometry or global capacity");
         sycl::queue q(sycl::ext::oneapi::filter_selector("level_zero:gpu"),
             [](sycl::exception_list errors) {
                 for (const auto& e : errors) std::rethrow_exception(e);
-            }, sycl::property::queue::in_order{});
+            }, {sycl::property::queue::in_order{},sycl::property::queue::enable_profiling{}});
         Buffers b(q);
         const size_t nq = size_t(M) * heads * 128;
         const size_t nk = size_t(M) * kvh * 128, nc = size_t(kvh) * cap * 128;
@@ -102,9 +103,29 @@ int run(int argc, char** argv) {
             gpu_prefill::commit(q, k, v, kc, vc, 1, kvh, global, depth, cap);
             gpu_prefill::commit(q, k, v, legacy_kc, legacy_vc, 1, kvh, global, depth, cap);
         }
+        auto* decode_scores=flash_decode_twopass::enabled()?b.alloc<float>(size_t(heads)*cap):nullptr;
+        uint32_t* packed_v=nullptr;
+        const char* packed_env=std::getenv("ARCAINE_FLINT_KBENCH_PACKED_V");
+        if(packed_env&&!std::strcmp(packed_env,"1")){
+            if(!decode||!global||!decode_scores)throw std::invalid_argument("packed V requires global two-pass decode");
+            const int blocks=(cap+15)/16;
+            const size_t words=size_t(kvh)*blocks*8*16*8;
+            packed_v=b.alloc<uint32_t>(words);
+            q.parallel_for(sycl::range<1>(words),[=](sycl::id<1> id){
+                const size_t i=id[0];const int pair=int(i%8),lane=int(i/8%16),dblock=int(i/(8*16)%8);
+                const int block=int(i/(8*16*8)%blocks),kv=int(i/(size_t(blocks)*8*16*8));
+                const int pos0=block*16+pair*2,pos1=pos0+1,d=dblock*16+lane;
+                const uint16_t lo=pos0<cap?sycl::bit_cast<uint16_t>(vc[(size_t(kv)*cap+pos0)*128+d]):0;
+                const uint16_t high=pos1<cap?sycl::bit_cast<uint16_t>(vc[(size_t(kv)*cap+pos1)*128+d]):0;
+                packed_v[i]=uint32_t(lo)|(uint32_t(high)<<16);
+            });
+        }
+        sycl::event partial_event,merge_event;
+        if(profile&&(!decode||max_parts==1||!gpu_prefill::enabled()))
+            throw std::invalid_argument("--profile requires GPU split decode");
         auto gpu = [&] {
             gpu_prefill::attention(q, query, k, v, kc, vc, sink, output,
-                                   partial, stats, M, heads, kvh, global, depth, cap, device_position);
+                                   partial, stats, M, heads, kvh, global, depth, cap, device_position,decode_scores,packed_v,profile?&partial_event:nullptr,profile?&merge_event:nullptr);
             if (!decode) gpu_prefill::commit(q, k, v, kc, vc, M, kvh, global, depth, cap);
         };
         auto legacy = [&] {
@@ -161,13 +182,29 @@ int run(int argc, char** argv) {
         auto once = [&] { if (use_gpu) gpu(); else legacy(); };
         once(); q.wait_and_throw();
         const auto start = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) once();
+        std::vector<sycl::event> partial_events,merge_events;
+        for (int i = 0; i < iters; ++i) {
+            once();
+            if(profile){partial_events.push_back(partial_event);merge_events.push_back(merge_event);}
+        }
         q.wait_and_throw();
         const double ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count() / iters;
         std::printf("flint-attention decode=%d split=%d path=%s M=%d depth=%d global=%d "
                     "cap=%d heads=%d kv_heads=%d iters=%d ms=%.4f\n",
             decode, gpu_prefill::decode_min_parts(global), use_gpu ? "gpu" : "host", M, depth, global, cap, heads, kvh, iters, ms);
+        if(profile){
+            auto duration=[](const sycl::event& e){return double(
+                e.get_profiling_info<sycl::info::event_profiling::command_end>()-
+                e.get_profiling_info<sycl::info::event_profiling::command_start>())/1e6;};
+            double p=0,m=0,first=0;
+            for(size_t i=0;i<partial_events.size();++i)p+=double(
+                merge_events[i].get_profiling_info<sycl::info::event_profiling::command_start>()-
+                partial_events[i].get_profiling_info<sycl::info::event_profiling::command_start>())/1e6;
+            for(const auto& e:merge_events)m+=duration(e);
+            for(const auto& e:partial_events)first+=duration(e);
+            std::printf("attention GPU stages partial_ms=%.4f first_kernel_ms=%.4f merge_ms=%.4f total_ms=%.4f\n",p/iters,first/iters,m/iters,(p+m)/iters);
+        }
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "flint-prefill-attention: %s\n", e.what());

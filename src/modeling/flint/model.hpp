@@ -30,6 +30,7 @@ public:
     // Benchmark-only prefix reuse: KV and logits remain in device memory.
     void save_decode_prefix();
     void restore_decode_prefix();
+    void clear_decode_graphs();
     const ModelInfo& info() const override { return info_; }
 
 private:
@@ -44,8 +45,8 @@ private:
     std::shared_ptr<ResidentDecode> resident_decode_;
     bool trace_enabled_ = false;
     void enqueue_forward(const ForwardInput& in);
-    void enqueue_device_step(const int* token, int* position, const int* active);
-    void run_device_block(int steps, int mode);
+    void enqueue_device_step(const int* token, int* position, const int* active,bool use_score_scratch);
+    void run_device_block(int steps, int mode,int past_position);
     void step(int token);
     void ensure_batch(int m);
     void release_batch();
@@ -76,6 +77,7 @@ private:
     float* weights_dev_ = nullptr;
     float* attn_partial_ = nullptr;
     float* attn_stats_ = nullptr;
+    float* attn_scores_ = nullptr;
     std::vector<KVCache> kv_;
 
     // Batched-prefill scratch, allocated on first use.

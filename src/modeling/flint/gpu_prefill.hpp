@@ -26,6 +26,8 @@ inline int decode_min_parts(bool global=false) {
     if (!std::strcmp(p, "64")) return 64;
     if (!std::strcmp(p, "128")) return 128;
     if (!std::strcmp(p, "256")) return 256;
+    if (!std::strcmp(p, "512")) return 512;
+    if (!std::strcmp(p, "1024")) return 1024;
     return 1;
 }
 
@@ -63,15 +65,18 @@ inline void attention(sycl::queue& q, const bf16* queries,
                       const bf16* sink, bf16* output,
                       float* partial, float* stats, int M, int heads,
                       int kv_heads, bool global, int base, int cap,
-                      const int* device_position = nullptr) {
-    const int minimum_parts = device_position ? decode_min_parts(global) : 1;
+                      const int* device_position = nullptr,float* decode_scores=nullptr,const uint32_t* decode_packed_v=nullptr,
+                      sycl::event* partial_event=nullptr,sycl::event* merge_event=nullptr) {
+    const bool shallow_two_pass=device_position&&global&&!decode_scores&&flash_decode_twopass::adaptive();
+    const int minimum_parts = device_position ? decode_min_parts(global&&!shallow_two_pass) : 1;
     const int max_parts = std::max(minimum_parts,
         parts_for(device_position ? cap : (global ? base + M : std::min(base + M, cap))));
     const int repeat = heads / kv_heads;
+    sycl::event partial_submission;
     if(device_position && repeat==8 && max_parts>1 && flash_decode::tile()) {
-        flash_decode::launch(q,queries,kcache,vcache,sink,partial,stats,kv_heads,
-                             global,cap,minimum_parts,max_parts,device_position);
-    } else q.parallel_for(
+        partial_submission=flash_decode::launch(q,queries,kcache,vcache,sink,partial,stats,kv_heads,
+                             global,cap,minimum_parts,max_parts,device_position,decode_scores,decode_packed_v);
+    } else partial_submission=q.parallel_for(
         sycl::nd_range<1>(size_t(M) * heads * max_parts * 32, 32),
         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
             const size_t group = it.get_group(0);
@@ -130,10 +135,13 @@ inline void attention(sycl::queue& q, const bf16* queries,
                 }
             }
         });
+    if(partial_event)*partial_event=partial_submission;
     if (max_parts == 1) return;
     if(device_position && flash_decode::tile() &&
-       flash_decode::merge(q,partial,stats,output,heads,global,cap,minimum_parts,max_parts,device_position))return;
-    q.parallel_for(
+       flash_decode::merge(q,partial,stats,output,heads,global,cap,minimum_parts,max_parts,device_position,merge_event)){
+        return;
+    }
+    const auto merge_submission=q.parallel_for(
         sycl::nd_range<1>(size_t(M) * heads * 32, 32),
         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
             const size_t query = it.get_group(0);
@@ -160,6 +168,7 @@ inline void attention(sycl::queue& q, const bf16* queries,
             for (int d = 0; d < 4; ++d)
                 output[query * 128 + lane * 4 + d] = bf16(acc[d] * inv);
         });
+    if(merge_event)*merge_event=merge_submission;
 }
 
 }  // namespace flint::gpu_prefill

@@ -4,10 +4,11 @@
 namespace flint::flash_decode_xmx {
 // BF16 QK on XMX. P is split into BF16 high/residual components for P*V,
 // retaining near-FP32 probability precision with FP32 output accumulation.
-inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16* vc,
+template<bool PackedLoads=false,bool HoistQuery=false>
+inline sycl::event partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16* vc,
                      const bf16* sink,float* partial,float* stats,int kv_heads,
                      bool global,int cap,int minimum_parts,int max_parts,const int* position){
-    q.parallel_for(sycl::nd_range<1>(size_t(kv_heads)*max_parts*16,16),
+    return q.parallel_for(sycl::nd_range<1>(size_t(kv_heads)*max_parts*16,16),
         [=](sycl::nd_item<1> it)[[sycl::reqd_sub_group_size(16)]]{
             const int work=int(it.get_group(0)),part=work%max_parts,kv=work/max_parts;
             const int lane=int(it.get_local_id(0)),pos=*position;
@@ -24,6 +25,15 @@ inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16*
             for(int n=0;n<8;++n)accum[n]=flint_moe_v8f{};
 #pragma unroll
             for(int m=0;m<8;++m){hi[m]=part? -3.402823466e+38f:float(sink[kv*8+m]);z[m]=part?0.f:1.f;}
+            flint_moe_v8s query_fragments[8];
+            if constexpr(HoistQuery){
+#pragma unroll
+                for(int block=0;block<8;++block){
+#pragma unroll
+                    for(int m=0;m<8;++m)
+                        query_fragments[block][m]=sycl::bit_cast<short>(query[size_t(kv*8+m)*128+block*16+lane]);
+                }
+            }
             for(int first=0;first<nkeys;first+=16){
                 const int key=first+lane;
                 const bool valid=key<nkeys;
@@ -34,14 +44,23 @@ inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16*
                 for(int k0=0;k0<128;k0+=16){
                     flint_moe_v8s a;flint_moe_v8i b;
 #pragma unroll
-                    for(int m=0;m<8;++m)
-                        a[m]=sycl::bit_cast<short>(query[size_t(kv*8+m)*128+k0+lane]);
+                    for(int m=0;m<8;++m){
+                        if constexpr(HoistQuery)a[m]=query_fragments[k0/16][m];
+                        else a[m]=sycl::bit_cast<short>(query[size_t(kv*8+m)*128+k0+lane]);
+                    }
+                    if constexpr(PackedLoads){
+                        sycl::vec<uint32_t,8> packed{};
+                        if(valid)packed.load(0,reinterpret_cast<const uint32_t*>(kc+(size_t(kv)*cap+slot)*128+k0));
 #pragma unroll
-                    for(int j=0;j<8;++j){
-                        const size_t index=(size_t(kv)*cap+slot)*128+k0+2*j;
-                        const uint16_t lo=valid?sycl::bit_cast<uint16_t>(kc[index]):0;
-                        const uint16_t high=valid?sycl::bit_cast<uint16_t>(kc[index+1]):0;
-                        b[j]=int(uint32_t(lo)|(uint32_t(high)<<16));
+                        for(int j=0;j<8;++j)b[j]=int(packed[j]);
+                    }else{
+#pragma unroll
+                        for(int j=0;j<8;++j){
+                            const size_t index=(size_t(kv)*cap+slot)*128+k0+2*j;
+                            const uint16_t lo=valid?sycl::bit_cast<uint16_t>(kc[index]):0;
+                            const uint16_t high=valid?sycl::bit_cast<uint16_t>(kc[index+1]):0;
+                            b[j]=int(uint32_t(lo)|(uint32_t(high)<<16));
+                        }
                     }
                     score=__spirv_SubgroupMatrixMultiplyAccumulateINTEL(16,a,b,score,0x3000);
                 }

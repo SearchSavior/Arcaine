@@ -3,6 +3,8 @@
 #include <cstring>
 #include "weights.hpp"
 #include "flash_decode_xmx.hpp"
+#include "flash_decode_block.hpp"
+#include "flash_decode_twopass.hpp"
 
 namespace flint::flash_decode {
 inline int tile() {
@@ -21,11 +23,26 @@ inline float softmax_exp(float x){
     if constexpr(Native)return sycl::native::exp2(x*1.4426950408889634f);
     else return sycl::exp(x);
 }
-template<int Tile,bool Native=false,bool SingleExp=false>
-inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16* vc,
+template<bool Native>
+inline void update_fast(float score,const float* value,float& hi,float& z,float* acc){
+    if(score>hi){
+        const float weight=softmax_exp<Native>(hi-score);
+        z=sycl::fma(z,weight,1.f);
+#pragma unroll
+        for(int d=0;d<4;++d)acc[d]=sycl::fma(acc[d],weight,value[d]);
+        hi=score;
+    }else{
+        const float weight=softmax_exp<Native>(score-hi);
+        z+=weight;
+#pragma unroll
+        for(int d=0;d<4;++d)acc[d]=sycl::fma(weight,value[d],acc[d]);
+    }
+}
+template<int Tile,bool Native=false,bool SingleExp=false,bool Contiguous=false,bool FastUpdate=false>
+inline sycl::event partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16* vc,
                      const bf16* sink,float* partial,float* stats,int kv_heads,
                      bool global,int cap,int minimum_parts,int max_parts,const int* position) {
-    q.submit([&](sycl::handler& h){
+    return q.submit([&](sycl::handler& h){
         sycl::local_accessor<bf16> keys(size_t(Tile)*128,h),values(size_t(Tile)*128,h);
         h.parallel_for(sycl::nd_range<1>(size_t(kv_heads)*max_parts*256,256),
             [=](sycl::nd_item<1> it)[[sycl::reqd_sub_group_size(32)]]{
@@ -37,7 +54,11 @@ inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16*
                     count<=1024?1:count<=4096?16:count<=16384?32:64);
                 if(part>=parts)return;
                 const int start=pos+1-count;
-                const int nkeys=count>part?(count-1-part)/parts+1:0;
+                const int partition=(count+parts-1)/parts;
+                const int nkeys=Contiguous?sycl::max(0,sycl::min(partition,count-part*partition)):
+                    (count>part?(count-1-part)/parts+1:0);
+                const int first_absolute=start+(Contiguous?part*partition:part);
+                const int key_step=Contiguous?1:parts;
                 const auto sg=it.get_sub_group();
                 float qv[4],acc[4]={};
 #pragma unroll
@@ -49,13 +70,20 @@ inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16*
                 // cache. Keep the eight GQA heads in one work-group, avoiding
                 // SLM copies/barriers until the context benefits from tiling.
                 if(count<=1024){
-                    for(int absolute=start+part;absolute<=pos;absolute+=parts){
+                    const int last_absolute=Contiguous?first_absolute+nkeys-1:pos;
+                    for(int absolute=first_absolute;absolute<=last_absolute;absolute+=key_step){
                         const int slot=global?absolute:absolute%cap;
                         const size_t index=(size_t(kv)*cap+slot)*128+lane*4;
                         float score=0.f;
 #pragma unroll
                         for(int d=0;d<4;++d)score+=qv[d]*float(kc[index+d]);
                         score=sycl::reduce_over_group(sg,score,sycl::plus<>());
+                        if constexpr(FastUpdate){
+                            float value[4];
+#pragma unroll
+                            for(int d=0;d<4;++d)value[d]=float(vc[index+d]);
+                            update_fast<Native>(score,value,hi,z,acc);
+                        }else{
                         const float next=sycl::fmax(hi,score);
                         float old_weight,weight;
                         if constexpr(SingleExp){
@@ -70,12 +98,13 @@ inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16*
 #pragma unroll
                         for(int d=0;d<4;++d)acc[d]=acc[d]*old_weight+weight*float(vc[index+d]);
                         hi=next;
+                        }
                     }
                 }else for(int first=0;first<nkeys;first+=Tile){
                     for(int i=tid;i<Tile*128;i+=256){
                         const int key=first+i/128;
                         if(key<nkeys){
-                            const int absolute=start+part+key*parts;
+                            const int absolute=first_absolute+key*key_step;
                             const int slot=global?absolute:absolute%cap;
                             const size_t index=(size_t(kv)*cap+slot)*128+i%128;
                             keys[i]=kc[index];values[i]=vc[index];
@@ -88,6 +117,12 @@ inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16*
 #pragma unroll
                         for(int d=0;d<4;++d)score+=qv[d]*float(keys[j*128+lane*4+d]);
                         score=sycl::reduce_over_group(sg,score,sycl::plus<>());
+                        if constexpr(FastUpdate){
+                            float value[4];
+#pragma unroll
+                            for(int d=0;d<4;++d)value[d]=float(values[j*128+lane*4+d]);
+                            update_fast<Native>(score,value,hi,z,acc);
+                        }else{
                         const float next=sycl::fmax(hi,score);
                         float old_weight,weight;
                         if constexpr(SingleExp){
@@ -103,6 +138,7 @@ inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16*
                         for(int d=0;d<4;++d)
                             acc[d]=acc[d]*old_weight+weight*float(values[j*128+lane*4+d]);
                         hi=next;
+                        }
                     }
                     it.barrier(sycl::access::fence_space::local_space);
                 }
@@ -115,10 +151,10 @@ inline void partials(sycl::queue& q,const bf16* query,const bf16* kc,const bf16*
 }
 // Spread partition accumulation over eight subgroups, then combine in SLM.
 inline bool merge(sycl::queue& q,const float* partial,const float* stats,bf16* output,
-                  int heads,bool global,int cap,int minimum_parts,int max_parts,const int* position){
+                  int heads,bool global,int cap,int minimum_parts,int max_parts,const int* position,sycl::event* profile=nullptr){
     const char* flag=std::getenv("ARCAINE_FLINT_FLASH_DECODE_PARALLEL_MERGE");
     if(!flag||flag[0]!=49||flag[1]!=0)return false;
-    q.submit([&](sycl::handler& h){
+    const auto event=q.submit([&](sycl::handler& h){
         sycl::local_accessor<float> sums(8*128,h),normalizers(8,h);
         h.parallel_for(sycl::nd_range<1>(size_t(heads)*256,256),
             [=](sycl::nd_item<1> it)[[sycl::reqd_sub_group_size(32)]]{
@@ -157,34 +193,74 @@ inline bool merge(sycl::queue& q,const float* partial,const float* stats,bf16* o
                 }
             });
     });
+    if(profile)*profile=event;
     return true;
 }
-inline void launch(sycl::queue& q,const bf16* query,const bf16* kc,const bf16* vc,
+inline sycl::event launch(sycl::queue& q,const bf16* query,const bf16* kc,const bf16* vc,
                    const bf16* sink,float* partial,float* stats,int kv_heads,
-                   bool global,int cap,int minimum_parts,int max_parts,const int* position) {
+                   bool global,int cap,int minimum_parts,int max_parts,const int* position,float* scores=nullptr,const uint32_t* packed_v=nullptr) {
+    if(global&&scores&&flash_decode_twopass::enabled()){
+        if(packed_v)return flash_decode_twopass::partials<true>(q,query,kc,vc,sink,partial,stats,scores,packed_v,kv_heads,
+                                                               cap,minimum_parts,max_parts,position);
+        return flash_decode_twopass::partials(q,query,kc,vc,sink,partial,stats,scores,nullptr,kv_heads,
+                                              cap,minimum_parts,max_parts,position);
+    }
+    const char* native_single=std::getenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP");
+    if(global&&native_single&&!std::strcmp(native_single,"3"))
+        return partials<16,true,true,false,true>(q,query,kc,vc,sink,partial,stats,kv_heads,
+                                                global,cap,minimum_parts,max_parts,position);
+    if(global&&native_single&&!std::strcmp(native_single,"2"))
+        return partials<16,true,true>(q,query,kc,vc,sink,partial,stats,kv_heads,
+                                      global,cap,minimum_parts,max_parts,position);
+    const char* contiguous=std::getenv("ARCAINE_FLINT_FLASH_DECODE_CONTIGUOUS");
+    if(global&&contiguous&&!std::strcmp(contiguous,"1")){
+        return partials<16,false,true,true>(q,query,kc,vc,sink,partial,stats,kv_heads,
+                                     global,cap,minimum_parts,max_parts,position);
+    }
+    const char* block=std::getenv("ARCAINE_FLINT_FLASH_DECODE_BLOCK");
+    if(global&&block){
+        if(!std::strcmp(block,"1")){
+            return flash_decode_block::partials(q,query,kc,vc,sink,partial,stats,kv_heads,
+                                        global,cap,minimum_parts,max_parts,position);
+        }
+        if(!std::strcmp(block,"2")){
+            return flash_decode_block::partials<33>(q,query,kc,vc,sink,partial,stats,kv_heads,
+                                            global,cap,minimum_parts,max_parts,position);
+        }
+        if(!std::strcmp(block,"3")){
+            return flash_decode_block::partials<33,true>(q,query,kc,vc,sink,partial,stats,kv_heads,
+                                                 global,cap,minimum_parts,max_parts,position);
+        }
+    }
     const char* matrix=std::getenv("ARCAINE_FLINT_FLASH_DECODE_XMX");
+    if(global&&matrix&&!std::strcmp(matrix,"2"))
+        return flash_decode_xmx::partials<true>(q,query,kc,vc,sink,partial,stats,kv_heads,
+                                               global,cap,minimum_parts,max_parts,position);
+    if(global&&matrix&&!std::strcmp(matrix,"3"))
+        return flash_decode_xmx::partials<true,true>(q,query,kc,vc,sink,partial,stats,kv_heads,
+                                                    global,cap,minimum_parts,max_parts,position);
     if(matrix&&matrix[0]=='1'&&matrix[1]=='\0'){
-        flash_decode_xmx::partials(q,query,kc,vc,sink,partial,stats,kv_heads,
+        return flash_decode_xmx::partials(q,query,kc,vc,sink,partial,stats,kv_heads,
                                   global,cap,minimum_parts,max_parts,position);
-        return;
+
     }
     const int size=tile();
     const char* single=std::getenv("ARCAINE_FLINT_FLASH_DECODE_SINGLE_EXP");
     if(single&&single[0]==49&&single[1]==0){
-        if(size==16)partials<16,false,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
-        else if(size==32)partials<32,false,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
-        else partials<64,false,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
-        return;
+        if(size==16)return partials<16,false,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+        else if(size==32)return partials<32,false,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+        else return partials<64,false,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+
     }
     const char* fast=std::getenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP");
     if(fast&&fast[0]==49&&fast[1]==0){
-        if(size==16)partials<16,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
-        else if(size==32)partials<32,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
-        else partials<64,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
-        return;
+        if(size==16)return partials<16,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+        else if(size==32)return partials<32,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+        else return partials<64,true>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+
     }
-    if(size==16)partials<16>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
-    else if(size==32)partials<32>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
-    else partials<64>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+    if(size==16)return partials<16>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+    else if(size==32)return partials<32>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
+    else return partials<64>(q,query,kc,vc,sink,partial,stats,kv_heads,global,cap,minimum_parts,max_parts,position);
 }
 }

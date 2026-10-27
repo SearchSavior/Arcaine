@@ -32,7 +32,7 @@ struct FlintModel::ResidentDecode {
     float* prefix_logits = nullptr;
     bool prefix_initialized = false;
     int prefix_position = -1;
-    std::array<std::array<std::unique_ptr<Executable>, 9>, 5> graphs;
+    std::array<std::array<std::unique_ptr<Executable>, 9>, 10> graphs;
     explicit ResidentDecode(sycl::queue q, const std::vector<int>& ids) : queue(q) {
         try {
             state = allocate<flint::gpu_decode::State>(q, 1);
@@ -62,7 +62,7 @@ struct FlintModel::ResidentDecode {
 };
 bool FlintModel::device_generation_enabled() const { return flint::gpu_decode::enabled(); }
 
-void FlintModel::enqueue_device_step(const int* token, int* position, const int* active) {
+void FlintModel::enqueue_device_step(const int* token, int* position, const int* active,bool use_score_scratch) {
     using namespace flint;
     using namespace flint::kernels;
     const int H = cfg_.hidden_size, heads = cfg_.num_attention_heads;
@@ -86,7 +86,7 @@ void FlintModel::enqueue_device_step(const int* token, int* position, const int*
                  log2base_, cfg_.rms_norm_eps, position);
         gpu_prefill::attention(q_, qbuf_, nullptr, nullptr, c.k, c.v, L.sink, attn_,
                               attn_partial_, attn_stats_, 1, heads, kvh,
-                              L.global, 0, c.cap, position);
+                              L.global, 0, c.cap, position,use_score_scratch?attn_scores_:nullptr);
         q4_gemv(q_, L.o, attn_, h_, 0, h_);
         rmsnorm(q_, h_, L.post_norm, normed_, H, cfg_.rms_norm_eps);
         if (!L.moe) {
@@ -114,9 +114,10 @@ void FlintModel::enqueue_device_step(const int* token, int* position, const int*
     // only the unused next slot, overwritten before the next active query.
     q_.single_task([=] { if (*active) ++*position; });
 }
-void FlintModel::run_device_block(int steps, int mode) {
+void FlintModel::run_device_block(int steps, int mode,int past_position) {
     auto& r = *resident_decode_;
-    auto& executable = r.graphs[mode][steps];
+    const bool use_score_scratch=!flint::flash_decode_twopass::adaptive()||past_position>=16384;
+    auto& executable = r.graphs[mode+(use_score_scratch?5:0)][steps];
     if (!executable) {
         graph_api::command_graph<> graph(q_.get_context(), q_.get_device());
         graph.begin_recording(q_);
@@ -138,7 +139,7 @@ void FlintModel::run_device_block(int steps, int mode) {
                         output,r.eos,r.eos_count,r.sample_values,r.sample_ids,r.sample_group_count);
                 else
                     q_.single_task([=] { *output = state->token; ++state->emitted; });
-                enqueue_device_step(&state->token, &state->position, &state->active);
+                enqueue_device_step(&state->token, &state->position, &state->active,use_score_scratch);
             }
             graph.end_recording(q_); recording = false;
             executable = std::make_unique<Executable>(graph.finalize());
@@ -171,7 +172,7 @@ std::vector<int> FlintModel::generate_device(int max_tokens, float temperature,
         if(!r.sample_ids)r.sample_ids=allocate<int>(q_,64*20);
         if(r.sample_group_count!=groups){
             q_.wait_and_throw();
-            for(auto& g:r.graphs[4])g.reset();
+            for(int m:{4,9})for(auto& g:r.graphs[m])g.reset();
             r.sample_group_count=groups;
         }
     }
@@ -182,7 +183,7 @@ std::vector<int> FlintModel::generate_device(int max_tokens, float temperature,
     while (int(result.size()) < max_tokens && state.active && state.position < max_seq_) {
         const int n = std::min({flint::gpu_decode::kBlock, max_tokens-int(result.size()),
                                 max_seq_-state.position});
-        run_device_block(n, mode);
+        run_device_block(n, mode,state.position);
         std::array<int, flint::gpu_decode::kBlock> ids;
         q_.memcpy(ids.data(), r.output, n * sizeof(int));
         q_.memcpy(&state, r.state, sizeof(state)).wait_and_throw();
@@ -207,7 +208,7 @@ bool FlintModel::decode_repeated_device(int token, int steps, int past_len) {
     q_.memcpy(r.state, &state, sizeof(state)).wait_and_throw();
     for (int left = steps; left; ) {
         const int n = std::min(left, flint::gpu_decode::kBlock);
-        run_device_block(n, 2); left -= n;
+        run_device_block(n, 2,pos_+steps-left); left -= n;
     }
     q_.memcpy(&state, r.state, sizeof(state)).wait_and_throw();
     if (state.position != pos_ + steps) throw std::runtime_error("Flint GPU decode position mismatch");
@@ -252,4 +253,10 @@ void FlintModel::restore_decode_prefix() {
     q_.memcpy(logits_dev_,r.prefix_logits,size_t(cfg_.vocab_size)*sizeof(float));
     q_.wait_and_throw();
     pos_ = r.prefix_position;
+}
+
+void FlintModel::clear_decode_graphs(){
+    if(!resident_decode_)return;
+    q_.wait_and_throw();
+    for(auto& mode:resident_decode_->graphs)for(auto& graph:mode)graph.reset();
 }

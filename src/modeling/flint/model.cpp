@@ -101,6 +101,9 @@ FlintModel::FlintModel(const std::string& model_dir, int max_seq_len) {
     attn_stats_ = alloc<float>(q_, (size_t)cfg_.num_attention_heads * decode_parts * 2,
                                "attn_stats");
 
+    if(flint::flash_decode_twopass::enabled())
+        attn_scores_=alloc<float>(q_,size_t(cfg_.num_attention_heads)*max_seq_,"decode_scores");
+
     kv_.resize(w_.layers.size());
     for (size_t i = 0; i < w_.layers.size(); ++i) {
         const bool global = w_.layers[i].global;
@@ -154,6 +157,7 @@ FlintModel::~FlintModel() {
     if (weights_dev_) sycl::free(weights_dev_, q_);
     if (attn_partial_) sycl::free(attn_partial_, q_);
     if (attn_stats_) sycl::free(attn_stats_, q_);
+    if (attn_scores_) sycl::free(attn_scores_, q_);
     release_batch();
 }
 
