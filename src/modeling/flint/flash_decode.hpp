@@ -5,6 +5,7 @@
 #include "flash_decode_xmx.hpp"
 #include "flash_decode_block.hpp"
 #include "flash_decode_twopass.hpp"
+#include "flash_decode_variants.hpp"
 
 namespace flint::flash_decode {
 inline int tile() {
@@ -200,6 +201,11 @@ inline sycl::event launch(sycl::queue& q,const bf16* query,const bf16* kc,const 
                    const bf16* sink,float* partial,float* stats,int kv_heads,
                    bool global,int cap,int minimum_parts,int max_parts,const int* position,float* scores=nullptr,const uint32_t* packed_v=nullptr) {
     if(global&&scores&&flash_decode_twopass::enabled()){
+        if(const int v=flash_decode_twopass::variant()){
+            if(packed_v)throw std::invalid_argument("global attention variants require row-major V");
+            return flash_decode_variants::launch(v,q,query,kc,vc,sink,partial,stats,scores,
+                                                  kv_heads,cap,minimum_parts,max_parts,position);
+        }
         if(packed_v)return flash_decode_twopass::partials<true>(q,query,kc,vc,sink,partial,stats,scores,packed_v,kv_heads,
                                                                cap,minimum_parts,max_parts,position);
         return flash_decode_twopass::partials(q,query,kc,vc,sink,partial,stats,scores,nullptr,kv_heads,

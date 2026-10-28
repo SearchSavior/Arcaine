@@ -1,11 +1,20 @@
 #pragma once
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include "grouped_moe.hpp"
 
 namespace flint::flash_decode_twopass {
 inline bool adaptive(){const char* p=std::getenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS");return p&&!std::strcmp(p,"auto");}
-inline bool enabled(){const char* p=std::getenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS");return p&&(!std::strcmp(p,"1")||!std::strcmp(p,"auto"));}
+inline int variant(){
+    const char* p=std::getenv("ARCAINE_FLINT_GLOBAL_ATTN_VARIANT");
+    if(!p || !*p || !std::strcmp(p,"0"))return 0;
+    char* end=nullptr;
+    const long v=std::strtol(p,&end,10);
+    if(*end || v<1 || v>10)throw std::invalid_argument("ARCAINE_FLINT_GLOBAL_ATTN_VARIANT must be 0..10");
+    return int(v);
+}
+inline bool enabled(){const char* p=std::getenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS");return variant()||(p&&(!std::strcmp(p,"1")||!std::strcmp(p,"auto")));}
 // Scores are temporary FP32 GPU data. Separate QK and PV kernels keep each
 // XMX accumulator set small; PV groups each own 64 output channels.
 // Return the first event so profiling can span both kernels up to the merge.

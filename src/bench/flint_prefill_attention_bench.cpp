@@ -29,19 +29,22 @@ struct Buffers {
 
 int run(int argc, char** argv) {
     try {
-        int M = 512, depth = 0, heads = 32, kvh = 4, cap = 513, iters = 10;
-        bool global = false, check = false, decode = false, profile=false;
+        int M = 512, depth = 0, heads = 32, kvh = 4, cap = 513, iters = 10, rounds = 1, seed = 17, score_scale = 1;
+        bool global = false, check = false, decode = false, profile=false, variants=false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--global") { global = true; continue; }
             if (arg == "--decode") { decode = true; continue; }
             if (arg == "--profile") { profile=true; continue; }
+            if (arg == "--variants") { variants=true; continue; }
             if (arg == "--check") { check = true; continue; }
             if (arg == "--help") {
                 std::printf("flint-prefill-attention --m 512 --depth 0 --heads 32 "
-                            "--kv-heads 4 --cap 513 --iters 10 [--global] [--decode] [--check] [--profile]\n"
+                            "--kv-heads 4 --cap 513 --iters 10 [--global] [--decode] [--check] [--profile] [--variants] [--rounds 1] [--seed 17] [--score-scale 1]\n"
                             "ARCAINE_FLINT_GPU_PREFILL=1 selects GPU token scheduling; "
-                            "unset/0 selects serial host scheduling. Inputs are normalized K/V.\n");
+                            "unset/0 selects serial host scheduling. Inputs are normalized K/V.\n"
+                            "ARCAINE_FLINT_GLOBAL_ATTN_VARIANT=1..10 selects an experimental global decode pipeline.\n"
+                            "--variants compares control and all ten variants on identical GPU inputs.\n");
                 return 0;
             }
             if (++i >= argc) throw std::invalid_argument("missing value");
@@ -54,13 +57,20 @@ int run(int argc, char** argv) {
             else if (arg == "--kv-heads") kvh = n;
             else if (arg == "--cap") cap = n;
             else if (arg == "--iters") iters = n;
+            else if (arg == "--rounds") rounds = n;
+            else if (arg == "--seed") seed = n;
+            else if (arg == "--score-scale") score_scale = n;
             else throw std::invalid_argument("unknown option " + arg);
         }
         if (M <= 0 || M > 4096 || depth < 0 || depth > 262144 ||
             heads <= 0 || heads > 32 || kvh <= 0 || heads % kvh ||
-            cap <= 0 || cap > 262272 || iters <= 0 ||
+            cap <= 0 || cap > 262272 || iters <= 0 || rounds <= 0 || rounds > 20 || (!variants && rounds != 1) || seed <= 0 || score_scale <= 0 || score_scale > 16 ||
             (global && depth + M > cap) || (decode && M != 1))
             throw std::invalid_argument("invalid attention geometry or global capacity");
+        const char* two_pass_env = std::getenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS");
+        if (variants && (!decode || !global || !gpu_prefill::enabled() || heads != kvh * 8 ||
+                         !two_pass_env || std::strcmp(two_pass_env, "1") || flash_decode::tile() == 0))
+            throw std::invalid_argument("--variants requires global GPU decode, GQA8, flash decode, and TWO_PASS=1");
         sycl::queue q(sycl::ext::oneapi::filter_selector("level_zero:gpu"),
             [](sycl::exception_list errors) {
                 for (const auto& e : errors) std::rethrow_exception(e);
@@ -79,7 +89,7 @@ int run(int argc, char** argv) {
         int* device_position = decode ? b.alloc<int>(1) : nullptr;
         auto* partial = b.alloc<float>(size_t(M) * heads * max_parts * 128);
         auto* stats = b.alloc<float>(size_t(M) * heads * max_parts * 2);
-        uint32_t state = 17;
+        uint32_t state = uint32_t(seed);
         auto signal = [&](size_t n, float amplitude) {
             std::vector<bf16> a(n);
             for (auto& value : a) {
@@ -88,8 +98,8 @@ int run(int argc, char** argv) {
             }
             return a;
         };
-        const auto hq = signal(nq, 1), hk = signal(nk, 1), hv = signal(nk, 2);
-        const auto hkc = signal(nc, 1), hvc = signal(nc, 2), hsink = signal(heads, 2);
+        const auto hq = signal(nq, float(score_scale)), hk = signal(nk, float(score_scale)), hv = signal(nk, 2);
+        const auto hkc = signal(nc, float(score_scale)), hvc = signal(nc, 2), hsink = signal(heads, 2);
         q.memcpy(query, hq.data(), nq * sizeof(bf16));
         q.memcpy(k, hk.data(), nk * sizeof(bf16));
         q.memcpy(v, hv.data(), nk * sizeof(bf16));
@@ -148,8 +158,17 @@ int run(int argc, char** argv) {
                 }
             }
         };
-        if (check) {
-            legacy();
+        const bool use_gpu = gpu_prefill::enabled();
+        for (int round = 0; round < rounds; ++round) {
+        for (int slot = 0; slot < (variants ? 11 : 1); ++slot) {
+        const int variant_index = variants ? (slot + round * 4) % 11 : 0;
+        if (variants) {
+            const std::string value = std::to_string(variant_index);
+            setenv("ARCAINE_FLINT_GLOBAL_ATTN_VARIANT", value.c_str(), 1);
+            std::printf("global-attention round=%d variant=%d\n", round, variant_index);
+        }
+        if (check && (!variants || round == 0)) {
+            if (!variants || slot == 0) legacy();
             q.memset(output, 0xff, nq * sizeof(bf16));
             gpu(); q.wait_and_throw();
             std::vector<bf16> actual(nq), expected(nq), ak(nc), av(nc), ek(nc), ev(nc);
@@ -178,7 +197,6 @@ int run(int argc, char** argv) {
         // Inputs may overwrite historical ring slots between timing repetitions;
         // arithmetic and launch counts stay identical. Correctness is checked
         // above from identical initial caches, outside timing.
-        const bool use_gpu = gpu_prefill::enabled();
         auto once = [&] { if (use_gpu) gpu(); else legacy(); };
         once(); q.wait_and_throw();
         const auto start = std::chrono::steady_clock::now();
@@ -204,6 +222,8 @@ int run(int argc, char** argv) {
             for(const auto& e:merge_events)m+=duration(e);
             for(const auto& e:partial_events)first+=duration(e);
             std::printf("attention GPU stages partial_ms=%.4f first_kernel_ms=%.4f merge_ms=%.4f total_ms=%.4f\n",p/iters,first/iters,m/iters,(p+m)/iters);
+        }
+        }
         }
         return 0;
     } catch (const std::exception& e) {
