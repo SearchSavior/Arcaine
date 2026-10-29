@@ -2,8 +2,8 @@
 
 #include <sycl/sycl.hpp>
 
-#include "config.hpp"
-#include "weights.hpp"
+#include "../config.hpp"
+#include "../weights.hpp"
 #include "bf16_decode.hpp"
 #include "awq_decode.hpp"
 #include "decode_router.hpp"

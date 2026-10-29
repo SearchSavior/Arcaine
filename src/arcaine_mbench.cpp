@@ -33,6 +33,8 @@
 #include "common/gpu/engine.hpp"
 #include "bench/diffusion_model_bench.hpp"
 
+int run_flint_generation(int argc, char** argv);
+
 // Reads config.json::model_type without constructing the model.
 static std::string read_model_type(const std::string& model_dir) {
     std::ifstream f(model_dir + "/config.json");
@@ -115,6 +117,8 @@ static void print_row(const char* test, const char* depth,
 
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
+    if (argc > 1 && !std::strcmp(argv[1], "flint-generate"))
+        return run_flint_generation(argc - 1, argv + 1);
     static const char* USAGE =
         "Usage: bench --model <model_dir> [options]\n"
         "  -h, --help    show this help text\n"
@@ -126,6 +130,7 @@ int main(int argc, char* argv[]) {
         "  --max-seq N   KvCache capacity       (default: auto)\n"
         "  --device N    run with one visible Level Zero GPU\n"
         "\n"
+        "Flint generation: arcaine_mbench flint-generate --help\n"
         "DiffusionGemma models delegate to the block-diffusion driver, which\n"
         "accepts -ds/--kernels/--layers/--experts/--seed/--md/--print-result.\n";
 

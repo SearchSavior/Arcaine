@@ -2,8 +2,8 @@
 
 #include <sycl/sycl.hpp>
 
-#include "config.hpp"
-#include "weights.hpp"
+#include "../config.hpp"
+#include "../weights.hpp"
 
 // Batched prefill kernels (M tokens). Two projection paths:
 //   bf16 : activations stay bf16, dot accumulates fp32.

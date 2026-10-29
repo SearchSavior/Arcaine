@@ -6,7 +6,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 
-#include "weights.hpp"
+#include "../weights.hpp"
 
 // XMX (matrix engine) INT8 prefill GEMM.
 //

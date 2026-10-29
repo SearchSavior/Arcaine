@@ -1,6 +1,6 @@
 #include "../common/bench/registry.hpp"
-#include "../modeling/flint/kernels.hpp"
-#include "../modeling/flint/awq_decode.hpp"
+#include "../modeling/flint/kernels/kernels.hpp"
+#include "../modeling/flint/kernels/awq_decode.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstdio>

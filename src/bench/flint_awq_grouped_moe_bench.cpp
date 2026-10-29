@@ -1,9 +1,9 @@
 // Flint's routed W4A16 prefill branch: device routes -> gate/up+SiLU -> down.
 // Includes host routing copies in the legacy timing; excludes setup/readback.
 #include "../common/bench/registry.hpp"
-#include "../modeling/flint/awq_xmx.hpp"
-#include "../modeling/flint/grouped_moe.hpp"
-#include "../modeling/flint/prefill.hpp"
+#include "../modeling/flint/kernels/awq_xmx.hpp"
+#include "../modeling/flint/kernels/grouped_moe.hpp"
+#include "../modeling/flint/kernels/prefill.hpp"
 
 #include <chrono>
 #include <cmath>

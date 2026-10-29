@@ -7,7 +7,7 @@ copies token IDs and a small state record to the host once per block. It does
 not download logits or upload a token on every decode step. The first block
 includes graph capture and compilation; use repeated requests for warm timing.
 
-This path is integrated with `flint_main` and `arcaine_mbench`. The server does
+This path is integrated with `arcaine_mbench`. The server does
 not yet use the resident generation API. Stochastic sampling supports top-k
 1..64; the parallel and distributed kernels support k<=20. Greedy is supported.
 
@@ -89,7 +89,7 @@ export ARCAINE_FLINT_DECODE_ROUTER=1 ARCAINE_FLINT_DECODE_ATTN_SPLIT=16
 export ARCAINE_FLINT_FLASH_DECODE=16
 export ARCAINE_FLINT_DECODE_PARALLEL_SAMPLE=1 ARCAINE_FLINT_DECODE_SAMPLE_GROUPS=64
 export ARCAINE_FLINT_AWQ_XMX=1 IGC_allowDecompose2DBlockFuncs=0
-cmake --build build --target arcaine_kbench arcaine_mbench flint_main -j 4
+cmake --build build --target arcaine_kbench arcaine_mbench -j 4
 
 # Exact GPU sampler comparison and isolated timing.
 ./build/arcaine_kbench flint-decode-sampling --vocab 150144 --top-k 20 --iters 200 --check
@@ -101,7 +101,7 @@ ARCAINE_FLINT_MBENCH_GPU_CHECKPOINT=1 ./build/arcaine_mbench \
   -n 32 -w 1 -r 3 --max-seq 32128
 
 # Real sampled generation; serial/distributed GPU token and RNG parity.
-ARCAINE_FLINT_FLASH_DECODE_SINGLE_EXP=1 ./build/flint_main \
-  /workspace/models/mattbucci_Flint-AWQ --no-tests --ctx 4224 \
+ARCAINE_FLINT_FLASH_DECODE_SINGLE_EXP=1 ./build/arcaine_mbench flint-generate \
+  /workspace/models/mattbucci_Flint-AWQ --ctx 4224 \
   --max-new 32 --runs 3 --sample-ab
 ```

@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdlib>
-#include "weights.hpp"
+#include "../weights.hpp"
 
 namespace flint::decode_router {
 inline bool enabled(){

@@ -1,5 +1,5 @@
 #pragma once
-#include "weights.hpp"
+#include "../weights.hpp"
 
 namespace flint::flash_decode_block {
 // Eight GQA heads share one contiguous KV tile. Each subgroup computes 32

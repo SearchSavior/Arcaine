@@ -1,6 +1,6 @@
 #pragma once
 
-#include "weights.hpp"
+#include "../weights.hpp"
 
 namespace flint::awq_xmx {
 

@@ -70,7 +70,7 @@ Build and run inside the development container (current name:
 ```bash
 docker exec arcaine-dev-run-0b4ca842ff71 bash -lc '
   cd /workspace &&
-  cmake --build build --target arcaine_kbench flint_main -j 4 &&
+  cmake --build build --target arcaine_kbench arcaine_mbench -j 4 &&
   ARCAINE_FLINT_AWQ_GROUPED_MOE=1 ARCAINE_FLINT_AWQ_XMX=1 \
   IGC_allowDecompose2DBlockFuncs=0 \
   ./build/arcaine_kbench flint-awq-grouped-moe \
@@ -116,7 +116,7 @@ All 6,291,456 routed output elements matched CuTe/XMX exactly for balanced,
 skewed, and concentrated routing. Comparison against the vector baseline
 also passed tolerance (maximum absolute difference 0.015625).
 Smaller checks covered M=1/17/65, ragged 8-row tiles, empty experts, and skew.
-The existing `flint_main --tests-only` suite passed with AWQ XMX enabled,
+The Flint kernel correctness suite (now `arcaine_kbench flint-check`) passed with AWQ XMX enabled,
 including its independent CPU references for AWQ math.
 
 A 17-token local-checkpoint integration check compared all 100,352 residual

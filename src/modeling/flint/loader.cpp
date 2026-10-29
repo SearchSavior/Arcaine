@@ -1,5 +1,5 @@
 #include "weights.hpp"
-#include "awq_decode.hpp"
+#include "kernels/awq_decode.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -23,7 +23,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "prefill_xmx.hpp"
+#include "kernels/prefill_xmx.hpp"
 
 namespace flint {
 namespace {

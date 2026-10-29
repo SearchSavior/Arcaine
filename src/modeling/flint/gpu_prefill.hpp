@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include "kernels.hpp"
-#include "flash_decode.hpp"
+#include "kernels/kernels.hpp"
+#include "kernels/flash_decode.hpp"
 
 // All query tokens are scheduled by the GPU. Current-chunk K/V remain outside
 // the ring until attention completes, preserving old slots needed by early queries.

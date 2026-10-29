@@ -92,9 +92,9 @@ set(FLINT_SRCS
     src/modeling/flint/model.cpp
     src/modeling/flint/gpu_decode.cpp
     src/modeling/flint/register.cpp
-    src/modeling/flint/awq_xmx.cpp
+    src/modeling/flint/kernels/awq_xmx.cpp
 )
-set_source_files_properties(src/modeling/flint/awq_xmx.cpp PROPERTIES
+set_source_files_properties(src/modeling/flint/kernels/awq_xmx.cpp PROPERTIES
     COMPILE_DEFINITIONS "SYCL_INTEL_TARGET;CUTLASS_ENABLE_SYCL"
     INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/sycl-tla/include;${CMAKE_SOURCE_DIR}/third_party/sycl-tla/tools/util/include")
 
@@ -168,6 +168,7 @@ target_link_libraries(test_chat_template_kwargs  PRIVATE DNNL::dnnl)
 set(MBENCH_SRCS
     src/arcaine_mbench.cpp
     src/bench/diffusion_model_bench.hpp
+    src/bench/flint_generation.cpp
     ${COMMON_SRCS}
     ${ARCH_SRCS}
     ${DIFFUSION_SRCS})
@@ -195,6 +196,7 @@ target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_I
 #   - "gemma4_unified"    -> Gemma4Model (AR, multimodal, BF16)
 #   - "qwen3_5_moe_text"  -> QwenModel (AR, NVFP4 MoE)
 #   - "qwen3_5"           -> Qwen35Model (AR, FP8/NVFP4, multimodal)
+#   - "flint"             -> FlintModel (AR, INT4)
 # Links COMMON_SRCS + ARCH_SRCS (all arches, so the registry can construct any)
 # plus DIFFUSION_SRCS (the block-diffusion path) and register_builtins.cpp
 # (wires the AR arches into ModelRegistry). Needs soxr + onnxruntime for the
@@ -219,28 +221,6 @@ set_target_properties(arcaine_server PROPERTIES
     INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
-# Flint INT4 standalone driver + kernel self-tests. Deliberately does NOT link
-# DNNL: this target is the mechanical proof that the Flint path is oneDNN-free.
-add_executable(flint_main
-    src/modeling/flint/main.cpp
-    ${FLINT_SRCS}
-    src/common/preprocess/tokenizer.cpp
-    src/common/preprocess/chat_template.cpp
-    src/common/registry.cpp
-    ${UNICODE_SRCS})
-target_compile_options(flint_main PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(flint_main   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(flint_main PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
-
-# Flint kernel benchmark (per-kernel timings; no DNNL, no end-to-end model).
-add_executable(flint_kbench
-    src/modeling/flint/kbench.cpp
-    src/modeling/flint/awq_xmx.cpp)
-target_compile_options(flint_kbench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(flint_kbench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(flint_kbench   PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
-
-# ---------------------------------------------------------------------------
 # Unified kernel benchmark binary. Each kernel bench registers itself via
 # REGISTER_BENCH() in its TU; a new kernel bench is added by dropping a new
 # .cpp into src/bench/ and appending it to KBENCH_SRCS — no main dispatch
@@ -258,13 +238,15 @@ set(KBENCH_SRCS
     src/bench/diffusion_int4_fusion_bench.cpp
     src/bench/diffusion_int4_w4a8_bench.cpp
     src/bench/diffusion_int4_grouped_s8s4_bench.cpp
+    src/bench/flint_kernel_bench.cpp
+    src/bench/flint_kernel_check.cpp
     src/bench/flint_awq_grouped_moe_bench.cpp
     src/bench/flint_prefill_attention_bench.cpp
     src/bench/flint_decode_head_bench.cpp
     src/bench/flint_decode_moe_bench.cpp
     src/bench/flint_decode_router_bench.cpp
     src/bench/flint_decode_sampling_bench.cpp
-    src/modeling/flint/awq_xmx.cpp
+    src/modeling/flint/kernels/awq_xmx.cpp
     # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
     src/common/gpu/sycl_graph_session.cpp)

@@ -1,6 +1,6 @@
 #include "../common/bench/registry.hpp"
-#include "../modeling/flint/kernels.hpp"
-#include "../modeling/flint/decode_router.hpp"
+#include "../modeling/flint/kernels/kernels.hpp"
+#include "../modeling/flint/kernels/decode_router.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstdio>

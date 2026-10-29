@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdlib>
 #include <cstring>
-#include "weights.hpp"
+#include "../weights.hpp"
 
 namespace flint::decode_vec {
 inline int width() {

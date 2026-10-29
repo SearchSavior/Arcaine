@@ -422,7 +422,7 @@ Implemented in `src/modeling/flint/` (all new code, no Arcaine GPU paths reused)
 | `sampling.hpp` | new temperature / top-k / top-p / greedy sampler |
 | `register.cpp` | `model_type: flint` registration for `arcaine_server` / `arcaine_mbench` |
 
-Build targets: `flint_main` (self-tests + generation; links **no** DNNL — verified with `ldd`), and Flint is part of `ARCH_SRCS` so `arcaine_server` and `arcaine_mbench` dispatch to it.
+Current entry points: `arcaine_kbench flint-check` for kernel checks, `arcaine_kbench flint-kernels --help` for the original kernel cases, and `arcaine_mbench flint-generate --help` for sampled generation. Flint is part of `ARCH_SRCS` so `arcaine_server` and `arcaine_mbench` dispatch to it. The unified binaries link oneDNN for other architectures; this no longer provides a standalone link-time check of Flint’s oneDNN independence.
 
 Environment variables:
 
@@ -436,7 +436,7 @@ Environment variables:
 
 Verification performed:
 
-- 8 kernel self-tests pass (`flint_main --tests-only`): q4 GEMV, RMSNorm, batched RMSNorm, embed+rmsnorm, decode attention with sinks, router top-6, bf16 prefill GEMM, int8 prefill GEMM.
+- 8 kernel self-tests pass (now `arcaine_kbench flint-check`): q4 GEMV, RMSNorm, batched RMSNorm, embed+rmsnorm, decode attention with sinks, router top-6, bf16 prefill GEMM, int8 prefill GEMM.
 - Loader validates tensor dtypes/shapes and verifies device readback of a norm and the embedding scales.
 - Full 49-layer token-wise and batched prefill produce identical greedy tokens on the smoke prompt for both bf16 and int8 paths.
 - End-to-end through `arcaine_server`: `{"role":"user","content":"The capital of France is"}` → `The capital of France is **Paris**.` with `prompt_tokens=7`.

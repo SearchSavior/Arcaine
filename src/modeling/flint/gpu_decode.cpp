@@ -1,7 +1,7 @@
 #include "model.hpp"
 #include "gpu_decode.hpp"
 #include "gpu_prefill.hpp"
-#include "kernels.hpp"
+#include "kernels/kernels.hpp"
 #include <array>
 #include <cmath>
 #include <cstdio>

@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdlib>
 #include <cstring>
-#include "weights.hpp"
+#include "../weights.hpp"
 #include "flash_decode_xmx.hpp"
 #include "flash_decode_block.hpp"
 #include "flash_decode_twopass.hpp"

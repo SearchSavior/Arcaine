@@ -12,11 +12,11 @@
 
 #include "../../common/preprocess/chat_template.hpp"
 #include "../../common/preprocess/tokenizer.hpp"
-#include "kernels.hpp"
-#include "prefill.hpp"
-#include "prefill_xmx.hpp"
-#include "awq_xmx.hpp"
-#include "grouped_moe.hpp"
+#include "kernels/kernels.hpp"
+#include "kernels/prefill.hpp"
+#include "kernels/prefill_xmx.hpp"
+#include "kernels/awq_xmx.hpp"
+#include "kernels/grouped_moe.hpp"
 #include "gpu_prefill.hpp"
 
 namespace {

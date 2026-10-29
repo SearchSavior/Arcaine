@@ -5,7 +5,7 @@
 #include <limits>
 #include <stdexcept>
 
-#include "weights.hpp"
+#include "../weights.hpp"
 
 // bf16 DPAS: eight activation rows x sixteen output channels x K=16.
 // Keep W4 weights in the loader's row-major layout; no duplicate weight bank.

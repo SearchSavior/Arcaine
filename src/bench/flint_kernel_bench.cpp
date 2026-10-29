@@ -1,3 +1,5 @@
+#include "common/bench/registry.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -17,11 +19,11 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 
-#include "awq_xmx.hpp"
-#include "kernels.hpp"
-#include "prefill.hpp"
-#include "prefill_xmx.hpp"
-#include "weights.hpp"
+#include "modeling/flint/kernels/awq_xmx.hpp"
+#include "modeling/flint/kernels/kernels.hpp"
+#include "modeling/flint/kernels/prefill.hpp"
+#include "modeling/flint/kernels/prefill_xmx.hpp"
+#include "modeling/flint/weights.hpp"
 
 using namespace flint;
 
@@ -281,7 +283,8 @@ int bench_awq(const std::string& which, int M, int N, int K, int iters, bool che
 
 }  // namespace
 
-int main(int argc, char** argv) {
+namespace {
+int run_flint_kernels(int argc, char** argv) {
     std::string which = "gemv";
     int iters = 200;
     int inner = 256;
@@ -291,6 +294,11 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
+        if (a == "--help" || a == "-h") {
+            std::printf("Usage: %s --case CASE [--iters N] [--n N] [--k N] [--m N] [--depth N] [--parts N] [--inner N] [--groups N] [--check]\n"
+                        "Cases: gemv, lmhead, qkv, attn-serial, attn-split, moe, moe-fused, dense, xmx-int8, xmx-bf16, alu-fp32, rmsnorm, router, prefill-bf16, prefill-int8, prefill-int8-xmx, prefill-xmx-check, awq-gemv, prefill-awq, prefill-awq-xmx\n", argv[0]);
+            return 0;
+        }
         if (a == "--case") {
             which = next();
             if (which == "prefill-xmx-check") {
@@ -893,3 +901,7 @@ int main(int argc, char** argv) {
     std::printf("BENCH_END %s\n", which.c_str());
     return 0;
 }
+
+}  // namespace
+
+REGISTER_BENCH("flint-kernels", "Flint projection, attention, MoE and prefill kernel benchmarks", run_flint_kernels)

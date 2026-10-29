@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdlib>
-#include "weights.hpp"
+#include "../weights.hpp"
 namespace flint::awq_decode {
 inline bool enabled() {
     const char* p=std::getenv("ARCAINE_FLINT_DECODE_AWQ_VEC");
