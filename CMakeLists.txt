@@ -93,6 +93,7 @@ set(FLINT_SRCS
     src/modeling/flint/gpu_decode.cpp
     src/modeling/flint/register.cpp
     src/modeling/flint/kernels/awq_xmx.cpp
+    src/modeling/flint/kernels/awq_joint_matrix.cpp
 )
 set_source_files_properties(src/modeling/flint/kernels/awq_xmx.cpp PROPERTIES
     COMPILE_DEFINITIONS "SYCL_INTEL_TARGET;CUTLASS_ENABLE_SYCL"
@@ -247,6 +248,7 @@ set(KBENCH_SRCS
     src/bench/flint_decode_router_bench.cpp
     src/bench/flint_decode_sampling_bench.cpp
     src/modeling/flint/kernels/awq_xmx.cpp
+    src/modeling/flint/kernels/awq_joint_matrix.cpp
     # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
     src/common/gpu/sycl_graph_session.cpp)

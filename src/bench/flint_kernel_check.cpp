@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +12,7 @@
 
 #include "common/bench/registry.hpp"
 #include "modeling/flint/kernels/awq_xmx.hpp"
+#include "modeling/flint/kernels/awq_joint_matrix.hpp"
 #include "modeling/flint/config.hpp"
 #include "modeling/flint/kernels/kernels.hpp"
 #include "modeling/flint/model.hpp"
@@ -118,7 +120,7 @@ struct AwqTestTensor {
     std::vector<uint8_t> codes, zeros;
     std::vector<sycl::half> scales;
 
-    AwqTestTensor(TestAllocations& buffers, int N, int K, int E, int seed)
+    AwqTestTensor(TestAllocations& buffers, int N, int K, int E, int seed, int padding = 0)
         : codes((size_t)E * N * K), zeros((size_t)E * (K / 64) * N),
           scales(zeros.size()) {
         const float palette[] = {0x1.008p-7f, 0x1.018p-6f, 0x1.038p-7f, 0x1.058p-5f,
@@ -142,9 +144,27 @@ struct AwqTestTensor {
         t.n = N; t.k = K; t.experts = E;
         t.stride_w = (size_t)N * K / 2;
         t.stride_s = t.stride_b = (size_t)N * (K / 64);
-        t.w = buffers.put(packed);
-        t.awq_s = buffers.put(scales);
-        t.awq_z = buffers.put(zeros);
+        if (padding) {
+            const size_t wb = t.stride_w, params = t.stride_s;
+            t.stride_w += padding;
+            t.stride_s += padding + 3;
+            t.stride_b += padding + 7;
+            std::vector<uint8_t> pw(size_t(E) * t.stride_w, 0xcd);
+            std::vector<sycl::half> ps(size_t(E) * t.stride_s, sycl::half(-17.f));
+            std::vector<uint8_t> pz(size_t(E) * t.stride_b, 0xcd);
+            for (int e = 0; e < E; ++e) {
+                std::copy_n(packed.data() + size_t(e) * wb, wb, pw.data() + size_t(e) * t.stride_w);
+                std::copy_n(scales.data() + size_t(e) * params, params, ps.data() + size_t(e) * t.stride_s);
+                std::copy_n(zeros.data() + size_t(e) * params, params, pz.data() + size_t(e) * t.stride_b);
+            }
+            t.w = buffers.put(pw);
+            t.awq_s = buffers.put(ps);
+            t.awq_z = buffers.put(pz);
+        } else {
+            t.w = buffers.put(packed);
+            t.awq_s = buffers.put(scales);
+            t.awq_z = buffers.put(zeros);
+        }
     }
 
     flint::bf16 weight(int expert, int row, int k) const {
@@ -738,13 +758,19 @@ void test_bf16_io(sycl::queue& q) {
           "BF16 lm_head FP32 sum/BF16 logits");
 }
 
-void test_awq_gemm_shape(sycl::queue& q, int N, int K, bool xmx) {
+void test_awq_gemm_shape(sycl::queue& q, int N, int K, bool xmx, bool padded = false, bool misaligned = false) {
     using namespace flint;
     TestAllocations buffers(q);
-    AwqTestTensor w(buffers, N, K, 3, 12);
+    AwqTestTensor w(buffers, N, K, 3, 12, padded ? 23 : 0);
     const int source_rows = 79, guard = 32;
     const auto A = test_signal((size_t)source_rows * K, 907);
-    bf16* ad = buffers.put(A);
+    bf16* ad = nullptr;
+    if (misaligned) {
+        ad = buffers.alloc<bf16>(A.size() + 1) + 1;
+        upload(q, ad, A);
+    } else {
+        ad = buffers.put(A);
+    }
     struct Case {
         int M, expert, stride, repeats;
         bool gather, scatter;
@@ -760,6 +786,8 @@ void test_awq_gemm_shape(sycl::queue& q, int N, int K, bool xmx) {
         {5, 1, N + 17, 3, true, true, 2},
         {33, 2, N + 9, 2, true, true, 2},
         {3, 0, N + 7, 3, true, true, 2},
+        {129, 2, N + 7, 2, true, true, 2},
+        {64, 1, N + 9, 2, false, true, 2},
     };
     int case_id = 0;
     for (const auto& c : cases) {
@@ -808,16 +836,17 @@ void test_awq_gemm_shape(sycl::queue& q, int N, int K, bool xmx) {
                 accepted = launched && accepted;
             }
         }
-        const std::string tag = "N=" + std::to_string(N) + ",M=" + std::to_string(c.M) +
+        const std::string tag = "N=" + std::to_string(N) + ",K=" + std::to_string(K) +
+                                ",M=" + std::to_string(c.M) + (misaligned ? ",unaligned-A" : "") +
                                 ",case=" + std::to_string(case_id++);
         const auto vector_result = download(q, vector_base, expected.size());
         check(test_close(vector_result, expected, 0.02f, 0.02f), ("AWQ vector GEMM " + tag).c_str());
         if (xmx) {
-            check(accepted, ("AWQ CuTe W4A16 launch " + tag).c_str());
+            check(accepted, ("AWQ XMX W4A16 launch " + tag).c_str());
             if (accepted) {
                 const auto result = download(q, xmx_base, expected.size());
-                check(test_close(result, expected, 0.02f, 0.02f), ("AWQ CuTe W4A16 CPU " + tag).c_str());
-                check(test_close(result, vector_result, 0.02f, 0.02f), ("AWQ CuTe W4A16 vector " + tag).c_str());
+                check(test_close(result, expected, 0.02f, 0.02f), ("AWQ XMX W4A16 CPU " + tag).c_str());
+                check(test_close(result, vector_result, 0.02f, 0.02f), ("AWQ XMX W4A16 vector " + tag).c_str());
             }
         }
     }
@@ -825,10 +854,29 @@ void test_awq_gemm_shape(sycl::queue& q, int N, int K, bool xmx) {
 
 void test_awq_gemm(sycl::queue& q) {
     const char* enabled = std::getenv("ARCAINE_FLINT_AWQ_XMX");
-    const bool xmx = enabled && std::strcmp(enabled, "1") == 0;
+    const bool joint = flint::awq_joint_matrix::mode() != flint::awq_joint_matrix::Mode::disabled;
+    const bool xmx = joint || (enabled && std::strcmp(enabled, "1") == 0);
     if (!xmx) std::printf("[test] AWQ CuTe W4A16 skipped (ARCAINE_FLINT_AWQ_XMX != 1)\n");
     test_awq_gemm_shape(q, 64, 128, xmx);
     test_awq_gemm_shape(q, 48, 256, xmx);
+    if (joint) {
+        test_awq_gemm_shape(q, 35, 64, true);
+        test_awq_gemm_shape(q, 129, 192, true, true);
+        test_awq_gemm_shape(q, 64, 64, true);
+        test_awq_gemm_shape(q, 64, 128, true, false, true);
+        using namespace flint;
+        TestAllocations buffers(q);
+        AwqTestTensor w(buffers, 35, 64, 2, 31);
+        auto* a = buffers.alloc<bf16>(64);
+        auto* c = buffers.put(std::vector<bf16>(35, bf16(-47.f)));
+        bool rejected = !awq_joint_matrix::gemm(q, w.t, a, nullptr, c, 1, 35, nullptr, nullptr, 34);
+        rejected = !awq_joint_matrix::gemm(q, w.t, a, nullptr, c, 1, 35, nullptr, nullptr, 0, 2) && rejected;
+        rejected = !awq_joint_matrix::gemm(q, w.t, a, nullptr, a, 1, 35) && rejected;
+        rejected = !awq_joint_matrix::gemm(q, w.t, a, nullptr, c, 0, 35) && rejected;
+        rejected = !awq_joint_matrix::gemm(q, w.t, a, nullptr, c, 1, 34) && rejected;
+        check(rejected && test_close(download(q, c, 35), std::vector<bf16>(35, bf16(-47.f))),
+              "AWQ joint_matrix rejects invalid calls without writes");
+    }
 }
 
 }  // namespace

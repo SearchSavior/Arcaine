@@ -20,6 +20,7 @@
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 
 #include "modeling/flint/kernels/awq_xmx.hpp"
+#include "modeling/flint/kernels/awq_joint_matrix.hpp"
 #include "modeling/flint/kernels/kernels.hpp"
 #include "modeling/flint/kernels/prefill.hpp"
 #include "modeling/flint/kernels/prefill_xmx.hpp"
@@ -132,16 +133,23 @@ struct AwqErrors {
 
 int bench_awq(const std::string& which, int M, int N, int K, int iters, bool check) {
     const bool gemv = which == "awq-gemv";
-    const bool xmx = which == "prefill-awq-xmx";
+    const bool joint = which == "prefill-awq-joint-matrix";
+    const bool xmx = which == "prefill-awq-xmx" || joint;
     if (M <= 0 || N <= 0 || K <= 0 || K % 64 || iters <= 0)
         throw std::invalid_argument("AWQ requires M,N > 0, K > 0 divisible by 64, --iters > 0");
     const uint64_t nk = uint64_t(N) * K, mk = uint64_t(M) * K, mn = uint64_t(M) * N;
     const uint64_t max_extent = uint64_t(std::numeric_limits<int>::max()) - 256;
     if (nk > max_extent || mk > max_extent || mn > max_extent)
         throw std::invalid_argument("AWQ dimensions exceed safe indexing limits");
-    if (xmx && N % 16)
+    if (xmx && !joint && N % 16)
         throw std::invalid_argument("prefill-awq-xmx requires N divisible by 16; no fallback");
-    if (xmx) {
+    if (joint && awq_joint_matrix::mode() == awq_joint_matrix::Mode::disabled)
+        throw std::invalid_argument("prefill-awq-joint-matrix requires external "
+                                    "ARCAINE_FLINT_AWQ_JOINT_MATRIX=dpas or dpas-sg32");
+    if (xmx && !joint) {
+        if (awq_joint_matrix::mode() != awq_joint_matrix::Mode::disabled)
+            throw std::invalid_argument("prefill-awq-xmx requires ARCAINE_FLINT_AWQ_JOINT_MATRIX unset; "
+                                        "use prefill-awq-joint-matrix for native kernels");
         const char* enabled = std::getenv("ARCAINE_FLINT_AWQ_XMX");
         const char* decompose = std::getenv("IGC_allowDecompose2DBlockFuncs");
         if (!enabled || std::strcmp(enabled, "1") || !decompose || std::strcmp(decompose, "0"))
@@ -149,10 +157,15 @@ int bench_awq(const std::string& which, int M, int N, int K, int iters, bool che
                                         "and IGC_allowDecompose2DBlockFuncs=0; no fallback");
     }
 
+    const char* profile_env = std::getenv("ARCAINE_FLINT_AWQ_JOINT_MATRIX_PROFILE");
+    const bool profile = joint && profile_env && !std::strcmp(profile_env, "1");
+    const sycl::property_list props = profile
+        ? sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}}
+        : sycl::property_list{sycl::property::queue::in_order{}};
     sycl::queue q(sycl::ext::oneapi::filter_selector("level_zero:gpu"),
                   [](sycl::exception_list errors) {
                       for (const auto& error : errors) std::rethrow_exception(error);
-                  }, sycl::property::queue::in_order{});
+                  }, props);
     const auto device = q.get_device();
     const bool vector_fits = uint64_t(K) * sizeof(bf16) <=
                             device.get_info<sycl::info::device::local_mem_size>();
@@ -162,6 +175,11 @@ int bench_awq(const std::string& which, int M, int N, int K, int iters, bool che
                 device.get_info<sycl::info::device::name>().c_str(),
                 device.get_info<sycl::info::device::max_compute_units>(),
                 device.get_info<sycl::info::device::local_mem_size>() / 1024);
+    if (joint)
+        std::printf("[joint_matrix] mode=%s weight=W4A16 tile=%s stage=%s global_a_requested=%d grf=256\n",
+                    awq_joint_matrix::mode() == awq_joint_matrix::Mode::dpas ? "dpas" : "dpas-sg32",
+                    awq_joint_matrix::tile_name(), awq_joint_matrix::staging_name(),
+                    int(awq_joint_matrix::global_a_enabled()));
     std::printf("BENCH_BEGIN %s\n", which.c_str());
     std::fflush(stdout);
 
@@ -200,12 +218,17 @@ int bench_awq(const std::string& which, int M, int N, int K, int iters, bool che
     q.memset(C, 0xff, size_t(mn) * sizeof(bf16));
     q.wait_and_throw();
 
+    sycl::event kernel_event;
     auto launch = [&] {
         if (gemv) {
             for (int token = 0; token < M; ++token)
                 kernels::q4_gemv(q, t, A + size_t(token) * K, C + size_t(token) * N);
         } else if (xmx) {
-            if (!awq_xmx::gemm(q, t, A, nullptr, C, M, N))
+            const bool accepted = joint ? awq_joint_matrix::gemm(q, t, A, nullptr, C, M, N,
+                                                                  nullptr, nullptr, 0, 0,
+                                                                  profile ? &kernel_event : nullptr)
+                                        : awq_xmx::gemm(q, t, A, nullptr, C, M, N);
+            if (!accepted)
                 throw std::runtime_error("awq_xmx::gemm rejected M=" + std::to_string(M) +
                                          " N=" + std::to_string(N) + " K=" + std::to_string(K) +
                                          "; refusing vector fallback");
@@ -217,13 +240,27 @@ int bench_awq(const std::string& which, int M, int N, int K, int iters, bool che
     for (int i = 0; i < warmup; ++i) launch();
     q.wait_and_throw();
     Timer timer;
+    std::vector<sycl::event> events;
+    if (profile) events.reserve(iters);
     timer.start();
-    for (int i = 0; i < iters; ++i) launch();
+    for (int i = 0; i < iters; ++i) {
+        launch();
+        if (profile) events.push_back(kernel_event);
+    }
     q.wait_and_throw();
     const double ms = timer.ms(iters);
     std::printf("%s M=%d N=%d K=%d warmup=%d iters=%d  %.6f ms/iter  "
                 "%.3f effective TFLOP/s\n", which.c_str(), M, N, K, warmup, iters,
                 ms, 2.0 * M * N * K / (ms * 1e9));
+    if (profile) {
+        double device_ns = 0;
+        for (const auto& event : events)
+            device_ns += double(event.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                event.get_profiling_info<sycl::info::event_profiling::command_start>());
+        const double device_ms = device_ns / (iters * 1e6);
+        std::printf("joint_matrix device=%.6f ms/iter %.3f effective TFLOP/s\n",
+                    device_ms, 2.0 * M * N * K / (device_ms * 1e9));
+    }
 
     if (check) {
         std::vector<bf16> hc(static_cast<size_t>(mn));
@@ -296,7 +333,7 @@ int run_flint_kernels(int argc, char** argv) {
         auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--help" || a == "-h") {
             std::printf("Usage: %s --case CASE [--iters N] [--n N] [--k N] [--m N] [--depth N] [--parts N] [--inner N] [--groups N] [--check]\n"
-                        "Cases: gemv, lmhead, qkv, attn-serial, attn-split, moe, moe-fused, dense, xmx-int8, xmx-bf16, alu-fp32, rmsnorm, router, prefill-bf16, prefill-int8, prefill-int8-xmx, prefill-xmx-check, awq-gemv, prefill-awq, prefill-awq-xmx\n", argv[0]);
+                        "Cases: gemv, lmhead, qkv, attn-serial, attn-split, moe, moe-fused, dense, xmx-int8, xmx-bf16, alu-fp32, rmsnorm, router, prefill-bf16, prefill-int8, prefill-int8-xmx, prefill-xmx-check, awq-gemv, prefill-awq, prefill-awq-xmx, prefill-awq-joint-matrix\n", argv[0]);
             return 0;
         }
         if (a == "--case") {
@@ -317,7 +354,7 @@ int run_flint_kernels(int argc, char** argv) {
         else if (a == "--check") check = true;
     }
 
-    if (which == "awq-gemv" || which == "prefill-awq" || which == "prefill-awq-xmx") {
+    if (which == "awq-gemv" || which == "prefill-awq" || which == "prefill-awq-xmx" || which == "prefill-awq-joint-matrix") {
         try {
             return bench_awq(which, which == "awq-gemv" && !m_explicit ? 1 : M,
                              n, k, iters, check);

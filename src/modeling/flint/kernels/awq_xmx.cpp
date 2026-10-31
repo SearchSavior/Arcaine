@@ -1,4 +1,5 @@
 #include "awq_xmx.hpp"
+#include "awq_joint_matrix.hpp"
 
 #if defined(SYCL_INTEL_TARGET) && defined(CUTLASS_ENABLE_SYCL)
 
@@ -117,7 +118,7 @@ bool aligned(const void* ptr) {
 
 }
 
-bool gemm(sycl::queue& q, const QTensor& t, const bf16* A,
+bool gemm_cute(sycl::queue& q, const QTensor& t, const bf16* A,
           const int* row_index, bf16* C, int M, int N,
           const bf16* residual, const int* out_index, int out_stride, int expert) {
     using namespace detail;
@@ -258,7 +259,7 @@ bool gemm(sycl::queue& q, const QTensor& t, const bf16* A,
 
 namespace flint::awq_xmx {
 
-bool gemm(sycl::queue&, const QTensor&, const bf16*, const int*, bf16*, int, int,
+bool gemm_cute(sycl::queue&, const QTensor&, const bf16*, const int*, bf16*, int, int,
           const bf16*, const int*, int, int) {
     return false;
 }
@@ -266,3 +267,16 @@ bool gemm(sycl::queue&, const QTensor&, const bf16*, const int*, bf16*, int, int
 }
 
 #endif
+
+namespace flint::awq_xmx {
+
+bool gemm(sycl::queue& q, const QTensor& t, const bf16* A,
+          const int* row_index, bf16* C, int M, int N,
+          const bf16* residual, const int* out_index, int out_stride, int expert) {
+    if (awq_joint_matrix::mode() != awq_joint_matrix::Mode::disabled)
+        return awq_joint_matrix::gemm(q, t, A, row_index, C, M, N,
+                                      residual, out_index, out_stride, expert);
+    return gemm_cute(q, t, A, row_index, C, M, N, residual, out_index, out_stride, expert);
+}
+
+} // namespace flint::awq_xmx
