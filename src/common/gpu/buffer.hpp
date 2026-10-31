@@ -22,6 +22,31 @@ inline uint16_t float_to_bf16(float f) {
     return static_cast<uint16_t>((u + rounding_bias) >> 16);
 }
 
+// IEEE binary16 -> float. Shared by all loaders (safetensors F16 checkpoints,
+// GGUF Q8_0 block scales).
+inline float f16_to_float(uint16_t h) {
+    uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x03ffu;
+    uint32_t out;
+    if (exp == 0) {
+        if (mant == 0) out = sign;
+        else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) { mant <<= 1; --exp; }
+            mant &= 0x03ffu;
+            out = sign | ((exp + 112u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (mant << 13);
+    } else {
+        out = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
 template<typename T>
 class GpuBuffer {
 public:

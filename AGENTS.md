@@ -44,9 +44,9 @@ CLI based end-to-end benchmarking tool for evalutation of implemented inference 
 
 Once `arcaine_mbench` is deemed the appropriate test evaluate these kv-cache depths for language models depending on stage of development.
 
-- **EARLY DAYS** and correctness- conservative path: `512,1024,2048,4096`
+- **EARLY DAYS** and correctness- conservative path: `-d 512,1024,2048,4096`
     - For probing and baselines
-- **DEEPER** long context: `8192,12000,16384,32000`
+- **DEEPER** long context: `-d 8192,12000,16384,32000`
     - Only promote to this level once the pipeline is correct.
 
 - For **BASELINE** runs if the test or environment has not changed between runs do not rerun

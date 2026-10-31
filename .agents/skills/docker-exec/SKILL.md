@@ -16,15 +16,8 @@ Use this container for all development and code changes; DO NOT run commands on 
 
 `docker exec arcaine-dev-run`
 
-## Example to build Arcaine
-
-```
-docker exec -i arcaine-dev-1 sh -c 'cmake -B build -G Ninja \
-  -DCMAKE_CXX_COMPILER=icpx \
-  -DARCAINE_SYCL_TARGETS=intel_gpu_bmg_g31 && \
-  cmake --build build -j"$(nproc)"'
-```
 
 ## Restrictions
 
 - DO NOT run commands on the host.
+- ALWAYS preface a command with `docker exec`

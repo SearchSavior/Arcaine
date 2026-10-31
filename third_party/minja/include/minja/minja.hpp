@@ -2728,6 +2728,15 @@ inline std::shared_ptr<Context> Context::builtins() {
   globals.set("tojson", simple_function("tojson", { "value", "indent" }, [](const std::shared_ptr<Context> &, Value & args) {
     return Value(args.at("value").dump(args.get<int64_t>("indent", -1), /* to_json= */ true));
   }));
+  globals.set("replace", simple_function("replace", { "value", "old", "new" }, [](const std::shared_ptr<Context> &, Value & args) {
+    std::string value = args.at("value").get<std::string>();
+    const std::string from = args.at("old").get<std::string>();
+    const std::string to = args.at("new").get<std::string>();
+    if (from.empty()) return Value(value);
+    for (size_t at = 0; (at = value.find(from, at)) != std::string::npos; at += to.size())
+      value.replace(at, from.size(), to);
+    return Value(value);
+  }));
   globals.set("items", simple_function("items", { "object" }, [](const std::shared_ptr<Context> &, Value & args) {
     auto items = Value::array();
     if (args.contains("object")) {

@@ -27,10 +27,13 @@
 #include <memory>
 
 #include "common/model_interface.hpp"
+#include "modeling/flint/model.hpp"
 #include "common/registry.hpp"
 #include "common/gpu/device_select.hpp"
 #include "common/gpu/engine.hpp"
 #include "bench/diffusion_model_bench.hpp"
+
+int run_flint_generation(int argc, char** argv);
 
 // Reads config.json::model_type without constructing the model.
 static std::string read_model_type(const std::string& model_dir) {
@@ -114,6 +117,8 @@ static void print_row(const char* test, const char* depth,
 
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
+    if (argc > 1 && !std::strcmp(argv[1], "flint-generate"))
+        return run_flint_generation(argc - 1, argv + 1);
     static const char* USAGE =
         "Usage: bench --model <model_dir> [options]\n"
         "  -h, --help    show this help text\n"
@@ -125,6 +130,7 @@ int main(int argc, char* argv[]) {
         "  --max-seq N   KvCache capacity       (default: auto)\n"
         "  --device N    run with one visible Level Zero GPU\n"
         "\n"
+        "Flint generation: arcaine_mbench flint-generate --help\n"
         "DiffusionGemma models delegate to the block-diffusion driver, which\n"
         "accepts -ds/--kernels/--layers/--experts/--seed/--md/--print-result.\n";
 
@@ -204,6 +210,30 @@ int main(int argc, char* argv[]) {
     double load_s = (now_ms() - t0) * 0.001;
 
     const ModelInfo& info = model->info();
+    const char* prefix_env = std::getenv("ARCAINE_FLINT_MBENCH_GPU_CHECKPOINT");
+    const bool reuse_prefix = prefix_env && prefix_env[0]=='1' && prefix_env[1]=='\0';
+    auto* flint_model = dynamic_cast<FlintModel*>(model.get());
+    if (reuse_prefix && (!flint_model || !model->device_generation_enabled())) {
+        std::fprintf(stderr,"GPU prefix checkpoints require Flint GPU decode\n");
+        return 1;
+    }
+    const char* attention_ab_env=std::getenv("ARCAINE_FLINT_MBENCH_ATTN_AB");
+    const int attention_ab_mode=attention_ab_env?std::atoi(attention_ab_env):0;
+    const bool attention_ab=attention_ab_mode!=0;
+    if(attention_ab&&!reuse_prefix){
+        std::fprintf(stderr,"Flint attention A/B requires GPU prefix checkpoints\n");return 1;
+    }
+    const char* original_two_pass_env=std::getenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS");
+    const char* original_global_split_env=std::getenv("ARCAINE_FLINT_DECODE_GLOBAL_ATTN_SPLIT");
+    const bool had_two_pass_env=original_two_pass_env!=nullptr,had_global_split_env=original_global_split_env!=nullptr;
+    const std::string original_two_pass=original_two_pass_env?original_two_pass_env:"";
+    const std::string original_global_split=original_global_split_env?original_global_split_env:"";
+    if(attention_ab_mode==2&&((original_two_pass!="1"&&original_two_pass!="auto")||std::atoi(original_global_split.c_str())<256)){
+        std::fprintf(stderr,"Three-way A/B requires initial TWO_PASS=auto and GLOBAL_ATTN_SPLIT>=256 for GPU workspace\n");return 1;
+    }
+    const char* original_native_env=std::getenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP");
+    const bool had_native_env=original_native_env!=nullptr;
+    const std::string original_native=original_native_env?original_native_env:"";
     printf("model   : %s\n", info.description.c_str());
     printf("backend : SYCL + oneDNN | GPUs: %d | max_seq: %d",
            GpuEngine::count(), max_seq);
@@ -231,7 +261,8 @@ int main(int argc, char* argv[]) {
         for (int r = 0; r < warmup + reps; ++r) {
             model->reset_cache();
             double t = now_ms();
-            model->forward(ForwardInput{prompt, 0});
+            if (model->device_generation_enabled()) model->forward_device(ForwardInput{prompt, 0});
+            else model->forward(ForwardInput{prompt, 0});
             double dt = now_ms() - t;
             if (r >= warmup) times.push_back(dt);
         }
@@ -251,9 +282,7 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        std::vector<double> times;
-
-        for (int r = 0; r < warmup + reps; ++r) {
+        auto prepare_prefix = [&] {
             model->reset_cache();
 
             // Pre-fill KV cache to `depth` tokens in chunks (untimed).
@@ -265,25 +294,56 @@ int main(int argc, char* argv[]) {
                 for (int pos = 0; pos < depth; pos += CHUNK) {
                     int sz = std::min(CHUNK, depth - pos);
                     std::vector<int> chunk(sz, bos_id);
-                    model->forward(ForwardInput{chunk, pos});
+                    if (model->device_generation_enabled()) model->forward_device(ForwardInput{chunk, pos});
+                    else model->forward(ForwardInput{chunk, pos});
                 }
             }
+
+        };
+        if (reuse_prefix) {
+            prepare_prefix();
+            flint_model->save_decode_prefix();
+        }
+
+        for(int variant=0;variant<(attention_ab?(attention_ab_mode==2?3:2):1);++variant){
+            if(attention_ab){
+                setenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP",variant==1?"2":"0",1);
+                setenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS",variant==2?"auto":"0",1);
+                setenv("ARCAINE_FLINT_DECODE_GLOBAL_ATTN_SPLIT",variant==2?"256":"16",1);
+                flint_model->clear_decode_graphs();
+                snprintf(name,sizeof(name),"tg %d %s",tg,variant==2?"twopass":variant==1?"native":"vector");
+            }
+        std::vector<double> times;
+
+        for (int r = 0; r < warmup + reps; ++r) {
+            if (reuse_prefix) flint_model->restore_decode_prefix();
+            else prepare_prefix();
 
             // Time `tg` single-token decode steps.
             // The cache grows from depth to depth+tg during this window,
             // which is realistic for mid-generation latency measurement.
             double t = now_ms();
-            for (int step = 0; step < tg; ++step)
-                model->forward(ForwardInput{single, depth + step});
+            if (!model->decode_repeated_device(bos_id, tg, depth))
+                for (int step = 0; step < tg; ++step)
+                    model->forward(ForwardInput{single, depth + step});
             double dt = now_ms() - t;
 
             if (r >= warmup) times.push_back(dt);
         }
 
         print_row(name, dstr, compute_stats(times, tg));
+        }
       }
     }
 
+    if(attention_ab){
+        if(had_two_pass_env)setenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS",original_two_pass.c_str(),1);
+        else unsetenv("ARCAINE_FLINT_FLASH_DECODE_TWO_PASS");
+        if(had_global_split_env)setenv("ARCAINE_FLINT_DECODE_GLOBAL_ATTN_SPLIT",original_global_split.c_str(),1);
+        else unsetenv("ARCAINE_FLINT_DECODE_GLOBAL_ATTN_SPLIT");
+        if(had_native_env)setenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP",original_native.c_str(),1);
+        else unsetenv("ARCAINE_FLINT_FLASH_DECODE_NATIVE_EXP");
+    }
     printf("\n");
     return 0;
 }

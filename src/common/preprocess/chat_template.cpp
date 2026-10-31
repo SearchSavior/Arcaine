@@ -67,7 +67,15 @@ TokenizerMetadata load_tokenizer_metadata(const std::string& model_dir) {
     if (t.contains("video_token")) {
         meta.video_token = string_or_empty(t, "video_token");
     } else if (t.contains("extra_special_tokens") && !t.at("extra_special_tokens").empty()) {
-        meta.video_token = t.at("extra_special_tokens").at(0).get<std::string>();
+        // Newer tokenizer_config.json stores this as an object keyed by token
+        // name; older exports used an array.
+        const auto& extra = t.at("extra_special_tokens");
+        if (extra.is_object()) {
+            if (extra.contains("video_token") && extra.at("video_token").is_string())
+                meta.video_token = extra.at("video_token").get<std::string>();
+        } else if (extra.is_array()) {
+            meta.video_token = extra.at(0).get<std::string>();
+        }
     }
     return meta;
 }
@@ -96,6 +104,40 @@ const CachedChatTemplate& cached_chat_template(const std::string& model_dir) {
     return res.first->second;
 }
 
+// Flint's template tests `t is string` and then applies Jinja `replace`
+// filters. OpenAI-shaped requests carry content as [{type:text,text:...}];
+// flatten text-only parts so the template sees a string.
+bool wants_string_content(const std::string& model_dir) {
+    std::ifstream f(model_dir + "/config.json");
+    if (!f) return false;
+    nlohmann::json j;
+    f >> j;
+    return j.value("model_type", "") == "flint";
+}
+
+void flatten_text_parts(json& messages) {
+    if (!messages.is_array()) return;
+    for (auto& m : messages) {
+        if (!m.contains("content")) continue;
+        auto& c = m["content"];
+        if (!c.is_array()) continue;
+        if (c.empty()) {
+            c = std::string();
+            continue;
+        }
+        std::string text;
+        bool all_text = true;
+        for (auto& part : c) {
+            if (!part.is_object() || part.value("type", "") != "text") {
+                all_text = false;
+                break;
+            }
+            text += part.value("text", "");
+        }
+        if (all_text) c = text;
+    }
+}
+
 void replace_one(std::string& text, const std::string& needle, const std::string& replacement) {
     size_t pos = text.find(needle);
     if (pos == std::string::npos)
@@ -122,6 +164,7 @@ PromptBuildResult render_chat_prompt(
 ) {
     const CachedChatTemplate& cached = cached_chat_template(model_dir);
     const TokenizerMetadata& meta = cached.meta;
+    if (wants_string_content(model_dir)) flatten_text_parts(messages);
     minja::chat_template_inputs inputs;
     inputs.messages = std::move(messages);
     inputs.tools = std::move(tools);
@@ -235,6 +278,7 @@ std::string build_chat_prompt_text(
                                      {"content", message.content}});
     }
     const CachedChatTemplate& cached = cached_chat_template(model_dir);
+    if (wants_string_content(model_dir)) flatten_text_parts(rendered_messages);
     minja::chat_template_inputs inputs;
     inputs.messages = std::move(rendered_messages);
     inputs.tools = json::array();

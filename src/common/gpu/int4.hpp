@@ -35,6 +35,12 @@ struct Int4Linear {
     // BF16 per-group scales transposed for oneDNN, logical shape
     // (in_features / group_size, out_features).
     GpuBuffer<bf16> weight_scale;
+    // Optional per-(K-group, N) signed zero points, logical shape
+    // (in_features / group_size, out_features) as s8. Present for asymmetric
+    // compressed-tensors int4 checkpoints; empty (has_zero_point=false) for the
+    // symmetric zero-point-8 case (diffusion_gemma).
+    GpuBuffer<int8_t> weight_zero_point;
+    bool has_zero_point = false;
 
     // oneDNN impl-preferred weight layout, materialized once on first use under
     // DIFF_INT4_WEIGHT_LAYOUT=any. The raw tag::ba layout forces oneDNN's
@@ -64,8 +70,10 @@ inline Int4WeightLayout int4_weight_layout() {
 
 struct Int4MatmulKey {
     int gpu, M, K, N, group;
+    bool has_zp;
     bool operator==(const Int4MatmulKey& o) const {
-        return gpu == o.gpu && M == o.M && K == o.K && N == o.N && group == o.group;
+        return gpu == o.gpu && M == o.M && K == o.K && N == o.N && group == o.group &&
+               has_zp == o.has_zp;
     }
 };
 
@@ -76,6 +84,7 @@ struct Int4MatmulKeyHash {
         h ^= std::hash<int>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(k.group) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}((int)k.has_zp) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -85,9 +94,10 @@ struct Int4MatmulEntry {
     dnnl::memory::desc weights_md;
 };
 
-inline Int4MatmulEntry& int4_matmul_entry(GpuEngine& ctx, int M, int K, int N, int group) {
+inline Int4MatmulEntry& int4_matmul_entry(GpuEngine& ctx, int M, int K, int N, int group,
+                                          bool has_zp = false) {
     static std::unordered_map<Int4MatmulKey, Int4MatmulEntry, Int4MatmulKeyHash> cache;
-    Int4MatmulKey key{ctx.index, M, K, N, group};
+    Int4MatmulKey key{ctx.index, M, K, N, group, has_zp};
     auto it = cache.find(key);
     if (it == cache.end()) {
         using dt = dnnl::memory::data_type;
@@ -95,6 +105,10 @@ inline Int4MatmulEntry& int4_matmul_entry(GpuEngine& ctx, int M, int K, int N, i
         dnnl::primitive_attr attr;
         // Per-group weight scales along K (group along dim 0, per-channel on N).
         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), {group, 1}, dt::bf16);
+        // Per-(K-group, N) weights zero points for asymmetric int4. s8 keeps the
+        // fast jit decompression kernel (s32 falls back to ocl:ref).
+        if (has_zp)
+            attr.set_zero_points(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), {group, 1}, dt::s8);
         // Enable integer-weight decompression with a BF16 compute math mode.
         attr.set_fpmath_mode(dnnl::fpmath_mode::bf16, /*apply_to_int=*/true);
         auto weights_md = (int4_weight_layout() == Int4WeightLayout::Any)
@@ -383,22 +397,30 @@ inline void matmul_int4_w4a16(
     auto dst_md = dnnl::memory::desc({M, N}, dt::bf16, tag::ab);
     auto wscale_md = dnnl::memory::desc({G, N}, dt::bf16, tag::ab);
 
-    auto& entry = int4_matmul_entry(ctx, M, K, N, W.group_size);
+    auto& entry = int4_matmul_entry(ctx, M, K, N, W.group_size, W.has_zero_point);
     const uint8_t* weight_data = int4_weight_data(W, entry.weights_md, K, N, ctx);
 
-    entry.primitive.execute(ctx.stream, {
-        {DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
-            src_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
-            const_cast<bf16*>(A))},
-        {DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
-            entry.weights_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
-            const_cast<uint8_t*>(weight_data))},
-        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
-            wscale_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
-            const_cast<bf16*>(W.weight_scale.data()))},
-        {DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
-            dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)}
-    });
+    std::unordered_map<int, dnnl::memory> args;
+    args.insert({DNNL_ARG_SRC, dnnl::sycl_interop::make_memory(
+        src_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+        const_cast<bf16*>(A))});
+    args.insert({DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+        entry.weights_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+        const_cast<uint8_t*>(weight_data))});
+    args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::sycl_interop::make_memory(
+        wscale_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+        const_cast<bf16*>(W.weight_scale.data()))});
+    if (W.has_zero_point) {
+        auto wzp_md = dnnl::memory::desc({G, N}, dt::s8, tag::ab);
+        args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,
+            dnnl::sycl_interop::make_memory(
+                wzp_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm,
+                const_cast<int8_t*>(W.weight_zero_point.data()))});
+    }
+    args.insert({DNNL_ARG_DST, dnnl::sycl_interop::make_memory(
+        dst_md, ctx.engine, dnnl::sycl_interop::memory_kind::usm, C)});
+
+    entry.primitive.execute(ctx.stream, args);
 }
 
 // Public entry point: picks W4A8 for large-M (prefill) when enabled, otherwise
@@ -419,8 +441,8 @@ inline void matmul_int4(
     bf16* C,
     GpuEngine& ctx = GpuEngine::get(0))
 {
-    if (diff_int4_w4a8_prefill_enabled() && M >= diff_int4_w4a8_min_m() &&
-        K >= 1024 && W.out_features >= K) {
+    if (!W.has_zero_point && diff_int4_w4a8_prefill_enabled() &&
+        M >= diff_int4_w4a8_min_m() && K >= 1024 && W.out_features >= K) {
         matmul_int4_w4a8(A, M, K, W, C, ctx);
         return;
     }
