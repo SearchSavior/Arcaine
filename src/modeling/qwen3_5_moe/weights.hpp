@@ -4,6 +4,35 @@
 #include <vector>
 #include "../../common/gpu/buffer.hpp"
 #include "../../common/gpu/nvfp4.hpp"
+#include "../../common/gpu/int4.hpp"
+#include "../../common/gpu/ops.hpp"
+
+// A quantized (or plain) projection weight. The same architecture can be fed by
+// an NVFP4 checkpoint (intended target), an AWQ pack-quantized INT4 checkpoint
+// (routed experts only; attention/linear-attn/shared expert stay BF16), or plain
+// BF16 weights. `kind` selects the GEMM at runtime via qwen_linear_matmul().
+struct QwenLinearWeight {
+    enum class Kind { BF16, NVFP4, INT4 } kind = Kind::BF16;
+    int out_features = 0;
+    GpuBuffer<bf16> bf16;   // (out_features, in_features) row-major
+    Nvfp4Linear     fp4;
+    Int4Linear      int4;
+};
+
+inline void qwen_linear_matmul(const bf16* A, int M, int K,
+                               const QwenLinearWeight& W, bf16* C, GpuEngine& ctx) {
+    switch (W.kind) {
+        case QwenLinearWeight::Kind::BF16:
+            matmul_bf16(A, M, K, W.bf16.data(), W.out_features, C, ctx);
+            break;
+        case QwenLinearWeight::Kind::NVFP4:
+            matmul_nvfp4(A, M, K, W.fp4, C, ctx);
+            break;
+        case QwenLinearWeight::Kind::INT4:
+            matmul_int4(A, M, K, W.int4, C, ctx);
+            break;
+    }
+}
 
 // Qwen3.5-MoE device weights. NVFP4 projections are stored as Nvfp4Linear
 // (identical scheme to diffusion_gemma: weight_packed U8, weight_scale F8_E4M3
@@ -15,10 +44,10 @@
 // (rotary_dim 64), q/k RMSNorm per head, sigmoid/swish output gate taken from
 // the 2nd half of q_proj's 8192 outputs.
 struct QwenFullAttn {
-    Nvfp4Linear     q_proj;   // [8192, 2048]  (Q[4096] || output-gate[4096])
-    Nvfp4Linear     k_proj;   // [512, 2048]   (2 KV heads * 256)
-    Nvfp4Linear     v_proj;   // [512, 2048]
-    Nvfp4Linear     o_proj;   // [2048, 4096]
+    QwenLinearWeight q_proj;   // [8192, 2048]  (Q[4096] || output-gate[4096])
+    QwenLinearWeight k_proj;   // [512, 2048]   (2 KV heads * 256)
+    QwenLinearWeight v_proj;   // [512, 2048]
+    QwenLinearWeight o_proj;   // [2048, 4096]
     GpuBuffer<bf16> q_norm;   // [256]
     GpuBuffer<bf16> k_norm;   // [256]
 };
@@ -34,17 +63,17 @@ struct QwenLinearAttn {
     GpuBuffer<bf16> A_log;        // [32]
     GpuBuffer<bf16> dt_bias;      // [32]
     GpuBuffer<bf16> norm;         // [128]
-    Nvfp4Linear     out_proj;     // [2048, 4096]
+    QwenLinearWeight out_proj;    // [2048, 4096]
 };
 
 // MoE block: 256 routed experts (SwiGLU, NVFP4, top-8) + always-on shared
 // expert (DeepSeekMoE) with a per-token scalar sigmoid gate.
 struct QwenMoE {
     GpuBuffer<bf16>            router_gate;          // [256, 2048]
-    std::vector<Nvfp4Linear>   experts_gate_up;      // 256 x fused [1024, 2048]
-    std::vector<Nvfp4Linear>   experts_down;         // 256 x [2048, 512]
-    Nvfp4Linear                shared_gate_up;       // fused [1024, 2048]
-    Nvfp4Linear                shared_down;          // [2048, 512]
+    std::vector<QwenLinearWeight> experts_gate_up;   // 256 x fused [1024, 2048]
+    std::vector<QwenLinearWeight> experts_down;      // 256 x [2048, 512]
+    QwenLinearWeight           shared_gate_up;       // fused [1024, 2048]
+    QwenLinearWeight           shared_down;          // [2048, 512]
     GpuBuffer<bf16>            shared_expert_gate;   // [1, 2048]
 };
 

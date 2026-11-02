@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include "preprocess/image_proc.hpp"
 #include "preprocess/audio_proc.hpp"
@@ -67,6 +68,17 @@ public:
 
     // Returns float logits (vocab_size,) for the last token position.
     virtual std::vector<float> forward(const ForwardInput& in) = 0;
+
+    // Optional device generation. Prefill completes without returning logits;
+    // generated IDs are returned in blocks, with sampling/feedback on device.
+    virtual bool device_generation_enabled() const { return false; }
+    virtual void forward_device(const ForwardInput&) {
+        throw std::logic_error("device forward unsupported");
+    }
+    virtual std::vector<int> generate_device(int, float, int, float, uint64_t&) {
+        throw std::logic_error("device generation unsupported");
+    }
+    virtual bool decode_repeated_device(int, int, int) { return false; }
 
     // Clear the KV cache so the next forward starts a fresh sequence.
     virtual void reset_cache() = 0;

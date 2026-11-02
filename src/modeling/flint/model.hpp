@@ -1,0 +1,104 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <sycl/sycl.hpp>
+
+#include "../../common/model_interface.hpp"
+#include "config.hpp"
+#include "weights.hpp"
+
+class FlintModel final : public Model {
+public:
+    FlintModel(const std::string& model_dir, int max_seq_len);
+    ~FlintModel() override;
+
+    PreparedInput prepare_input(const std::string& prompt,
+                                const std::vector<std::string>& image_paths,
+                                const std::vector<std::string>& audio_paths,
+                                const std::string& vad_model) override;
+    std::vector<float> forward(const ForwardInput& in) override;
+    void reset_cache() override;
+    bool device_generation_enabled() const override;
+    void forward_device(const ForwardInput& in) override;
+    std::vector<int> generate_device(int max_tokens, float temperature, int top_k,
+                                     float top_p, uint64_t& rng) override;
+    bool decode_repeated_device(int token, int steps, int past_len) override;
+    int current_position() const { return pos_; }
+    // Benchmark-only prefix reuse: KV and logits remain in device memory.
+    void save_decode_prefix();
+    void restore_decode_prefix();
+    void clear_decode_graphs();
+    const ModelInfo& info() const override { return info_; }
+
+private:
+    struct KVCache {
+        flint::bf16* k = nullptr;
+        flint::bf16* v = nullptr;
+        int cap = 0;
+        bool global = true;
+    };
+
+    struct ResidentDecode;
+    std::shared_ptr<ResidentDecode> resident_decode_;
+    bool trace_enabled_ = false;
+    void enqueue_forward(const ForwardInput& in);
+    void enqueue_device_step(const int* token, int* position, const int* active,bool use_score_scratch);
+    void run_device_block(int steps, int mode,int past_position);
+    void step(int token);
+    void ensure_batch(int m);
+    void release_batch();
+    void prefill_batch(const std::vector<int>& tokens, int pos_base);
+    void attend(const flint::bf16* q, const KVCache& c, const flint::bf16* sink,
+                flint::bf16* out, int pos);
+    std::vector<float> logits();
+public:
+    void dump_trace(const std::string& path);
+private:
+
+    FlintConfig cfg_;
+    flint::FlintWeights w_;
+    ModelInfo info_;
+    sycl::queue q_;
+
+    int max_seq_ = 0;
+    int pos_ = 0;
+    float log2base_ = 0.f;
+
+    flint::bf16 *h_ = nullptr, *normed_ = nullptr, *qbuf_ = nullptr,
+                *kbuf_ = nullptr, *vbuf_ = nullptr, *attn_ = nullptr,
+                *act_ = nullptr, *down_ = nullptr, *gate_ = nullptr,
+                *up_ = nullptr;
+    float* logits_dev_ = nullptr;
+    flint::bf16* trace_ = nullptr;
+    int* ids_dev_ = nullptr;
+    float* weights_dev_ = nullptr;
+    float* attn_partial_ = nullptr;
+    float* attn_stats_ = nullptr;
+    float* attn_scores_ = nullptr;
+    std::vector<KVCache> kv_;
+
+    // Batched-prefill scratch, allocated on first use.
+    int batch_cap_ = 0;
+    int* b_tokens = nullptr;
+    flint::bf16 *b_h = nullptr, *b_normed = nullptr, *b_q = nullptr,
+                *b_k = nullptr, *b_v = nullptr, *b_attn = nullptr,
+                *b_gate = nullptr, *b_up = nullptr, *b_routed = nullptr,
+                *b_shared_act = nullptr, *b_shared_up = nullptr,
+                *b_shared_down = nullptr, *b_egate = nullptr, *b_eup = nullptr,
+                *b_eact = nullptr;
+    int* b_ids = nullptr;
+    float* b_weights = nullptr;
+    float* b_attn_partial = nullptr;
+    float* b_attn_stats = nullptr;
+    int* b_grouped_metadata = nullptr;
+    int* b_rows = nullptr;
+    int* b_outs = nullptr;
+    int8_t* b_xq = nullptr;
+    float* b_xs = nullptr;
+    int8_t* b_xq2 = nullptr;
+    float* b_xs2 = nullptr;
+    int* b_xi = nullptr;  // per-(token, group) int8 sums for the XMX GEMM
+};

@@ -11,6 +11,7 @@
 #include "../../common/preprocess/chat_template.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -120,12 +121,19 @@ std::vector<float> QwenModel::forward_tokens(
     //    residual = h; h = input_layernorm(h); h = attn(h); h = residual + h;
     //    residual = h; h = post_attn_layernorm(h); h = moe(h); h = residual + h.
     // Norm weights are (1+w)-baked at load -> plain rms_norm.
+    static const bool lprof = std::getenv("QWEN_LAYER_PROF") != nullptr;
+    using LClk = std::chrono::high_resolution_clock;
+    double t_full = 0, t_lin = 0, t_moe = 0;
+    auto lms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
     for (int l = 0; l < L; ++l) {
         auto& layer = weights_.layers[l];
 
         // attn sub-layer
         rms_norm(q, hidden.data(), layer.input_layernorm.data(),
                 h_normed.data(), seq, H, cfg_.rms_norm_eps);
+        auto ta = LClk::now();
         if (layer.is_full_attention) {
             const auto& a = std::get<QwenFullAttn>(layer.attn);
             qwen_full_attention_forward(ctx, a, kv_cache_.layers[l],
@@ -137,13 +145,27 @@ std::vector<float> QwenModel::forward_tokens(
                                      h_normed.data(), sub_out.data(),
                                      seq, past_len, cfg_);
         }
+        if (lprof) {
+            q.wait();
+            (layer.is_full_attention ? t_full : t_lin) += lms(ta, LClk::now());
+        }
         add_inplace(q, hidden.data(), sub_out.data(), (size_t)seq * H);
 
         // moe sub-layer
         rms_norm(q, hidden.data(), layer.post_attention_layernorm.data(),
                 h_normed.data(), seq, H, cfg_.rms_norm_eps);
+        auto tm = LClk::now();
         qwen_moe_forward(ctx, layer.moe, h_normed.data(), sub_out.data(), seq, cfg_);
+        if (lprof) {
+            q.wait();
+            t_moe += lms(tm, LClk::now());
+        }
         add_inplace(q, hidden.data(), sub_out.data(), (size_t)seq * H);
+    }
+    if (lprof) {
+        std::fprintf(stderr,
+                     "[layer-prof] seq=%d full_attn=%.1f linear_attn=%.1f moe=%.1f ms\n",
+                     seq, t_full, t_lin, t_moe);
     }
 
     // 3. Final RMSNorm on the LAST token only (we only need its logits).

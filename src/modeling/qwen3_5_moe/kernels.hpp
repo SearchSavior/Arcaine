@@ -20,6 +20,7 @@
 #include "../../common/gpu/buffer.hpp"
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 // ---------------------------------------------------------------------------
 // Elementwise activations
@@ -226,6 +227,66 @@ inline void l2norm(sycl::queue& q, const bf16* x, bf16* out, int N, int D, float
                 float inv_norm = sycl::rsqrt(lmem[0] + eps);
                 for (int d = lid; d < D; d += lsz)
                     orow[d] = float_to_bf16(bf16_to_float(xrow[d]) * inv_norm);
+            });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Gated DeltaNet recurrent core (prefill + decode), single launch.
+// Work-group per value head; each of `value_dim` work-items owns one value
+// column of the key_dim x value_dim fp32 recurrent state, held in SLM for the
+// whole sequence. Iterates seq internally, so prefill is one kernel launch
+// instead of a host-side chunked rule (the previous ~86%-of-prefill bottleneck)
+// or one launch per token. Layouts match the model arrays:
+//   query/key: [seq, heads, key_dim]; value: [seq, heads, value_dim];
+//   beta/g:    [seq, heads];  state: [heads, key_dim, value_dim] fp32 (in/out);
+//   output:    [seq, heads, value_dim].
+// Ported from qwen3_5/kernels.hpp (dense DeltaNet) — identical math/layout.
+// ---------------------------------------------------------------------------
+inline void qwen_moe_recurrent_delta(sycl::queue& q,
+                                     const bf16* query, const bf16* key,
+                                     const bf16* value, const bf16* beta,
+                                     const bf16* g, float* state, bf16* output,
+                                     int seq, int heads, int key_dim, int value_dim) {
+    if (value_dim > 256 || key_dim <= 0)
+        throw std::runtime_error("Unsupported DeltaNet recurrent tile");
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> local_state((size_t)key_dim * value_dim, h);
+        h.parallel_for(
+            sycl::nd_range<1>((size_t)heads * value_dim, (size_t)value_dim),
+            [=](sycl::nd_item<1> item) {
+                int head = item.get_group(0);
+                int value_index = item.get_local_id(0);
+                size_t state_base = (size_t)head * key_dim * value_dim;
+                for (int k = 0; k < key_dim; ++k)
+                    local_state[(size_t)k * value_dim + value_index] =
+                        state[state_base + (size_t)k * value_dim + value_index];
+
+                for (int token = 0; token < seq; ++token) {
+                    size_t qk_base = ((size_t)token * heads + head) * key_dim;
+                    size_t v_base = ((size_t)token * heads + head) * value_dim;
+                    float decay = sycl::exp(bf16_to_float(g[(size_t)token * heads + head]));
+                    float memory = 0.0f;
+                    for (int k = 0; k < key_dim; ++k) {
+                        float current = local_state[(size_t)k * value_dim + value_index] * decay;
+                        local_state[(size_t)k * value_dim + value_index] = current;
+                        memory += current * bf16_to_float(key[qk_base + k]);
+                    }
+                    float delta = (bf16_to_float(value[v_base + value_index]) - memory) *
+                        bf16_to_float(beta[(size_t)token * heads + head]);
+                    float result = 0.0f;
+                    for (int k = 0; k < key_dim; ++k) {
+                        float current = local_state[(size_t)k * value_dim + value_index] +
+                            bf16_to_float(key[qk_base + k]) * delta;
+                        local_state[(size_t)k * value_dim + value_index] = current;
+                        result += current * bf16_to_float(query[qk_base + k]);
+                    }
+                    output[v_base + value_index] = float_to_bf16(result);
+                }
+
+                for (int k = 0; k < key_dim; ++k)
+                    state[state_base + (size_t)k * value_dim + value_index] =
+                        local_state[(size_t)k * value_dim + value_index];
             });
     });
 }

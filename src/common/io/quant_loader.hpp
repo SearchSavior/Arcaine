@@ -17,6 +17,8 @@
 #include "../../common/gpu/buffer.hpp"   // GpuBuffer, bf16, float_to_bf16
 #include "../../common/gpu/nvfp4.hpp"    // Nvfp4Linear
 #include "../../common/gpu/fp8.hpp"      // Fp8Linear
+#include "../../common/gpu/int4.hpp"     // Int4Linear
+#include "../../common/gpu/q8_0.hpp"     // Q8Linear, Q8BatchedLinear
 #include "safetensors.hpp"              // SafetensorsFile
 #include "tensor_view.hpp"             // TensorView
 
@@ -95,3 +97,45 @@ Nvfp4Linear        upload_nvfp4_linear_pair(const TensorSource& sf,
                                             const std::string& gate_prefix,
                                             const std::string& up_prefix,
                                             sycl::queue& q);
+
+// ---------------------------------------------------------------------------
+// compressed-tensors int4 W4A16 ("pack-quantized"), shared with all models.
+// weight_packed is I32 with 8 signed int4 per word along K (low-nibble first);
+// the raw byte stream is oneDNN s4 tag::ba for logical (K, N).  weight_scale is
+// BF16/F16 (out, K/group) transposed to (groups, out); F16 scales normalized to
+// BF16.  Symmetric u4 zero-point 8 is rebased to two's-complement s4 via a
+// per-nibble sign-bit XOR (byte ^ 0x88), so oneDNN consumes it directly.
+// ---------------------------------------------------------------------------
+Int4Linear         upload_int4_linear(const TensorSource& sf, const std::string& prefix,
+                                      sycl::queue& q);
+
+// Fuse gate_proj + up_proj into one int4 weight with out_features = 2*half_out
+// (gate block then up block).
+Int4Linear         upload_int4_linear_pair(const TensorSource& sf,
+                                           const std::string& gate_prefix,
+                                           const std::string& up_prefix,
+                                           sycl::queue& q);
+
+// Fuse N projections along the output dimension into one (N_total, K) int4
+// weight. Rows are output channels, so concatenating packed rows is layout-safe.
+Int4Linear         upload_int4_linear_concat(const TensorSource& sf,
+                                             const std::vector<std::string>& prefixes,
+                                             sycl::queue& q, const char* name);
+
+// ---------------------------------------------------------------------------
+// GGUF Q8_0 (W8A16): 32-element blocks of int8 with an F16 scale.
+// ---------------------------------------------------------------------------
+Q8Linear           upload_q8_linear_view(const TensorView& tv, sycl::queue& q,
+                                         bool keep_row_scales, const char* name = "?");
+
+Q8Linear           upload_q8_linear(const TensorSource& sf, const std::string& prefix,
+                                    sycl::queue& q, bool keep_row_scales = false);
+
+// Extract expert `expert` from a 3D [E, N, K] Q8_0 tensor.
+Q8Linear           upload_q8_linear_slice(const TensorView& tv, int expert,
+                                          sycl::queue& q, const char* name = "?");
+
+// Extract experts [first, last) from a 3D [E, N, K] Q8_0 tensor into a batched
+// (B, N, K) weight with (B, K/32, N) scales.
+Q8BatchedLinear    upload_q8_batched_slice(const TensorView& tv, int first, int last,
+                                           sycl::queue& q, const char* name = "?");

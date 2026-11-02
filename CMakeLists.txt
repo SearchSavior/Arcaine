@@ -87,8 +87,20 @@ set(QWEN35_SRCS
     src/modeling/qwen3_5/register.cpp
 )
 
+set(FLINT_SRCS
+    src/modeling/flint/loader.cpp
+    src/modeling/flint/model.cpp
+    src/modeling/flint/gpu_decode.cpp
+    src/modeling/flint/register.cpp
+    src/modeling/flint/kernels/awq_xmx.cpp
+    src/modeling/flint/kernels/awq_joint_matrix.cpp
+)
+set_source_files_properties(src/modeling/flint/kernels/awq_xmx.cpp PROPERTIES
+    COMPILE_DEFINITIONS "SYCL_INTEL_TARGET;CUTLASS_ENABLE_SYCL"
+    INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/third_party/sycl-tla/include;${CMAKE_SOURCE_DIR}/third_party/sycl-tla/tools/util/include")
+
 # All built-in architectures linked into the inference/bench binaries.
-set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS} ${QWEN35_SRCS})
+set(ARCH_SRCS ${GEMMA4_SRCS} ${QWEN_SRCS} ${QWEN35_SRCS} ${FLINT_SRCS})
 
 # DiffusionGemma 26B-A4B (block-diffusion MoE) decoder sources. Defined here so
 # arcaine_mbench (below) can link the diffusion bench driver as well as the AR
@@ -129,7 +141,7 @@ target_compile_options(gemma4 PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2
 target_link_options(gemma4   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # ARCH_SRCS now pulls qwen3_5_moe (NVFP4 loader) + common/quant_loader.cpp, both
 # of which include nvfp4.hpp -> __spirv_SubgroupMatrixMultiplyAccumulateINTEL.
-target_link_options(gemma4 PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(gemma4 PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 target_link_libraries(gemma4 PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(gemma4 PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
@@ -157,6 +169,7 @@ target_link_libraries(test_chat_template_kwargs  PRIVATE DNNL::dnnl)
 set(MBENCH_SRCS
     src/arcaine_mbench.cpp
     src/bench/diffusion_model_bench.hpp
+    src/bench/flint_generation.cpp
     ${COMMON_SRCS}
     ${ARCH_SRCS}
     ${DIFFUSION_SRCS})
@@ -165,7 +178,7 @@ add_executable(arcaine_mbench ${MBENCH_SRCS})
 target_compile_options(arcaine_mbench PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_mbench   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 # See gemma4: ARCH_SRCS / COMMON_SRCS include nvfp4.hpp-bearing loader TUs.
-target_link_options(arcaine_mbench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(arcaine_mbench PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 target_link_libraries(arcaine_mbench PRIVATE DNNL::dnnl soxr onnxruntime)
 set_target_properties(arcaine_mbench PROPERTIES
     BUILD_RPATH "${ORT_DIR}/lib"
@@ -176,7 +189,7 @@ set_target_properties(arcaine_mbench PROPERTIES
 add_executable(diffusion_gemma src/diffusion_main.cpp ${DIFFUSION_SRCS})
 target_compile_options(diffusion_gemma PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(diffusion_gemma   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 
 # OpenAI-compatible HTTP API server. Single binary serving every registered
 # architecture: dispatches by config.json::model_type at startup.
@@ -184,6 +197,7 @@ target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_I
 #   - "gemma4_unified"    -> Gemma4Model (AR, multimodal, BF16)
 #   - "qwen3_5_moe_text"  -> QwenModel (AR, NVFP4 MoE)
 #   - "qwen3_5"           -> Qwen35Model (AR, FP8/NVFP4, multimodal)
+#   - "flint"             -> FlintModel (AR, INT4)
 # Links COMMON_SRCS + ARCH_SRCS (all arches, so the registry can construct any)
 # plus DIFFUSION_SRCS (the block-diffusion path) and register_builtins.cpp
 # (wires the AR arches into ModelRegistry). Needs soxr + onnxruntime for the
@@ -197,7 +211,7 @@ add_executable(arcaine_server
     src/register_builtins.cpp)
 target_compile_options(arcaine_server PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_server   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
-target_link_options(arcaine_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_options(arcaine_server PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 
 # DiffusionGemma throughput benchmark is folded into arcaine_mbench (the driver
 # is bench/diffusion_model_bench.hpp, dispatched on config.json::model_type).
@@ -225,6 +239,16 @@ set(KBENCH_SRCS
     src/bench/diffusion_int4_fusion_bench.cpp
     src/bench/diffusion_int4_w4a8_bench.cpp
     src/bench/diffusion_int4_grouped_s8s4_bench.cpp
+    src/bench/flint_kernel_bench.cpp
+    src/bench/flint_kernel_check.cpp
+    src/bench/flint_awq_grouped_moe_bench.cpp
+    src/bench/flint_prefill_attention_bench.cpp
+    src/bench/flint_decode_head_bench.cpp
+    src/bench/flint_decode_moe_bench.cpp
+    src/bench/flint_decode_router_bench.cpp
+    src/bench/flint_decode_sampling_bench.cpp
+    src/modeling/flint/kernels/awq_xmx.cpp
+    src/modeling/flint/kernels/awq_joint_matrix.cpp
     # qwen35_nvfp4_mlp_bench loads a real NVFP4 layer:
     src/common/io/quant_loader.cpp
     src/common/gpu/sycl_graph_session.cpp)
@@ -233,7 +257,7 @@ target_compile_options(arcaine_kbench PRIVATE
     -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_kbench PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
 target_link_options(arcaine_kbench PRIVATE
-    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+    -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io)
 target_link_libraries(arcaine_kbench PRIVATE DNNL::dnnl)
 
 

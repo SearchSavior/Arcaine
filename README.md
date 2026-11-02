@@ -171,3 +171,13 @@ The API and UI share the same origin, so no CORS configuration is required.
   `dnnl_primitive_attr_set_scales_v3`, re-run the CMake configure/build step so
   the binary embeds the `/opt/onednn/lib` runtime path ahead of oneAPI/OpenVINO
   library paths.
+
+## Attribution
+
+The SYCL optimization, hardware information, software optimization, and register
+diagnostics skills in `.agents/skills/` are copied unchanged from
+[sycl-skills](https://github.com/xiaolong-intel/sycl-skills) by original author
+[xiaolong-intel](https://github.com/xiaolong-intel), licensed under the
+[Apache License 2.0](.agents/skills/sycl-optimization/LICENSE).
+Imported from revision
+[`1689134`](https://github.com/xiaolong-intel/sycl-skills/commit/16891344898a66eae96f5632ccc02fddc49013d5).

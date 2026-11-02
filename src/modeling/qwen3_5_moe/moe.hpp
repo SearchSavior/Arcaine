@@ -34,7 +34,10 @@
 //
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <utility>
@@ -93,13 +96,13 @@ inline void qwen_routed_experts_forward(
 
         // gate_up: [M, 2*inter]  (gate in [0,inter), up in [inter,2*inter))
         GpuBuffer<bf16> d_gu((size_t)M * 2 * inter, q);
-        matmul_nvfp4(d_sub.data(), M, H, w.experts_gate_up[e], d_gu.data(), ctx);
+        qwen_linear_matmul(d_sub.data(), M, H, w.experts_gate_up[e], d_gu.data(), ctx);
         // SwiGLU -> [M, inter]
         GpuBuffer<bf16> d_act((size_t)M * inter, q);
         swiglu_strided(q, d_gu.data(), d_act.data(), M, inter);
         // down -> [M, H]
         GpuBuffer<bf16> d_dn((size_t)M * H, q);
-        matmul_nvfp4(d_act.data(), M, inter, w.experts_down[e], d_dn.data(), ctx);
+        qwen_linear_matmul(d_act.data(), M, inter, w.experts_down[e], d_dn.data(), ctx);
 
         std::vector<bf16> dn_h((size_t)M * H);
         d_dn.download(dn_h.data(), (size_t)M * H);
@@ -130,6 +133,13 @@ inline void qwen_moe_forward(
     int E     = cfg.num_experts;              // 256
     int top_k = cfg.num_experts_per_tok;      // 8
     int inter = cfg.moe_intermediate_size;    // 512
+    static const bool prof = std::getenv("QWEN_MOE_PROF") != nullptr;
+    using ProfClk = std::chrono::high_resolution_clock;
+    auto pnow = [] { return ProfClk::now(); };
+    auto pms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = pnow();
 
     // ---- 1. Router: hidden @ router_gate.T -> [S, E]; host softmax+topk+renorm ----
     GpuBuffer<bf16> scores((size_t)S * E, q);
@@ -163,9 +173,11 @@ inline void qwen_moe_forward(
         for (int s = 0; s < top_k; ++s) wgt[(size_t)t * top_k + s] *= sinv;
     }
 
+    auto t1 = pnow();
     // ---- 2. Routed experts (host-orchestrated) -> fp32 accumulator ----
     std::vector<float> out_h((size_t)S * H, 0.0f);
     qwen_routed_experts_forward(ctx, w, hidden, idx, wgt, out_h, S, cfg);
+    auto t2 = pnow();
 
     // Upload routed (bf16) into `out`.
     std::vector<bf16> out_b((size_t)S * H);
@@ -174,11 +186,11 @@ inline void qwen_moe_forward(
 
     // ---- 3. Shared expert (device) ----
     GpuBuffer<bf16> sgu((size_t)S * 2 * inter, q);
-    matmul_nvfp4(hidden, S, H, w.shared_gate_up, sgu.data(), ctx);
+    qwen_linear_matmul(hidden, S, H, w.shared_gate_up, sgu.data(), ctx);
     GpuBuffer<bf16> sact((size_t)S * inter, q);
     swiglu_strided(q, sgu.data(), sact.data(), S, inter);
     GpuBuffer<bf16> sdn((size_t)S * H, q);
-    matmul_nvfp4(sact.data(), S, inter, w.shared_down, sdn.data(), ctx);
+    qwen_linear_matmul(sact.data(), S, inter, w.shared_down, sdn.data(), ctx);
 
     // shared_expert_gate: hidden @ gate.T -> [S,1]; scale shared_out by sigmoid.
     GpuBuffer<bf16> glogit((size_t)S, q);
@@ -188,4 +200,9 @@ inline void qwen_moe_forward(
     // ---- 4. Combine: out (routed) += shared ----
     add_inplace(q, out, sdn.data(), (size_t)S * H);
     q.wait();
+    if (prof) {
+        std::fprintf(stderr,
+                     "[moe-prof] S=%d router=%.1f routed=%.1f shared=%.1f total=%.1f ms\n",
+                     S, pms(t0, t1), pms(t1, t2), pms(t2, pnow()), pms(t0, pnow()));
+    }
 }
